@@ -3900,11 +3900,16 @@ impl Game<'_> {
         reg.banned_ips = own_banned_ips;
         reg.whitelisted = own_whitelisted;
         if plugin_command {
-            suggestions.extend(super::server_plugins::tab_complete(
-                self,
-                player_uuid,
-                command,
-            ));
+            suggestions.extend(
+                super::server_plugins::tab_complete(self, player_uuid, command)
+                    .into_iter()
+                    .map(|text| horizon_client::command::Suggestion {
+                        range: (start, end),
+                        text,
+                        tooltip: None,
+                        int_value: None,
+                    }),
+            );
         }
         // ServerCommandSuggestionsProvider.limitSuggestionCount.
         suggestions.truncate(1000);

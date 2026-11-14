@@ -645,13 +645,15 @@ fn backup_connected_player_records(
                 .advancements
                 .to_json(tree, horizon_world::DATA_VERSION);
             let bytes = serde_json::to_vec_pretty(&json).map_err(std::io::Error::other)?;
-            horizon_client::save::write_durable(&path, &bytes).map_err(std::io::Error::other)?;
+            horizon_client::save::write_durable(&path, &bytes)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
         }
         if reset_stats && let Some(play) = lan.play.get(&guest.conn) {
             let path = super::stats::player_json(backup_root, "stats", uuid);
             let bytes =
                 serde_json::to_vec_pretty(&play.stats.to_json()).map_err(std::io::Error::other)?;
-            horizon_client::save::write_durable(&path, &bytes).map_err(std::io::Error::other)?;
+            horizon_client::save::write_durable(&path, &bytes)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
         }
     }
     Ok(())

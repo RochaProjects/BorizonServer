@@ -383,6 +383,7 @@ fn download_world(url: &str, name: &str) -> Result<PathBuf, String> {
         .map_err(|e| format!("Arquivo ZIP inválido: {e}"))?;
     let candidates: Vec<String> = archive
         .file_names()
+        .filter_map(Result::ok)
         .filter(|path| {
             path.ends_with("level.dat")
                 && !path.ends_with("level.dat_old")
@@ -420,7 +421,7 @@ fn download_world(url: &str, name: &str) -> Result<PathBuf, String> {
             let Some(enclosed) = entry.enclosed_name() else {
                 continue;
             };
-            let raw = entry.name();
+            let raw = entry.name().map_err(|e| e.to_string())?.into_owned();
             let Some(relative) = raw.strip_prefix(prefix) else {
                 continue;
             };

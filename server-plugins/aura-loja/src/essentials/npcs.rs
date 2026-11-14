@@ -207,13 +207,17 @@ fn import_pack(url: &str, expected_sha1: &str) -> Result<usize, String> {
         let item_root = format!("assets/aura/items/npc/{key}/cube_");
         let model_root = format!("assets/aura/models/item/npc/{key}/cube_");
         for i in 0..cube_count {
-            if archive
+            let item_path = format!("{item_root}{i}.json");
+            let model_path = format!("{model_root}{i}.json");
+            let item_exists = archive
                 .file_names()
-                .all(|name| name != format!("{item_root}{i}.json"))
-                || archive
-                    .file_names()
-                    .all(|name| name != format!("{model_root}{i}.json"))
-            {
+                .filter_map(Result::ok)
+                .any(|name| name == item_path);
+            let model_exists = archive
+                .file_names()
+                .filter_map(Result::ok)
+                .any(|name| name == model_path);
+            if !item_exists || !model_exists {
                 return Err(format!(
                     "O resource pack não possui os modelos Java do cubo {i} ({entity})."
                 ));

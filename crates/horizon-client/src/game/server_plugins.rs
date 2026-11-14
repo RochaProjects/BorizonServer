@@ -1053,7 +1053,11 @@ impl Host for GameHost<'_, '_, '_> {
                     return fail("invalid_command");
                 };
                 let result = self.game.native_run_command_as(uuid, command);
-                serde_json::json!({"ok":result.ran,"output":result.output})
+                serde_json::json!({
+                    "ok": result.ran,
+                    "result": result.result,
+                    "output": result.output.iter().map(Text::component).collect::<Vec<_>>()
+                })
             }
             op::CHAT_SEND => {
                 let Some(component) = data.get("component") else {
@@ -1908,10 +1912,7 @@ impl Host for GameHost<'_, '_, '_> {
                     Tag::String(item_model.into()),
                 ));
                 let mut nbt = Compound::new();
-                nbt.insert(
-                    "item".into(),
-                    horizon_client::items::item_nbt::item_to_nbt(&stack),
-                );
+                nbt.insert("item".into(), horizon_items::item_nbt::item_to_nbt(&stack));
                 nbt.insert("item_display".into(), Tag::String("fixed".into()));
                 nbt.insert("transformation".into(), Tag::Compound(transformation));
                 nbt.insert("billboard".into(), Tag::Byte(0));

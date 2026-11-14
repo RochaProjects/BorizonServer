@@ -9,7 +9,6 @@ use std::{
     io::{Read, Write},
     path::{Component, Path, PathBuf},
     sync::{Mutex, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
 };
 use zip::ZipArchive;
 
@@ -399,19 +398,16 @@ fn download_world(url: &str, name: &str) -> Result<PathBuf, String> {
         });
     }
     let prefix = &candidates[0];
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |v| v.as_millis());
     let root = std::env::current_dir()
         .map_err(|e| e.to_string())?
-        .join("plugins/.horizon-world-imports");
+        .join("plugins/AuraEssentials/.imports");
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
-    let stem = format!("{}-{now}", name.to_ascii_lowercase());
+    let stem = name.to_ascii_lowercase();
     let mut destination = root.join(&stem);
-    let mut suffix = 0;
+    let mut suffix = 1;
     while destination.exists() {
-        suffix += 1;
         destination = root.join(format!("{stem}-{suffix}"));
+        suffix += 1;
     }
     fs::create_dir(&destination).map_err(|e| e.to_string())?;
     let extracted = (|| -> Result<(), String> {
@@ -510,7 +506,11 @@ fn run_import_task(host: &HostApiV3, payload: &serde_json::Value) {
         }
         ImportState::Failed(error) => {
             finish(host);
-            message(host, player, &format!("Importação cancelada: {error}"));
+            message(
+                host,
+                player,
+                &format!("Importação do mundo falhou: {error}"),
+            );
         }
         ImportState::Ready(path) => {
             let result = call_json(
@@ -535,17 +535,16 @@ fn run_import_task(host: &HostApiV3, payload: &serde_json::Value) {
                     ),
                 );
             } else {
-                message(
-                    host,
-                    player,
-                    &format!(
-                        "Mundo baixado, mas a validação/importação falhou: {}.",
-                        result
-                            .as_ref()
-                            .and_then(|v| v["error"].as_str())
-                            .unwrap_or("falha")
-                    ),
-                );
+                let error = result
+                    .as_ref()
+                    .and_then(|value| value["error"].as_str())
+                    .unwrap_or("falha");
+                let detail = result
+                    .as_ref()
+                    .and_then(|value| value["detail"].as_str())
+                    .map(|detail| format!(" ({detail})"))
+                    .unwrap_or_default();
+                message(host, player, &format!("Importação falhou: {error}{detail}"));
             }
         }
     }

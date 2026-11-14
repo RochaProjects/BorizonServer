@@ -1,6 +1,8 @@
 //! AuraNPC model NPCs: each Bedrock cube is rendered by a vanilla Java item_display
 //! referencing the matching `aura:npc/.../cube_N` item model in the AuraNPC resource pack.
-use crate::plugin_api::{call_json, get_public_http_bytes, message};
+use crate::plugin_api::{
+    add_suggestions, call_json, completion_input, get_public_http_bytes, message,
+};
 use glam::{EulerRot, Mat4, Quat, Vec3};
 use horizon_server_plugin_api::{HostApiV3, operation};
 use serde::{Deserialize, Serialize};
@@ -60,6 +62,145 @@ fn npc_file() -> Option<PathBuf> {
 }
 fn model_root() -> Option<PathBuf> {
     Some(plugin_dir()?.join("npc-models/imported"))
+}
+fn model_config_file() -> Option<PathBuf> {
+    Some(plugin_dir()?.join("npc-models.json"))
+}
+fn model_source_marker() -> Option<PathBuf> {
+    Some(plugin_dir()?.join("npc-models/source.json"))
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default)]
+struct ModelConfig {
+    auto_import: bool,
+    url: String,
+    sha1: String,
+}
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            auto_import: true,
+            url: DEFAULT_PACK_URL.into(),
+            sha1: DEFAULT_PACK_SHA1.into(),
+        }
+    }
+}
+fn model_config() -> ModelConfig {
+    let Some(path) = model_config_file() else {
+        return ModelConfig::default();
+    };
+    if let Ok(bytes) = fs::read(&path) {
+        return serde_json::from_slice(&bytes).unwrap_or_default();
+    }
+    let config = ModelConfig::default();
+    if let (Some(parent), Ok(bytes)) = (path.parent(), serde_json::to_vec_pretty(&config)) {
+        let _ = fs::create_dir_all(parent);
+        let _ = fs::write(path, bytes);
+    }
+    config
+}
+fn model_source_is_current(config: &ModelConfig) -> bool {
+    model_source_marker()
+        .and_then(|path| fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .is_some_and(|marker| {
+            marker["url"] == config.url && marker["sha1"] == config.sha1 && !models().is_empty()
+        })
+}
+fn write_model_source_marker(url: &str, sha1: &str, models: usize) {
+    let Some(path) = model_source_marker() else {
+        return;
+    };
+    if let (Some(parent), Ok(bytes)) = (
+        path.parent(),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "url": url,
+            "sha1": sha1,
+            "models": models,
+        })),
+    ) {
+        let _ = fs::create_dir_all(parent);
+        let _ = fs::write(path, bytes);
+    }
+}
+
+fn report_import(host: &HostApiV3, player: u128, text: &str) {
+    if player == 0 {
+        let _ = call_json(
+            host,
+            0,
+            serde_json::json!({"operation":operation::SERVER_LOG,"data":{"level":"info","message":text}}),
+        );
+    } else {
+        message(host, player, text);
+    }
+}
+
+fn begin_import(host: &HostApiV3, player: u128, url: String, expected: String) -> bool {
+    let mut jobs = IMPORTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if jobs
+        .values()
+        .any(|state| matches!(state, ImportState::Running | ImportState::Finished(_)))
+    {
+        report_import(
+            host,
+            player,
+            "Já existe uma importação do AuraNPC em andamento.",
+        );
+        return false;
+    }
+    jobs.insert(player, ImportState::Running);
+    drop(jobs);
+    let scheduled = call_json(
+        host,
+        player,
+        serde_json::json!({"operation":operation::SCHEDULER_SCHEDULE,"data":{"plugin":"AuraEssentials","delay_ticks":20,"period_ticks":20,"data":{"kind":"npc_import_poll","player":format!("{player:032x}")}}}),
+    );
+    if !scheduled.as_ref().is_some_and(|value| value["ok"] == true) {
+        IMPORTS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&player);
+        report_import(
+            host,
+            player,
+            "Não foi possível acompanhar a importação do AuraNPC.",
+        );
+        return false;
+    }
+    report_import(
+        host,
+        player,
+        "Download e validação do AuraNPC iniciados em background.",
+    );
+    std::thread::spawn(move || {
+        let result = match import_pack(&url, &expected) {
+            Ok(count) => {
+                write_model_source_marker(&url, &expected, count);
+                Ok(count)
+            }
+            Err(error) => Err(error),
+        };
+        IMPORTS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(player, ImportState::Finished(result));
+    });
+    true
+}
+
+pub(super) fn ensure_default_import(host: &HostApiV3) {
+    let config = model_config();
+    if !config.auto_import || model_source_is_current(&config) {
+        return;
+    }
+    begin_import(host, 0, config.url, config.sha1);
 }
 fn read() -> Vec<Npc> {
     npc_file()
@@ -472,7 +613,7 @@ pub(super) fn register_commands(host: &HostApiV3) {
         "npc listar",
         "npc modelos",
         "npc importar <url:text>",
-        "npc model <id:word> <modelo:word>",
+        "npc criar <id:word> <modelo:word>",
         "npc remover <id:word>",
         "npc editar <id:word> nome <texto:text>",
         "npc editar <id:word> modelo <modelo:word>",
@@ -516,7 +657,7 @@ pub(super) fn command(host: &HostApiV3, player: u128, command: &str) -> bool {
                 },
             );
         }
-        ["npc", "model", id, model] => {
+        ["npc", "criar", id, model] => {
             if !valid_npc_id(id) {
                 message(
                     host,
@@ -529,7 +670,7 @@ pub(super) fn command(host: &HostApiV3, player: u128, command: &str) -> bool {
                 message(
                     host,
                     player,
-                    "Modelo não importado. Use /npc importar <URL> e /npc modelos.",
+                    "Modelo não importado. Os modelos AuraNPC são importados automaticamente; use /npc modelos para consultar.",
                 );
                 return true;
             }
@@ -595,7 +736,10 @@ pub(super) fn command(host: &HostApiV3, player: u128, command: &str) -> bool {
                 .get_or_init(Default::default)
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if matches!(jobs.get(&player), Some(ImportState::Running)) {
+            if jobs
+                .values()
+                .any(|state| matches!(state, ImportState::Running | ImportState::Finished(_)))
+            {
                 message(
                     host,
                     player,
@@ -708,7 +852,7 @@ pub(super) fn command(host: &HostApiV3, player: u128, command: &str) -> bool {
         _ => message(
             host,
             player,
-            "Uso: /npc importar <URL> | modelos | model <id> <namespace:entidade> | listar | editar <id> nome|modelo|acao|comando|posicao ... | remover <id>.",
+            "Uso: /npc criar <id> <modelo> | listar | modelos | editar <id> nome|modelo|acao|comando|posicao ... | remover <id>.",
         ),
     }
     true
@@ -794,14 +938,18 @@ pub(super) fn event(host: &HostApiV3, kind: u32, payload: &Value) {
                 serde_json::json!({"operation":operation::SCHEDULER_CANCEL,"data":{"task_id":task}}),
             );
             match result {
-                Ok(count) => message(
+                Ok(count) => report_import(
                     host,
                     player,
                     &format!(
-                        "{count} modelos 3D AuraNPC importados. Use /npc modelos e /npc model <id> <namespace:entidade>."
+                        "{count} modelos 3D do AuraNPC prontos. Consulte /npc modelos e crie com /npc criar <id> <modelo>."
                     ),
                 ),
-                Err(error) => message(host, player, &format!("Importação falhou: {error}")),
+                Err(error) => report_import(
+                    host,
+                    player,
+                    &format!("Importação do AuraNPC falhou: {error}"),
+                ),
             }
         }
         None => {}
@@ -837,35 +985,31 @@ fn update(host: &HostApiV3, player: u128, id: &str, change: impl FnOnce(&mut Npc
     }
 }
 pub(super) fn suggestions(host: &HostApiV3, player: u128, line: &str) {
-    let w: Vec<_> = line.split_whitespace().collect();
-    let rows = read();
-    let vals: Vec<String> = match w.as_slice() {
-        ["npc"] => [
-            "listar", "modelos", "importar", "model", "editar", "remover",
-        ]
-        .map(str::to_owned)
-        .into(),
-        ["npc", "model", _] | ["npc", "editar", _, "modelo"] => models(),
-        ["npc", "editar"] | ["npc", "remover"] => rows.iter().map(|n| n.id.clone()).collect(),
-        ["npc", "editar", _, _] => ["nome", "modelo", "acao", "comando", "posicao"]
+    let (words, current) = completion_input(line);
+    if words.first() != Some(&"npc") {
+        return;
+    }
+    let admin = super::player_snapshot(host, player)
+        .and_then(|snapshot| snapshot["permission_level"].as_u64())
+        .is_some_and(|level| level >= 2);
+    let candidates: Vec<String> = match words.as_slice() {
+        ["npc"] => {
+            let mut commands = vec!["listar".to_owned(), "modelos".to_owned()];
+            if admin {
+                commands.extend(["criar", "importar", "editar", "remover"].map(str::to_owned));
+            }
+            commands
+        }
+        ["npc", "criar"] if admin => models(),
+        ["npc", "editar"] | ["npc", "remover"] if admin => {
+            read().into_iter().map(|npc| npc.id).collect()
+        }
+        ["npc", "editar", _] if admin => ["nome", "modelo", "acao", "comando", "posicao"]
             .map(str::to_owned)
             .into(),
-        ["npc", "editar", _, "acao", _] => ["nenhuma", "comando"].map(str::to_owned).into(),
-        _ => vec![],
+        ["npc", "editar", _, "modelo"] if admin => models(),
+        ["npc", "editar", _, "acao"] if admin => ["nenhuma", "comando"].map(str::to_owned).into(),
+        _ => Vec::new(),
     };
-    let cur = if line.ends_with(' ') {
-        ""
-    } else {
-        w.last().copied().unwrap_or("")
-    };
-    for v in vals
-        .into_iter()
-        .filter(|v| v.to_lowercase().starts_with(&cur.to_lowercase()))
-    {
-        let _ = call_json(
-            host,
-            player,
-            serde_json::json!({"operation":operation::COMMAND_SUGGESTION_ADD,"data":{"value":v}}),
-        );
-    }
+    add_suggestions(host, player, current, candidates);
 }

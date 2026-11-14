@@ -1,5 +1,5 @@
 //! Holograms are plugin definitions rendered as ordinary vanilla text_display entities.
-use crate::plugin_api::{call_json, message};
+use crate::plugin_api::{add_suggestions, call_json, completion_input, message};
 use horizon_server_plugin_api::{HostApiV3, operation};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -467,35 +467,32 @@ fn update(host: &HostApiV3, player: u128, id: &str, change: impl FnOnce(&mut Hol
     }
 }
 pub(super) fn suggestions(host: &HostApiV3, player: u128, line: &str) {
-    let w: Vec<_> = line.split_whitespace().collect();
-    let entries = load();
-    let vals: Vec<String> = match w.as_slice() {
-        ["holograma"] => ["listar", "criar", "editar", "renomear", "remover"]
-            .map(str::to_owned)
-            .into(),
-        ["holograma", "editar"] => entries.iter().map(|e| e.id.clone()).collect(),
-        ["holograma", "editar", _, _] => ["titulo", "descricao", "fundo", "cor", "posicao"]
-            .map(str::to_owned)
-            .into(),
-        ["holograma", "editar", _, "fundo", _] => ["separado", "unico"].map(str::to_owned).into(),
-        ["holograma", "renomear"] | ["holograma", "remover"] => {
-            entries.iter().map(|e| e.id.clone()).collect()
-        }
-        _ => vec![],
-    };
-    let current = if line.ends_with(' ') {
-        ""
-    } else {
-        w.last().copied().unwrap_or("")
-    };
-    for value in vals
-        .into_iter()
-        .filter(|v| v.to_lowercase().starts_with(&current.to_lowercase()))
-    {
-        let _ = call_json(
-            host,
-            player,
-            serde_json::json!({"operation":operation::COMMAND_SUGGESTION_ADD,"data":{"value":value}}),
-        );
+    let (words, current) = completion_input(line);
+    if words.first() != Some(&"holograma") {
+        return;
     }
+    let admin = super::player_snapshot(host, player)
+        .and_then(|snapshot| snapshot["permission_level"].as_u64())
+        .is_some_and(|level| level >= 2);
+    let entries = load();
+    let candidates: Vec<String> = match words.as_slice() {
+        ["holograma"] => {
+            let mut commands = vec!["listar".to_owned()];
+            if admin {
+                commands.extend(["criar", "editar", "renomear", "remover"].map(str::to_owned));
+            }
+            commands
+        }
+        ["holograma", "editar"] | ["holograma", "renomear"] | ["holograma", "remover"] if admin => {
+            entries.iter().map(|entry| entry.id.clone()).collect()
+        }
+        ["holograma", "editar", _] if admin => ["titulo", "descricao", "fundo", "cor", "posicao"]
+            .map(str::to_owned)
+            .into(),
+        ["holograma", "editar", _, "fundo"] if admin => {
+            ["separado", "unico"].map(str::to_owned).into()
+        }
+        _ => Vec::new(),
+    };
+    add_suggestions(host, player, current, candidates);
 }

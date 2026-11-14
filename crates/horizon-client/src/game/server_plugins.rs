@@ -443,7 +443,7 @@ fn import_custom_dimension(game: &mut Game<'_>, data: &serde_json::Value) -> ser
     let Some(root) = std::env::current_dir().ok() else {
         return serde_json::json!({"ok":false,"error":"server_root_unavailable"});
     };
-    let staging = root.join("plugins/.horizon-world-imports");
+    let staging = root.join("plugins/AuraEssentials/.imports");
     let (Ok(staging), Ok(source)) = (staging.canonicalize(), Path::new(source).canonicalize())
     else {
         return serde_json::json!({"ok":false,"error":"import_source_not_found"});
@@ -1640,24 +1640,19 @@ impl Host for GameHost<'_, '_, '_> {
                     .and_then(|value| value.as_str())
                     .unwrap_or("center")
                 {
-                    "left" => 0,
-                    "center" => 1,
-                    "right" => 2,
+                    value @ ("left" | "center" | "right") => value,
                     _ => return fail("invalid_alignment"),
                 };
-                nbt.insert("alignment".into(), Tag::Byte(alignment));
+                nbt.insert("alignment".into(), Tag::String(alignment.into()));
                 let billboard = match data
                     .get("billboard")
                     .and_then(|value| value.as_str())
                     .unwrap_or("center")
                 {
-                    "fixed" => 0,
-                    "vertical" => 1,
-                    "horizontal" => 2,
-                    "center" => 3,
+                    value @ ("fixed" | "vertical" | "horizontal" | "center") => value,
                     _ => return fail("invalid_billboard"),
                 };
-                nbt.insert("billboard".into(), Tag::Byte(billboard));
+                nbt.insert("billboard".into(), Tag::String(billboard.into()));
                 match self
                     .game
                     .native_summon(dimension, "minecraft:text_display", position, nbt)
@@ -1785,9 +1780,7 @@ impl Host for GameHost<'_, '_, '_> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("center")
                 {
-                    "left" => 0,
-                    "center" => 1,
-                    "right" => 2,
+                    value @ ("left" | "center" | "right") => value,
                     _ => return fail("invalid_alignment"),
                 };
                 let billboard = match data
@@ -1795,14 +1788,11 @@ impl Host for GameHost<'_, '_, '_> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("center")
                 {
-                    "fixed" => 0,
-                    "vertical" => 1,
-                    "horizontal" => 2,
-                    "center" => 3,
+                    value @ ("fixed" | "vertical" | "horizontal" | "center") => value,
                     _ => return fail("invalid_billboard"),
                 };
-                nbt.insert("alignment".into(), Tag::Byte(alignment));
-                nbt.insert("billboard".into(), Tag::Byte(billboard));
+                nbt.insert("alignment".into(), Tag::String(alignment.into()));
+                nbt.insert("billboard".into(), Tag::String(billboard.into()));
                 if let Some((old_dimension, old_id, old_kind)) =
                     self.game.native_entity_by_uuid(uuid)
                 {

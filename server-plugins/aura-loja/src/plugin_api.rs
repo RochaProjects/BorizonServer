@@ -134,3 +134,41 @@ pub fn message(host: &HostApiV3, player: u128, text: &str) {
         unsafe { send(host.common.context, high, low, text.as_ptr(), text.len()) };
     }
 }
+
+/// Splits a command completion request into completed words and the token under the cursor.
+/// Keeping the last, partially typed word separate makes every command use the same tab rules.
+pub fn completion_input(line: &str) -> (Vec<&str>, &str) {
+    let line = line.trim_start().trim_start_matches('/');
+    let mut words: Vec<_> = line.split_whitespace().collect();
+    if line.chars().last().is_some_and(char::is_whitespace) {
+        (words, "")
+    } else {
+        let current = words.pop().unwrap_or("");
+        (words, current)
+    }
+}
+
+/// Filters, sorts and deduplicates dynamic completions before returning them to Brigadier.
+pub fn add_suggestions(
+    host: &HostApiV3,
+    player: u128,
+    current: &str,
+    candidates: impl IntoIterator<Item = String>,
+) {
+    let mut candidates: Vec<_> = candidates
+        .into_iter()
+        .filter(|value| value.to_lowercase().starts_with(&current.to_lowercase()))
+        .collect();
+    candidates.sort_unstable();
+    candidates.dedup();
+    for value in candidates.into_iter().take(1000) {
+        let _ = call_json(
+            host,
+            player,
+            serde_json::json!({
+                "operation": horizon_server_plugin_api::operation::COMMAND_SUGGESTION_ADD,
+                "data": {"value": value}
+            }),
+        );
+    }
+}

@@ -1,6 +1,6 @@
 //! Comandos essenciais que usam apenas operações genéricas do SDK público.
 
-use crate::plugin_api::{call_json, message};
+use crate::plugin_api::{add_suggestions, call_json, completion_input, message};
 use horizon_server_plugin_api::{HostApiV3, event, operation};
 
 const STORAGE_ID: &str = "AuraEssentials";
@@ -22,6 +22,7 @@ pub fn register_commands(host: &HostApiV3) {
     roles::register_commands(host);
     holograms::register_commands(host);
     npcs::register_commands(host);
+    npcs::ensure_default_import(host);
     teleport::register_commands(host);
     worlds::register_commands(host);
     for (usage, level, permission) in [
@@ -108,8 +109,7 @@ pub fn suggestions(host: &HostApiV3, player: u128, line: &str) {
     roles::suggestions(host, player, line);
     holograms::suggestions(host, player, line);
     npcs::suggestions(host, player, line);
-    let trailing = line.ends_with(' ');
-    let words: Vec<_> = line.split_whitespace().collect();
+    let (words, current) = completion_input(line);
     let (root, args) = words.split_first().map_or(("", &[][..]), |(r, a)| (*r, a));
     let mut candidates = Vec::new();
     let admin = player_snapshot(host, player)
@@ -241,6 +241,7 @@ pub fn suggestions(host: &HostApiV3, player: u128, line: &str) {
                         | "do_mob_spawning"
                         | "do_fire_tick"
                         | "mob_griefing"
+                        | "random_tick_speed"
                 ) =>
         {
             if *rule == "random_tick_speed" {
@@ -291,62 +292,9 @@ pub fn suggestions(host: &HostApiV3, player: u128, line: &str) {
         }
         _ => {}
     }
-    let branch_is_complete = match (root, args) {
-        ("mundo", [command])
-            if matches!(
-                *command,
-                "listar"
-                    | "criar"
-                    | "tp"
-                    | "carregar"
-                    | "descarregar"
-                    | "spawn"
-                    | "definirspawn"
-                    | "definirprincipal"
-                    | "removerprincipal"
-                    | "gamerule"
-                    | "remover"
-                    | "reset"
-                    | "renomear"
-            ) =>
-        {
-            true
-        }
-        ("mundo", ["criar", _]) | ("mundo", ["gamerule", _]) | ("mundo", ["reset", _]) => true,
-        ("mundo", ["gamerule", _, rule])
-            if matches!(
-                *rule,
-                "keep_inventory"
-                    | "do_daylight_cycle"
-                    | "do_mob_spawning"
-                    | "do_fire_tick"
-                    | "mob_griefing"
-                    | "random_tick_speed"
-            ) =>
-        {
-            true
-        }
-        _ => false,
-    };
-    let current = if trailing || args.is_empty() || branch_is_complete {
-        ""
-    } else {
-        words.last().copied().unwrap_or_default()
-    };
-    candidates.retain(|candidate| {
-        candidate
-            .to_lowercase()
-            .starts_with(&current.to_lowercase())
-    });
-    candidates.sort_unstable();
-    candidates.dedup();
-    for value in candidates.into_iter().take(1000) {
-        let _ = call_json(
-            host,
-            player,
-            serde_json::json!({"operation": operation::COMMAND_SUGGESTION_ADD, "data": {"value": value}}),
-        );
-    }
+    // Brigadier already completes registered literals. This callback supplies only
+    // argument values, consistently filtering the token currently under the cursor.
+    add_suggestions(host, player, current, candidates);
 }
 
 fn open_inventory_view(host: &HostApiV3, player: u128, name: &str, ender: bool) -> bool {

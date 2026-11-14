@@ -1,6 +1,6 @@
 //! Cargos explícitos: OP/permissões controlam acesso, nunca identidade visual.
 use super::{player_snapshot, storage_get, storage_set};
-use crate::plugin_api::{call_json, message};
+use crate::plugin_api::{add_suggestions, call_json, completion_input, message};
 use horizon_server_plugin_api::{HostApiV3, event, operation};
 use serde_json::json;
 use std::{
@@ -158,8 +158,16 @@ pub(super) fn command(host: &HostApiV3, actor: u128, command: &str) -> bool {
 }
 
 pub(super) fn suggestions(host: &HostApiV3, actor: u128, line: &str) {
-    let words: Vec<_> = line.split_whitespace().collect();
-    let trailing = line.ends_with(' ');
+    let (words, current) = completion_input(line);
+    if words.first() != Some(&"entregarcargo") {
+        return;
+    }
+    let admin = player_snapshot(host, actor)
+        .and_then(|snapshot| snapshot["permission_level"].as_u64())
+        .is_some_and(|level| level >= 2);
+    if !admin {
+        return;
+    }
     let candidates: Vec<String> = match words.as_slice() {
         ["entregarcargo"] => call_json(
             host,
@@ -171,22 +179,10 @@ pub(super) fn suggestions(host: &HostApiV3, actor: u128, line: &str) {
         .iter()
         .filter_map(|p| p["name"].as_str().map(str::to_owned))
         .collect(),
-        ["entregarcargo", _] if trailing => ROLE_KEYS.iter().map(|s| (*s).to_owned()).collect(),
-        ["entregarcargo", _, _] => ROLE_KEYS.iter().map(|s| (*s).to_owned()).collect(),
+        ["entregarcargo", _] => ROLE_KEYS.iter().map(|s| (*s).to_owned()).collect(),
         _ => Vec::new(),
     };
-    let current = if line.ends_with(' ') {
-        ""
-    } else {
-        words.last().copied().unwrap_or("")
-    };
-    for value in candidates.into_iter().filter(|v| v.starts_with(current)) {
-        let _ = call_json(
-            host,
-            actor,
-            serde_json::json!({"operation": operation::COMMAND_SUGGESTION_ADD, "data": {"value": value}}),
-        );
-    }
+    add_suggestions(host, actor, current, candidates);
 }
 
 pub(super) fn event(host: &HostApiV3, kind: u32, payload: &serde_json::Value) {

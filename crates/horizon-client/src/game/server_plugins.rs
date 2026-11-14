@@ -3,6 +3,8 @@
 
 #[cfg(feature = "server-plugins")]
 use super::native_server::NativeSidebar;
+#[cfg(feature = "server-plugins")]
+use super::native_world_edit::NativeHeightmap;
 use super::{
     Game,
     native_server::{NativeCommand, NativeServerPlayer},
@@ -15,11 +17,508 @@ use horizon_client::{
 use horizon_server_plugin_loader::{Event, Host, ItemDelta, MenuItem, TransactionError};
 #[cfg(feature = "server-plugins")]
 use horizon_world::nbt::{Compound, Tag};
+#[cfg(feature = "server-plugins")]
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+#[cfg(feature = "server-plugins")]
+struct PlayerDataResetPlan {
+    categories: Vec<String>,
+    expires: Instant,
+}
+
+#[cfg(feature = "server-plugins")]
+struct DimensionDeletePlan {
+    dimension: String,
+    expires: Instant,
+}
+
+#[cfg(feature = "server-plugins")]
+static PLAYER_DATA_RESET_PLANS: OnceLock<Mutex<HashMap<String, PlayerDataResetPlan>>> =
+    OnceLock::new();
+#[cfg(feature = "server-plugins")]
+static PLAYER_DATA_RESET_NONCE: AtomicU64 = AtomicU64::new(1);
+#[cfg(feature = "server-plugins")]
+static DIMENSION_DELETE_PLANS: OnceLock<Mutex<HashMap<String, DimensionDeletePlan>>> =
+    OnceLock::new();
+#[cfg(feature = "server-plugins")]
+static SAFE_LOCATION_RNG: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
 
 #[cfg(feature = "server-plugins")]
 struct GameHost<'g, 'a, 'c> {
     game: &'g mut Game<'a>,
     commands: Option<&'c mut Vec<NativeCommand>>,
+}
+
+#[cfg(feature = "server-plugins")]
+fn reset_categories(value: &serde_json::Value) -> Option<Vec<String>> {
+    let requested = value.as_array()?;
+    let mut categories = Vec::new();
+    for item in requested {
+        let name = item.as_str()?.to_ascii_lowercase();
+        match name.as_str() {
+            "all" | "jogadores" | "players" => {
+                categories.extend(["advancements", "stats", "playerdata"].map(str::to_owned));
+            }
+            "advancements" | "conquistas" => categories.push("advancements".into()),
+            "stats" | "estatisticas" => categories.push("stats".into()),
+            "playerdata" | "dados" => categories.push("playerdata".into()),
+            _ => return None,
+        }
+    }
+    categories.sort();
+    categories.dedup();
+    (!categories.is_empty()).then_some(categories)
+}
+
+#[cfg(feature = "server-plugins")]
+fn valid_custom_dimension_id(id: &str) -> bool {
+    let Some((namespace, path)) = id.split_once(':') else {
+        return false;
+    };
+    namespace != "minecraft"
+        && horizon_core::LevelKey::parse(id).is_ok()
+        && !path.is_empty()
+        && !path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+}
+
+#[cfg(feature = "server-plugins")]
+fn find_safe_location(
+    game: &Game<'_>,
+    player: u128,
+    data: &serde_json::Value,
+) -> serde_json::Value {
+    let snapshot = game
+        .native_server_players()
+        .into_iter()
+        .find(|snapshot| snapshot.uuid == player)
+        .or_else(|| {
+            game.native_acting_player()
+                .filter(|snapshot| snapshot.uuid == player)
+        });
+    let Some(snapshot) = snapshot else {
+        return serde_json::json!({"ok": false, "error": "player_not_online"});
+    };
+    let Some(radius) = data
+        .get("radius")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|radius| (8..=512).contains(radius))
+    else {
+        return serde_json::json!({"ok": false, "error": "invalid_radius", "min": 8, "max": 512});
+    };
+    let attempts = data
+        .get("attempts")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(96)
+        .clamp(1, 256) as usize;
+    let dimension = data
+        .get("dimension")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&snapshot.dimension);
+    if dimension != snapshot.dimension {
+        return serde_json::json!({"ok": false, "error": "dimension_must_be_current"});
+    }
+    let center = data
+        .get("center")
+        .and_then(serde_json::Value::as_array)
+        .filter(|center| center.len() == 2)
+        .and_then(|center| {
+            Some([
+                center[0]
+                    .as_i64()?
+                    .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                center[1]
+                    .as_i64()?
+                    .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            ])
+        })
+        .unwrap_or([
+            snapshot.position[0].floor() as i32,
+            snapshot.position[2].floor() as i32,
+        ]);
+    let mut columns = Vec::with_capacity(attempts);
+    for _ in 0..attempts {
+        let seed = SAFE_LOCATION_RNG.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed);
+        let mut value = seed ^ (player as u64) ^ (seed.rotate_left(17));
+        value ^= value >> 12;
+        value ^= value << 25;
+        value ^= value >> 27;
+        let x =
+            ((value.wrapping_mul(0x2545_f491_4f6c_dd1d) % (radius * 2 + 1)) as i64) - radius as i64;
+        value = value.wrapping_add(seed.rotate_left(31));
+        value ^= value >> 12;
+        value ^= value << 25;
+        value ^= value >> 27;
+        let z =
+            ((value.wrapping_mul(0x2545_f491_4f6c_dd1d) % (radius * 2 + 1)) as i64) - radius as i64;
+        if x * x + z * z > (radius as i64 * radius as i64) {
+            continue;
+        }
+        columns.push((
+            center[0].saturating_add(x as i32),
+            center[1].saturating_add(z as i32),
+        ));
+    }
+    let Ok(read) = game.native_read_columns(
+        dimension,
+        &columns,
+        NativeHeightmap::MotionBlockingNoLeaves,
+        (1, 2),
+    ) else {
+        return serde_json::json!({"ok": false, "error": "world_read_failed"});
+    };
+    for (index, base) in read.bases.iter().enumerate() {
+        let Some(y) = base else { continue };
+        let Some(blocks) = read.blocks.get(index * 3..index * 3 + 3) else {
+            continue;
+        };
+        let name = |block: u16| read.palette.get(usize::from(block)).map(String::as_str);
+        let ground = name(blocks[0]).unwrap_or("");
+        let feet = name(blocks[1]).unwrap_or("");
+        let head = name(blocks[2]).unwrap_or("");
+        if ground.ends_with("_leaves")
+            || ground.ends_with("_fence")
+            || ground.ends_with("_wall")
+            || ground.ends_with("_slab")
+            || ground.ends_with("_stairs")
+            || ["minecraft:air", "minecraft:cave_air", "minecraft:void_air"].contains(&ground)
+            || ground.contains("water")
+            || ground.contains("lava")
+            || ground.ends_with("_fire")
+            || !["minecraft:air", "minecraft:cave_air", "minecraft:void_air"].contains(&feet)
+            || !["minecraft:air", "minecraft:cave_air", "minecraft:void_air"].contains(&head)
+        {
+            continue;
+        }
+        let (x, z) = columns[index];
+        return serde_json::json!({
+            "ok": true,
+            "location": {
+                "dimension": dimension,
+                "position": [f64::from(x) + 0.5, f64::from(*y), f64::from(z) + 0.5],
+                "yaw": snapshot.yaw,
+                "pitch": snapshot.pitch,
+            },
+            "search_scope": "loaded_chunks",
+        });
+    }
+    serde_json::json!({"ok": false, "error": "no_safe_loaded_location", "search_scope": "loaded_chunks"})
+}
+
+#[cfg(feature = "server-plugins")]
+fn create_custom_dimension(game: &mut Game<'_>, data: &serde_json::Value) -> serde_json::Value {
+    let Some(id) = data.get("id").and_then(serde_json::Value::as_str) else {
+        return serde_json::json!({"ok": false, "error": "invalid_dimension_id"});
+    };
+    let Some(preset) = data.get("preset").and_then(serde_json::Value::as_str) else {
+        return serde_json::json!({"ok": false, "error": "invalid_preset"});
+    };
+    if !valid_custom_dimension_id(id) {
+        return serde_json::json!({"ok": false, "error": "invalid_dimension_id"});
+    }
+    if !matches!(preset, "overworld" | "nether" | "end" | "flat") {
+        return serde_json::json!({"ok": false, "error": "invalid_preset"});
+    }
+    if game
+        .world_dimensions()
+        .iter()
+        .any(|dimension| dimension.id() == id)
+    {
+        return serde_json::json!({"ok": false, "error": "dimension_exists"});
+    }
+    let path = horizon_client::save::dimension_dir(&game.world_root, id);
+    if path.exists() {
+        return serde_json::json!({"ok": false, "error": "dimension_data_exists"});
+    }
+    if let Err(error) =
+        horizon_client::save::set_custom_dimension_generator(&game.world_root, id, preset)
+    {
+        return serde_json::json!({"ok": false, "error": "generator_registration_failed", "detail": error.to_string()});
+    }
+    if let Err(error) = fs::create_dir_all(path.join("region")) {
+        let _ = horizon_client::save::remove_custom_dimension_generator(&game.world_root, id);
+        return serde_json::json!({"ok": false, "error": "dimension_create_failed", "detail": error.to_string()});
+    }
+    serde_json::json!({"ok": true, "dimension": id, "preset": preset, "loaded": false})
+}
+
+#[cfg(feature = "server-plugins")]
+fn prepare_custom_dimension_delete(game: &Game<'_>, data: &serde_json::Value) -> serde_json::Value {
+    let Some(id) = data.get("dimension").and_then(serde_json::Value::as_str) else {
+        return serde_json::json!({"ok": false, "error": "invalid_dimension_id"});
+    };
+    if !valid_custom_dimension_id(id) {
+        return serde_json::json!({"ok": false, "error": "protected_or_invalid_dimension"});
+    }
+    if game
+        .native_server_players()
+        .iter()
+        .any(|player| player.dimension == id)
+    {
+        return serde_json::json!({"ok": false, "error": "players_in_dimension"});
+    }
+    let path = horizon_client::save::dimension_dir(&game.world_root, id);
+    if !path.is_dir() {
+        return serde_json::json!({"ok": false, "error": "dimension_not_found"});
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64);
+    let nonce = PLAYER_DATA_RESET_NONCE.fetch_add(1, Ordering::Relaxed);
+    let token = format!("{now:016x}{nonce:016x}");
+    let plans = DIMENSION_DELETE_PLANS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut plans = plans.lock().unwrap_or_else(|error| error.into_inner());
+    plans.retain(|_, plan| plan.expires > Instant::now());
+    plans.insert(
+        token.clone(),
+        DimensionDeletePlan {
+            dimension: id.to_owned(),
+            expires: Instant::now() + Duration::from_secs(60),
+        },
+    );
+    serde_json::json!({
+        "ok": true,
+        "token": token,
+        "dimension": id,
+        "expires_in_seconds": 60,
+        "backup_required": true,
+    })
+}
+
+#[cfg(feature = "server-plugins")]
+fn commit_custom_dimension_delete(
+    game: &mut Game<'_>,
+    data: &serde_json::Value,
+) -> serde_json::Value {
+    let Some(token) = data.get("token").and_then(serde_json::Value::as_str) else {
+        return serde_json::json!({"ok": false, "error": "missing_token"});
+    };
+    let plans = DIMENSION_DELETE_PLANS.get_or_init(|| Mutex::new(HashMap::new()));
+    let plan = plans
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(token);
+    let Some(plan) = plan else {
+        return serde_json::json!({"ok": false, "error": "invalid_or_expired_token"});
+    };
+    if plan.expires <= Instant::now() {
+        return serde_json::json!({"ok": false, "error": "invalid_or_expired_token"});
+    }
+    if game
+        .native_server_players()
+        .iter()
+        .any(|player| player.dimension == plan.dimension)
+    {
+        return serde_json::json!({"ok": false, "error": "players_in_dimension"});
+    }
+    if !game.native_unload_dimension(&plan.dimension) {
+        return serde_json::json!({"ok": false, "error": "dimension_busy_or_unload_failed"});
+    }
+    let world_root = match game.world_root.canonicalize() {
+        Ok(root) => root,
+        Err(_) => return serde_json::json!({"ok": false, "error": "world_unavailable"}),
+    };
+    let target = horizon_client::save::dimension_dir(&world_root, &plan.dimension);
+    let metadata = match fs::symlink_metadata(&target) {
+        Ok(metadata) => metadata,
+        Err(_) => return serde_json::json!({"ok": false, "error": "dimension_not_found"}),
+    };
+    let canonical = match target.canonicalize() {
+        Ok(path) => path,
+        Err(_) => return serde_json::json!({"ok": false, "error": "unsafe_dimension_path"}),
+    };
+    if metadata.file_type().is_symlink() || !canonical.starts_with(&world_root) {
+        return serde_json::json!({"ok": false, "error": "unsafe_dimension_path"});
+    }
+    let Ok(server_root) = std::env::current_dir() else {
+        return serde_json::json!({"ok": false, "error": "backup_unavailable"});
+    };
+    let backup = server_root
+        .join("plugins")
+        .join("AuraEssentials")
+        .join("backups")
+        .join(format!("dimension-{token}"));
+    if let Err(error) = copy_directory(&target, &backup) {
+        let _ = fs::remove_dir_all(&backup);
+        return serde_json::json!({"ok": false, "error": "backup_failed", "detail": error.to_string()});
+    }
+    if let Err(error) = fs::remove_dir_all(&target) {
+        return serde_json::json!({"ok": false, "error": "dimension_delete_failed", "backup": backup.to_string_lossy(), "detail": error.to_string()});
+    }
+    if let Err(error) =
+        horizon_client::save::remove_custom_dimension_generator(&world_root, &plan.dimension)
+    {
+        return serde_json::json!({"ok": false, "error": "generator_entry_remove_failed", "backup": backup.to_string_lossy(), "detail": error.to_string()});
+    }
+    let _ = game.native_dimension_clear_game_rule_overrides(&plan.dimension);
+    serde_json::json!({"ok": true, "dimension": plan.dimension, "backup": backup.to_string_lossy()})
+}
+
+#[cfg(feature = "server-plugins")]
+fn reset_targets(root: &Path, categories: &[String]) -> Vec<PathBuf> {
+    let mut targets = Vec::new();
+    for category in categories {
+        let path = match category.as_str() {
+            "advancements" => root.join("advancements"),
+            "stats" => root.join("stats"),
+            "playerdata" => root.join("playerdata"),
+            _ => continue,
+        };
+        if path.exists() {
+            targets.push(path);
+        }
+    }
+    targets
+}
+
+#[cfg(feature = "server-plugins")]
+fn prepare_player_data_reset(game: &Game<'_>, data: &serde_json::Value) -> serde_json::Value {
+    let Some(categories) =
+        reset_categories(data.get("categories").unwrap_or(&serde_json::Value::Null))
+    else {
+        return serde_json::json!({"ok": false, "error": "invalid_categories"});
+    };
+    if !game.native_server_players().is_empty() {
+        return serde_json::json!({"ok": false, "error": "players_online"});
+    }
+    let targets = reset_targets(&game.world_root, &categories);
+    if targets.is_empty() {
+        return serde_json::json!({"ok": false, "error": "data_not_found"});
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64);
+    let nonce = PLAYER_DATA_RESET_NONCE.fetch_add(1, Ordering::Relaxed);
+    let token = format!("{now:016x}{nonce:016x}");
+    let plans = PLAYER_DATA_RESET_PLANS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut plans = plans.lock().unwrap_or_else(|error| error.into_inner());
+    plans.retain(|_, plan| plan.expires > Instant::now());
+    plans.insert(
+        token.clone(),
+        PlayerDataResetPlan {
+            categories: categories.clone(),
+            expires: Instant::now() + Duration::from_secs(60),
+        },
+    );
+    let affected: Vec<_> = targets
+        .iter()
+        .filter_map(|path| path.strip_prefix(&game.world_root).ok())
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    serde_json::json!({
+        "ok": true,
+        "token": token,
+        "expires_in_seconds": 60,
+        "categories": categories,
+        "affected_paths": affected,
+        "backup_required": true,
+    })
+}
+
+#[cfg(feature = "server-plugins")]
+fn copy_directory(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = destination.join(entry.file_name());
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "refusing to back up a symlink",
+            ));
+        }
+        if kind.is_dir() {
+            copy_directory(&source_path, &target_path)?;
+        } else if kind.is_file() {
+            fs::copy(source_path, target_path)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "server-plugins")]
+fn commit_player_data_reset(game: &Game<'_>, data: &serde_json::Value) -> serde_json::Value {
+    let Some(token) = data.get("token").and_then(serde_json::Value::as_str) else {
+        return serde_json::json!({"ok": false, "error": "missing_token"});
+    };
+    let plans = PLAYER_DATA_RESET_PLANS.get_or_init(|| Mutex::new(HashMap::new()));
+    let plan = plans
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(token);
+    let Some(plan) = plan else {
+        return serde_json::json!({"ok": false, "error": "invalid_or_expired_token"});
+    };
+    if plan.expires <= Instant::now() {
+        return serde_json::json!({"ok": false, "error": "invalid_or_expired_token"});
+    }
+    if !game.native_server_players().is_empty() {
+        return serde_json::json!({"ok": false, "error": "players_online"});
+    }
+    let Ok(world_root) = game.world_root.canonicalize() else {
+        return serde_json::json!({"ok": false, "error": "world_unavailable"});
+    };
+    let targets = reset_targets(&world_root, &plan.categories);
+    if targets.is_empty() {
+        return serde_json::json!({"ok": false, "error": "data_not_found"});
+    }
+    for target in &targets {
+        let Ok(metadata) = fs::symlink_metadata(target) else {
+            return serde_json::json!({"ok": false, "error": "data_unavailable"});
+        };
+        let Ok(canonical) = target.canonicalize() else {
+            return serde_json::json!({"ok": false, "error": "data_unavailable"});
+        };
+        if metadata.file_type().is_symlink() || !canonical.starts_with(&world_root) {
+            return serde_json::json!({"ok": false, "error": "unsafe_data_path"});
+        }
+    }
+    let Ok(server_root) = std::env::current_dir() else {
+        return serde_json::json!({"ok": false, "error": "backup_unavailable"});
+    };
+    let backup_root = server_root
+        .join("plugins")
+        .join("AuraEssentials")
+        .join("backups")
+        .join(format!("player-data-{token}"));
+    for target in &targets {
+        let Some(name) = target.file_name() else {
+            let _ = fs::remove_dir_all(&backup_root);
+            return serde_json::json!({"ok": false, "error": "unsafe_data_path"});
+        };
+        if let Err(error) = copy_directory(target, &backup_root.join(name)) {
+            let _ = fs::remove_dir_all(&backup_root);
+            return serde_json::json!({"ok": false, "error": "backup_failed", "detail": error.to_string()});
+        }
+    }
+    for target in &targets {
+        if let Err(error) = fs::remove_dir_all(target) {
+            return serde_json::json!({
+                "ok": false,
+                "error": "partial_reset_failed",
+                "backup": backup_root.to_string_lossy(),
+                "detail": error.to_string(),
+            });
+        }
+    }
+    serde_json::json!({
+        "ok": true,
+        "categories": plan.categories,
+        "backup": backup_root.to_string_lossy(),
+        "removed_paths": targets.iter().map(|path| path.to_string_lossy()).collect::<Vec<_>>(),
+    })
 }
 
 #[cfg(feature = "server-plugins")]
@@ -324,6 +823,46 @@ impl Host for GameHost<'_, '_, '_> {
                     "health": snapshot.health,
                 })
             }
+            op::PLAYER_LOOKUP | op::PLAYER_ONLINE_LIST => {
+                let players = self.game.native_server_players();
+                let result: Vec<_> = if operation == op::PLAYER_LOOKUP {
+                    let by_uuid =
+                        data.get("uuid")
+                            .and_then(|value| value.as_str())
+                            .and_then(|value| {
+                                u128::from_str_radix(value.trim_start_matches("0x"), 16).ok()
+                            });
+                    let by_name = data
+                        .get("name")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned);
+                    let Some(snapshot) = players.into_iter().find(|snapshot| {
+                        by_uuid.is_some_and(|uuid| snapshot.uuid == uuid)
+                            || by_name
+                                .as_ref()
+                                .is_some_and(|name| snapshot.name.eq_ignore_ascii_case(name))
+                    }) else {
+                        return fail("player_not_online");
+                    };
+                    vec![snapshot]
+                } else {
+                    players
+                };
+                serde_json::json!({
+                    "ok": true,
+                    "players": result.into_iter().map(|snapshot| serde_json::json!({
+                        "uuid": format!("{:032x}", snapshot.uuid),
+                        "name": snapshot.name,
+                        "dimension": snapshot.dimension,
+                        "position": snapshot.position,
+                        "yaw": snapshot.yaw,
+                        "pitch": snapshot.pitch,
+                        "game_mode": snapshot.game_mode,
+                        "permission_level": snapshot.permission,
+                        "health": snapshot.health,
+                    })).collect::<Vec<_>>()
+                })
+            }
             op::PLAYER_TELEPORT => {
                 let Some(dimension) = data.get("dimension").and_then(|v| v.as_str()) else {
                     return fail("invalid_dimension");
@@ -344,8 +883,32 @@ impl Host for GameHost<'_, '_, '_> {
                 };
                 let yaw = data.get("yaw").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
                 let pitch = data.get("pitch").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let target = match data.get("target") {
+                    None => player,
+                    Some(value) => {
+                        let Some(target) = value.as_str().and_then(|value| {
+                            u128::from_str_radix(value.trim_start_matches("0x"), 16).ok()
+                        }) else {
+                            return fail("invalid_target");
+                        };
+                        target
+                    }
+                };
+                if !self
+                    .game
+                    .native_server_players()
+                    .iter()
+                    .any(|snapshot| snapshot.uuid == target)
+                    && !self
+                        .game
+                        .native_acting_player()
+                        .is_some_and(|snapshot| snapshot.uuid == target)
+                {
+                    return fail("target_not_online");
+                }
                 serde_json::json!({
-                    "ok": self.game.native_teleport_player(player, dimension, position, yaw, pitch)
+                    "ok": self.game.native_teleport_player(target, dimension, position, yaw, pitch),
+                    "target": format!("{target:032x}")
                 })
             }
             op::PLAYER_GAME_MODE_SET => {
@@ -356,6 +919,9 @@ impl Host for GameHost<'_, '_, '_> {
                     "ok": self.game.native_set_game_mode(player, mode as i32)
                 })
             }
+            op::WORLD_LOCATION_FIND_SAFE => find_safe_location(self.game, player, &data),
+            op::WORLD_PLAYER_DATA_RESET_PREPARE => prepare_player_data_reset(self.game, &data),
+            op::WORLD_PLAYER_DATA_RESET_COMMIT => commit_player_data_reset(self.game, &data),
             op::WORLD_DIMENSIONS_LIST => {
                 let dimensions: Vec<_> = self
                     .game
@@ -450,6 +1016,9 @@ impl Host for GameHost<'_, '_, '_> {
                 };
                 serde_json::json!({"ok": self.game.native_unload_dimension(dimension)})
             }
+            op::WORLD_DIMENSION_CREATE => create_custom_dimension(self.game, &data),
+            op::WORLD_DIMENSION_DELETE_PREPARE => prepare_custom_dimension_delete(self.game, &data),
+            op::WORLD_DIMENSION_DELETE_COMMIT => commit_custom_dimension_delete(self.game, &data),
             op::SCOREBOARD_SIDEBAR_SET => {
                 let Some(title) = data.get("title") else {
                     return fail("missing_title");
@@ -654,11 +1223,27 @@ fn plugin_storage(operation: &str, data: &serde_json::Value) -> serde_json::Valu
     };
     let plugin_dir: PathBuf = root.join("plugins").join(namespace);
     let path = plugin_dir.join("storage.json");
-    if !path.exists() {
+    if namespace == "AuraEssentials" && !path.exists() {
         let legacy = root
+            .join("plugins")
+            .join("AuraEssentialsHorizon")
+            .join("storage.json");
+        if legacy.exists() {
+            let _ = fs::create_dir_all(&plugin_dir);
+            let _ = fs::rename(legacy, &path);
+        }
+    }
+    if !path.exists() {
+        let mut legacy = root
             .join("plugins")
             .join("data")
             .join(format!("{namespace}.json"));
+        if namespace == "AuraEssentials" && !legacy.exists() {
+            legacy = root
+                .join("plugins")
+                .join("data")
+                .join("AuraEssentialsHorizon.json");
+        }
         if legacy.exists()
             && fs::create_dir_all(&plugin_dir)
                 .and_then(|()| fs::rename(&legacy, &path))
@@ -801,6 +1386,7 @@ pub(super) fn register_commands(game: &mut Game<'_>, commands: &mut Vec<NativeCo
     let Some(root) = root() else {
         return;
     };
+    commands.push(NativeCommand::new("plugins"));
     let mut host = GameHost {
         game,
         commands: Some(commands),
@@ -833,6 +1419,28 @@ pub(super) fn perform_command(
     let Some(root) = root() else {
         return;
     };
+    if command.trim().trim_start_matches('/') == "plugins" {
+        let plugins = horizon_server_plugin_loader::plugins(&root);
+        let message = if plugins.is_empty() {
+            "Nenhum plugin carregado.".to_owned()
+        } else {
+            let entries = plugins
+                .iter()
+                .map(|plugin| {
+                    if plugin.enabled {
+                        format!("§a{}", plugin.name)
+                    } else {
+                        format!("§c{} (desativado)", plugin.name)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("§7, ");
+            format!("§7Plugins ({}): {entries}", plugins.len())
+        };
+        game.native_tell(player.uuid, Text::literal(message).resolve_legacy());
+        *ran = true;
+        return;
+    }
     let mut host = GameHost {
         game,
         commands: None,
@@ -952,6 +1560,22 @@ pub(super) fn player_join(game: &mut Game<'_>, player: u128, name: &str) {
 
 #[cfg(feature = "server-plugins")]
 pub(super) fn player_quit(game: &mut Game<'_>, player: u128, name: &str) {
+    let last_location = game
+        .native_server_players()
+        .into_iter()
+        .find(|snapshot| snapshot.uuid == player)
+        .or_else(|| {
+            game.native_acting_player()
+                .filter(|snapshot| snapshot.uuid == player)
+        })
+        .map(|snapshot| {
+            serde_json::json!({
+                "dimension": snapshot.dimension,
+                "position": snapshot.position,
+                "yaw": snapshot.yaw,
+                "pitch": snapshot.pitch,
+            })
+        });
     dispatch_event(
         game,
         horizon_server_plugin_api::event::PLAYER_QUIT,
@@ -959,7 +1583,7 @@ pub(super) fn player_quit(game: &mut Game<'_>, player: u128, name: &str) {
         name,
         [0; 3],
         0,
-        serde_json::Value::Null,
+        serde_json::json!({"last_location": last_location}),
     );
 }
 
@@ -1052,7 +1676,16 @@ pub(super) fn player_death(
         &player.name,
         player.position.map(|value| value.floor() as i32),
         0,
-        serde_json::json!({"damage_type": damage_type, "attacker_entity_id": attacker}),
+        serde_json::json!({
+            "damage_type": damage_type,
+            "attacker_entity_id": attacker,
+            "location": {
+                "dimension": player.dimension,
+                "position": player.position,
+                "yaw": player.yaw,
+                "pitch": player.pitch,
+            }
+        }),
     )
 }
 

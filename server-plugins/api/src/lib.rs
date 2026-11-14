@@ -19,6 +19,8 @@ pub mod event {
     pub const CHAT: u32 = 8;
     pub const RESOURCE_PACK_STATUS: u32 = 9;
     pub const PLAYER_TELEPORT: u32 = 10;
+    pub const PLAYER_MOVE: u32 = 11;
+    pub const SERVER_TASK: u32 = 12;
 }
 
 /// Stable operation names accepted by `HostApiV3::call_json`.
@@ -27,6 +29,8 @@ pub mod operation {
     pub const CHAT_SEND: &str = "chat.send";
     pub const MENU_OPEN: &str = "menu.open";
     pub const PLAYER_GET: &str = "player.get";
+    pub const PLAYER_LOOKUP: &str = "player.lookup";
+    pub const PLAYER_ONLINE_LIST: &str = "player.online.list";
     pub const PLAYER_TELEPORT: &str = "player.teleport";
     pub const PLAYER_GAME_MODE_SET: &str = "player.game_mode.set";
     pub const RESOURCE_PACK_SEND: &str = "resource_pack.send";
@@ -39,6 +43,14 @@ pub mod operation {
     pub const WORLD_CUSTOM_GAMERULE_SET: &str = "world.custom_gamerule.set";
     pub const WORLD_CUSTOM_GAMERULE_CLEAR: &str = "world.custom_gamerule.clear";
     pub const WORLD_DIMENSION_UNLOAD: &str = "world.dimension.unload";
+    pub const WORLD_DIMENSION_CREATE: &str = "world.dimension.create";
+    pub const WORLD_DIMENSION_DELETE_PREPARE: &str = "world.dimension.delete.prepare";
+    pub const WORLD_DIMENSION_DELETE_COMMIT: &str = "world.dimension.delete.commit";
+    pub const WORLD_LOCATION_FIND_SAFE: &str = "world.location.find_safe";
+    pub const WORLD_PLAYER_DATA_RESET_PREPARE: &str = "world.player_data.reset.prepare";
+    pub const WORLD_PLAYER_DATA_RESET_COMMIT: &str = "world.player_data.reset.commit";
+    pub const SCHEDULER_SCHEDULE: &str = "scheduler.schedule";
+    pub const SCHEDULER_CANCEL: &str = "scheduler.cancel";
     pub const SCOREBOARD_SIDEBAR_SET: &str = "scoreboard.sidebar.set";
     pub const SCOREBOARD_SIDEBAR_CLEAR: &str = "scoreboard.sidebar.clear";
     pub const PLUGIN_STORAGE_GET: &str = "plugin.storage.get";
@@ -48,6 +60,13 @@ pub mod operation {
     pub const ENTITY_TEXT_DISPLAY_CREATE: &str = "entity.text_display.create";
     pub const ENTITY_MOVE: &str = "entity.move";
     pub const ENTITY_REMOVE: &str = "entity.remove";
+    pub const ENTITY_DISPLAY_UPSERT: &str = "entity.display.upsert";
+    pub const ENTITY_DISPLAY_LIST: &str = "entity.display.list";
+    pub const ENTITY_DISPLAY_DELETE: &str = "entity.display.delete";
+    pub const INVENTORY_STACK_INSPECT: &str = "inventory.stack.inspect";
+    pub const TRANSACTION_COMMIT: &str = "transaction.commit";
+    pub const INVENTORY_DELIVERY_LIST: &str = "inventory.delivery.list";
+    pub const INVENTORY_DELIVERY_CLAIM: &str = "inventory.delivery.claim";
 }
 
 /// Return values from `HostApiV2::get_balance` and `HostApiV2::transact`.

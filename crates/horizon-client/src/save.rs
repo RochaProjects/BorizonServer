@@ -3461,6 +3461,101 @@ pub fn world_gen_settings(world: &Path) -> Option<Tag> {
             .cloned()
     })
 }
+
+/// Add or replace the generator used by a custom dimension in the world's
+/// saved registry. The dimension ID remains stable; callers create/remove its
+/// storage directory separately.
+pub fn set_custom_dimension_generator(world: &Path, dimension: &str, preset: &str) -> Result<()> {
+    let (namespace, path) = dimension
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("dimension id must be namespaced"))?;
+    if namespace == "minecraft"
+        || namespace.is_empty()
+        || path.is_empty()
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        anyhow::bail!("invalid custom dimension id");
+    }
+    let mut settings = world_gen_settings(world)
+        .ok_or_else(|| anyhow::anyhow!("world generator settings are missing"))?;
+    let (kind, generator) = match preset {
+        "overworld" => ("minecraft:overworld", "minecraft:overworld"),
+        "nether" => ("minecraft:the_nether", "minecraft:the_nether"),
+        "end" => ("minecraft:the_end", "minecraft:the_end"),
+        "flat" => ("minecraft:overworld", "minecraft:flat"),
+        _ => anyhow::bail!("unknown dimension preset"),
+    };
+    let source = settings
+        .get("dimensions")
+        .and_then(|dimensions| dimensions.get(kind))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("generator template is missing"))?;
+    let dimension_data = if preset == "flat" {
+        Tag::compound([
+            ("type", string("minecraft:overworld")),
+            (
+                "generator",
+                Tag::compound([
+                    ("type", string(generator)),
+                    (
+                        "settings",
+                        Tag::compound([
+                            ("biome", string("minecraft:plains")),
+                            ("features", Tag::Byte(0)),
+                            ("lakes", Tag::Byte(0)),
+                            (
+                                "layers",
+                                Tag::List(vec![
+                                    Tag::compound([
+                                        ("block", string("minecraft:bedrock")),
+                                        ("height", Tag::Int(1)),
+                                    ]),
+                                    Tag::compound([
+                                        ("block", string("minecraft:dirt")),
+                                        ("height", Tag::Int(2)),
+                                    ]),
+                                    Tag::compound([
+                                        ("block", string("minecraft:grass_block")),
+                                        ("height", Tag::Int(1)),
+                                    ]),
+                                ]),
+                            ),
+                            (
+                                "structure_overrides",
+                                Tag::List(vec![
+                                    string("minecraft:strongholds"),
+                                    string("minecraft:villages"),
+                                ]),
+                            ),
+                        ]),
+                    ),
+                ]),
+            ),
+        ])
+    } else {
+        source
+    };
+    let Some(Tag::Compound(dimensions)) = settings.get_mut("dimensions") else {
+        anyhow::bail!("world dimension registry is invalid");
+    };
+    dimensions.insert(dimension.into(), dimension_data);
+    write_saved_data(world, "world_gen_settings", settings)
+}
+
+/// Remove a custom dimension's generator entry after its region data is safely
+/// backed up and deleted.
+pub fn remove_custom_dimension_generator(world: &Path, dimension: &str) -> Result<()> {
+    let mut settings = world_gen_settings(world)
+        .ok_or_else(|| anyhow::anyhow!("world generator settings are missing"))?;
+    let Some(Tag::Compound(dimensions)) = settings.get_mut("dimensions") else {
+        anyhow::bail!("world dimension registry is invalid");
+    };
+    dimensions.remove(&dimension.into());
+    write_saved_data(world, "world_gen_settings", settings)
+}
+
 fn write_saved_data(world: &Path, name: &str, data: Tag) -> Result<()> {
     write_dat(
         &saved_data_path(world, name),

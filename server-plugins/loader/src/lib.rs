@@ -81,6 +81,13 @@ struct LoadedPlugin {
     _library: Library,
 }
 
+/// A plugin currently loaded by the dedicated server.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginInfo {
+    pub name: String,
+    pub enabled: bool,
+}
+
 #[derive(Clone, Copy)]
 enum PluginDescriptor {
     V2(&'static PluginV2),
@@ -152,7 +159,21 @@ impl BalanceStore {
         if self.path.is_some() {
             return;
         }
-        let plugin_dir = plugins_dir.join("AuraEssentialsHorizon");
+        let plugin_dir = plugins_dir.join("AuraEssentials");
+        let legacy_dir = plugins_dir.join("AuraEssentialsHorizon");
+        if legacy_dir.is_dir() {
+            if !plugin_dir.exists() {
+                let _ = fs::rename(&legacy_dir, &plugin_dir);
+            } else if let Ok(entries) = fs::read_dir(&legacy_dir) {
+                for entry in entries.flatten() {
+                    let from = entry.path();
+                    let to = plugin_dir.join(entry.file_name());
+                    if !to.exists() {
+                        let _ = fs::rename(from, to);
+                    }
+                }
+            }
+        }
         let path = plugin_dir.join("balances.json");
         self.path = Some(path.clone());
         self.available = true;
@@ -801,6 +822,20 @@ unsafe fn load_plugin(path: &Path) -> Result<LoadedPlugin, String> {
 
 fn plugin_name(plugin: PluginDescriptor) -> String {
     plugin.name()
+}
+
+/// Names and runtime state for `/plugins` and other generic server tooling.
+pub fn plugins(root: &Path) -> Vec<PluginInfo> {
+    let lock = load_once(root);
+    let state = lock.lock().unwrap_or_else(|error| error.into_inner());
+    state
+        .plugins
+        .iter()
+        .map(|plugin| PluginInfo {
+            name: plugin_name(plugin.descriptor),
+            enabled: !plugin.disabled,
+        })
+        .collect()
 }
 
 pub fn register_commands(root: &Path, host: &mut dyn Host) {

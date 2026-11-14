@@ -139,10 +139,10 @@ impl View {
                     color: None,
                     options: 3,
                 });
-            if let Some((old_team, _)) = prior {
-                if let Some((_, players)) = view.teams.get_mut(&old_team) {
-                    players.retain(|member| member != player);
-                }
+            if let Some((old_team, _)) = prior
+                && let Some((_, players)) = view.teams.get_mut(&old_team)
+            {
+                players.retain(|member| member != player);
             }
             let combine = |a: &Tag, b: &Tag| {
                 component_tag(

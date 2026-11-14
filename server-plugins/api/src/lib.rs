@@ -5,6 +5,8 @@ use std::ffi::c_void;
 
 pub const ABI_VERSION: u32 = 2;
 pub const ABI_VERSION_V3: u32 = 3;
+/// Prefix passed to a plugin's existing command callback during dynamic tab completion.
+pub const COMMAND_COMPLETION_PREFIX: &str = "__horizon_tab_complete__:";
 pub type ByteSlice = *const u8;
 
 /// Stable numeric identifiers for generic server events in ABI v2.
@@ -26,17 +28,25 @@ pub mod event {
 /// Stable operation names accepted by `HostApiV3::call_json`.
 pub mod operation {
     pub const COMMAND_REGISTER: &str = "command.register";
+    /// Appends one Brigadier completion while the loader is querying plugins.
+    pub const COMMAND_SUGGESTION_ADD: &str = "command.suggestions.add";
     pub const CHAT_SEND: &str = "chat.send";
     pub const MENU_OPEN: &str = "menu.open";
     pub const PLAYER_GET: &str = "player.get";
     pub const PLAYER_LOOKUP: &str = "player.lookup";
     pub const PLAYER_ONLINE_LIST: &str = "player.online.list";
+    /// Reads one vanilla statistic for an online player (for example custom:minecraft.player_kills).
+    pub const PLAYER_STAT_GET: &str = "player.stat.get";
+    /// Reads all saved vanilla statistics for an online player.
+    pub const PLAYER_STATS_GET: &str = "player.stats.get";
     pub const PLAYER_TELEPORT: &str = "player.teleport";
     pub const PLAYER_GAME_MODE_SET: &str = "player.game_mode.set";
     pub const RESOURCE_PACK_SEND: &str = "resource_pack.send";
     pub const RESOURCE_PACK_SEND_BATCH: &str = "resource_pack.send_batch";
     pub const RESOURCE_PACK_REMOVE: &str = "resource_pack.remove";
     pub const WORLD_DIMENSIONS_LIST: &str = "world.dimensions.list";
+    /// Opens an existing dimension and optionally keeps a chunk ticket for it.
+    pub const WORLD_DIMENSION_LOAD: &str = "world.dimension.load";
     pub const WORLD_GAMERULE_GET: &str = "world.gamerule.get";
     pub const WORLD_GAMERULE_SET: &str = "world.gamerule.set";
     pub const WORLD_CUSTOM_GAMERULE_GET: &str = "world.custom_gamerule.get";
@@ -47,9 +57,22 @@ pub mod operation {
     pub const WORLD_DIMENSION_DELETE_PREPARE: &str = "world.dimension.delete.prepare";
     pub const WORLD_DIMENSION_DELETE_COMMIT: &str = "world.dimension.delete.commit";
     pub const WORLD_LOCATION_FIND_SAFE: &str = "world.location.find_safe";
+    /// Creates a short-lived reset plan. Its response reports whether online players require force mode.
     pub const WORLD_PLAYER_DATA_RESET_PREPARE: &str = "world.player_data.reset.prepare";
+    /// Commits a reset with backups by default; `backup: false` skips them.
     pub const WORLD_PLAYER_DATA_RESET_COMMIT: &str = "world.player_data.reset.commit";
+    /// Refuses new logins and kicks connected players for a generic maintenance window.
+    pub const SERVER_MAINTENANCE_BEGIN: &str = "server.maintenance.begin";
+    /// Reads the maintenance gate and number of admitted sessions.
+    pub const SERVER_MAINTENANCE_STATUS: &str = "server.maintenance.status";
+    /// Reopens logins only after all sessions have left.
+    pub const SERVER_MAINTENANCE_END: &str = "server.maintenance.end";
+    /// Writes a bounded INFO/WARN/ERROR line to the server log.
+    pub const SERVER_LOG: &str = "server.log";
+    /// Runs an arbitrary plugin task after the requested number of server ticks. Optional
+    /// `period_ticks` repeats it at that interval until `scheduler.cancel` removes its task id.
     pub const SCHEDULER_SCHEDULE: &str = "scheduler.schedule";
+    /// Cancels a task that has not run yet.
     pub const SCHEDULER_CANCEL: &str = "scheduler.cancel";
     pub const SCOREBOARD_SIDEBAR_SET: &str = "scoreboard.sidebar.set";
     pub const SCOREBOARD_SIDEBAR_CLEAR: &str = "scoreboard.sidebar.clear";

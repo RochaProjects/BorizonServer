@@ -3469,9 +3469,12 @@ pub fn set_custom_dimension_generator(world: &Path, dimension: &str, preset: &st
     let (namespace, path) = dimension
         .split_once(':')
         .ok_or_else(|| std::io::Error::other("dimension id must be namespaced"))?;
-    if namespace == "minecraft"
-        || namespace.is_empty()
+    if namespace.is_empty()
         || path.is_empty()
+        || matches!(
+            dimension,
+            "minecraft:overworld" | "minecraft:the_nether" | "minecraft:the_end"
+        )
         || path
             .split('/')
             .any(|part| part.is_empty() || part == "." || part == "..")

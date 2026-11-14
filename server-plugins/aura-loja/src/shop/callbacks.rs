@@ -15,6 +15,7 @@ use std::ffi::c_void;
 unsafe extern "C-unwind" fn create() -> *mut c_void {
     let mut plugin_state = state().lock().unwrap_or_else(|error| error.into_inner());
     ensure_loaded(&mut plugin_state);
+    essentials::ensure_resource_pack_config();
     Box::into_raw(Box::new(())) as *mut c_void
 }
 unsafe extern "C-unwind" fn destroy(state: *mut c_void) {
@@ -59,16 +60,22 @@ unsafe extern "C-unwind" fn command(
     line: *const u8,
     len: usize,
 ) -> u8 {
-    if host.is_null() || line.is_null() || len > 512 {
+    if host.is_null() || line.is_null() || len > 1024 {
         return 0;
     }
     let line = unsafe { std::slice::from_raw_parts(line, len) };
     let Ok(line) = std::str::from_utf8(line) else {
         return 0;
     };
-    let line = line.trim().trim_start_matches('/');
+    let raw_line = line.strip_prefix('/').unwrap_or(line);
+    let line = raw_line.trim();
     let host = unsafe { &*host };
     let player = (u128::from(high) << 64) | u128::from(low);
+    if let Some(line) = raw_line.strip_prefix(horizon_server_plugin_api::COMMAND_COMPLETION_PREFIX)
+    {
+        essentials::suggestions(host, player, line);
+        return 1;
+    }
     if essentials::command(host, player, line) {
         return 1;
     }
@@ -121,6 +128,18 @@ unsafe extern "C-unwind" fn menu_click(
         return;
     };
     match view {
+        View::Warps { page, pages, slots } => {
+            if slot == 45 && page > 0 {
+                drop(state);
+                essentials::open_warps_page(host, player, page - 1);
+            } else if slot == 53 && page + 1 < pages {
+                drop(state);
+                essentials::open_warps_page(host, player, page + 1);
+            } else if let Some(name) = slots.get(&slot).cloned() {
+                drop(state);
+                essentials::teleport_warp(host, player, &name);
+            }
+        }
         View::Categories(mapping) => {
             if let Some(category) = mapping.get(&slot).copied() {
                 open_items(&mut state, host, player, category, 0);

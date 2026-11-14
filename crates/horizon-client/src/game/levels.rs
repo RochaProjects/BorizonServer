@@ -614,6 +614,9 @@ impl Game<'_> {
         // `ServerTickEvent.Pre`. A paused pass and a held server tick nothing.
         let running = (!paused && !self.agent.hold_server).then(|| self.clock.world_runs());
         let server = self.serving.is_some() || self.options.dedicated.is_some();
+        if server {
+            super::server_plugins::begin_server_tick();
+        }
         // A config edited while the server is paused (empty) still reloads.
         // The parts outside every level get spans of their own, so that a slow
         // tick's line and `horizon-report` say when a mod's tick hook took it.
@@ -732,6 +735,10 @@ impl Game<'_> {
         if let Err(error) = closed {
             self.native_lifecycle.cancel_server_tick();
             return Err(error);
+        }
+        if server {
+            let _span = horizon_client::spans::guard("server_plugin_tasks");
+            super::server_plugins::run_scheduled_tasks(self);
         }
         // `ServerTickEnd`: an errored tick or an idle-close failure (at
         // the `?` above) never reaches this site.

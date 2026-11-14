@@ -1503,6 +1503,18 @@ fn login_and_configure(
             _ => {}
         }
     }
+    if shared.maintenance_active() {
+        let reason = horizon_world::nbt::Tag::String(horizon_world::nbt::JavaString::from(
+            "Server maintenance in progress",
+        ));
+        let _ = send(c, cfg::Clientbound::Disconnect(cfg::Disconnect { reason }));
+        lost(
+            shared,
+            &format!("{name} ({})", uuid_string(uuid)),
+            "Server maintenance in progress",
+        );
+        return Ok(None);
+    }
     Ok(Some(Parts {
         uuid,
         name: name.to_owned(),
@@ -1673,13 +1685,24 @@ fn wait_alive<T>(
 }
 
 fn play(
-    c: Connection,
+    mut c: Connection,
     shared: &Arc<Shared>,
     parts: Parts,
     address: std::net::SocketAddr,
     counted: Option<super::Counted>,
     expected: bool,
 ) {
+    // Close the small race where maintenance starts after configuration's
+    // final check but before this connection enters the play state.
+    if shared.maintenance_active() {
+        let reason = horizon_world::nbt::Tag::String(horizon_world::nbt::JavaString::from(
+            "Server maintenance in progress",
+        ));
+        let packet = cfg::Clientbound::Disconnect(cfg::Disconnect { reason });
+        let _ = c.send(&packet.encode());
+        shared.release(parts.uuid);
+        return;
+    }
     shared.entered_play();
     let conn = shared.next_id();
     let pending = Arc::new(AtomicUsize::new(0));

@@ -3852,6 +3852,7 @@ impl Game<'_> {
         let parse = d.parse(command, &self.ui.registries);
         let ((mut start, mut end), mut suggestions) =
             d.suggestions(&parse, command.len(), &self.ui.registries);
+        let mut plugin_command = false;
         let (label, rest) = command.split_once(' ').unwrap_or((command, ""));
         let arguments: Vec<String> = if command.contains(' ') {
             rest.split(' ').map(str::to_owned).collect()
@@ -3862,6 +3863,7 @@ impl Game<'_> {
         if let Some(typed) = arguments.last()
             && Self::native_command_level(host, command).is_some_and(|l| l <= permission)
         {
+            plugin_command = true;
             (start, end) = (command.len() - typed.len(), command.len());
             let words: Vec<&str> = arguments.iter().map(String::as_str).collect();
             if super::native_server::completes_player_name(
@@ -3897,6 +3899,13 @@ impl Game<'_> {
         reg.banned_players = own_banned;
         reg.banned_ips = own_banned_ips;
         reg.whitelisted = own_whitelisted;
+        if plugin_command {
+            suggestions.extend(super::server_plugins::tab_complete(
+                self,
+                player_uuid,
+                command,
+            ));
+        }
         // ServerCommandSuggestionsProvider.limitSuggestionCount.
         suggestions.truncate(1000);
         let utf16 = |byte: usize| command[..byte.min(command.len())].encode_utf16().count() as i32;

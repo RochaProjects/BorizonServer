@@ -131,14 +131,16 @@ impl Game<'_> {
     }
     #[allow(dead_code)]
     fn native_custom_dimension_dir(&self, dimension: &str) -> Option<std::path::PathBuf> {
-        if dimension.starts_with("minecraft:") {
+        if matches!(
+            dimension,
+            "minecraft:overworld" | "minecraft:the_nether" | "minecraft:the_end"
+        ) {
             return None;
         }
         let key = horizon_core::LevelKey::parse(dimension).ok()?;
         let namespace = key.namespace();
         let path = key.path();
-        if namespace == "minecraft"
-            || path.is_empty()
+        if path.is_empty()
             || path
                 .split('/')
                 .any(|segment| segment.is_empty() || segment == "." || segment == "..")

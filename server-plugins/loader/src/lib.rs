@@ -67,6 +67,9 @@ pub trait Host {
     ) -> Result<(), TransactionError>;
     /// Dispatches an extensible JSON request. The response is also a JSON value.
     fn call_json(&mut self, player: u128, request: serde_json::Value) -> serde_json::Value;
+    fn take_command_suggestions(&mut self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 struct HostBridge<'a> {
@@ -932,6 +935,64 @@ pub fn perform_command(root: &Path, host: &mut dyn Host, player: u128, command: 
         }
     }
     false
+}
+
+/// Ask plugins for dynamic Brigadier completions without adding another C ABI callback.
+pub fn tab_complete(root: &Path, host: &mut dyn Host, player: u128, line: &str) -> Vec<String> {
+    const PREFIX: &str = horizon_server_plugin_api::COMMAND_COMPLETION_PREFIX;
+    if line.len() > 512 {
+        return Vec::new();
+    }
+    let request = format!("{PREFIX}{line}");
+    let lock = load_once(root);
+    let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+    let (high, low) = uuid_parts(player);
+    let Loader {
+        plugins, balances, ..
+    } = &mut *state;
+    for plugin in plugins {
+        if plugin.disabled {
+            continue;
+        }
+        let result = match plugin.descriptor {
+            PluginDescriptor::V2(descriptor) => {
+                let (mut api, mut bridge) = host_api(host, balances);
+                bind_api(&mut api, &mut bridge);
+                catch_unwind(AssertUnwindSafe(|| unsafe {
+                    descriptor.command.expect("validado")(
+                        plugin.state,
+                        &api,
+                        high,
+                        low,
+                        request.as_ptr(),
+                        request.len(),
+                    )
+                }))
+            }
+            PluginDescriptor::V3(descriptor) => {
+                let (mut api, mut bridge) = host_api_v3(host, balances);
+                bind_api_v3(&mut api, &mut bridge);
+                catch_unwind(AssertUnwindSafe(|| unsafe {
+                    descriptor.command.expect("validado")(
+                        plugin.state,
+                        &api,
+                        high,
+                        low,
+                        request.as_ptr(),
+                        request.len(),
+                    )
+                }))
+            }
+        };
+        if result.is_err() {
+            plugin.disabled = true;
+            log::error!(
+                "Plugin {} desativado após panic",
+                plugin_name(plugin.descriptor)
+            );
+        }
+    }
+    host.take_command_suggestions()
 }
 
 pub fn menu_click(

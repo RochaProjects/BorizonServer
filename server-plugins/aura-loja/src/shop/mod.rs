@@ -78,11 +78,11 @@ struct Category {
     items: Vec<ShopItem>,
 }
 
-struct State {
+pub(crate) struct State {
     loaded: bool,
     config: ShopConfig,
     categories: Vec<Category>,
-    views: HashMap<(u128, i32), View>,
+    pub(crate) views: HashMap<(u128, i32), View>,
 }
 
 impl Default for State {
@@ -100,8 +100,13 @@ impl Default for State {
 }
 
 #[derive(Clone)]
-enum View {
+pub(crate) enum View {
     Categories(HashMap<i32, usize>),
+    Warps {
+        page: usize,
+        pages: usize,
+        slots: HashMap<i32, String>,
+    },
     Items {
         category: usize,
         page: usize,
@@ -118,7 +123,7 @@ enum View {
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 
-fn state() -> &'static Mutex<State> {
+pub(crate) fn state() -> &'static Mutex<State> {
     STATE.get_or_init(|| Mutex::new(State::default()))
 }
 

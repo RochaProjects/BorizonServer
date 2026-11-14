@@ -122,20 +122,30 @@ ABI v3's `call_json` accepts an UTF-8 JSON object `{ "operation": "...", "data":
 | Operation | Purpose |
 |---|---|
 | `command.register` | Register usage, operator-level fallback, and optional named permission node during plugin startup. |
+| `command.suggestions.add` | Add one dynamic completion while the loader is querying a plugin's command callback. |
 | `chat.send` | Send a structured Minecraft text component to the callback player. |
 | `menu.open` | Open a virtual chest with structured title, item names and lore; clicks go to `menu_click`. |
 | `player.get` | Read online player's UUID, name, dimension, coordinates, rotation, mode, permission level and health. |
 | `player.teleport` | Teleport to coordinates in a built-in or valid custom dimension; pending cross-level moves are queued by the server. |
 | `player.game_mode.set` | Change the player's vanilla game mode. |
 | `resource_pack.send`, `resource_pack.send_batch`, `resource_pack.remove` | Send/remove Java Edition server resource packs; batch sends 1–8 pack pushes in order during one plugin API call, and pack status is delivered as an event. This does not turn separate packs into a single archive or make the current Play-stage send happen before spawn. |
-| `world.dimensions.list` | List built-in dimensions and custom dimensions that exist in the save. |
+| `world.dimensions.list` | List built-in/custom dimensions that exist in the save and `loaded_dimensions` currently open in memory. |
+| `world.dimension.load` / `world.dimension.unload` | Open or close an existing dimension. `load` can take a namespaced `owner` to keep a chunk ticket and keep the dimension ticking until `unload` releases that owner. |
 | `world.gamerule.get/set` | Read/change a vanilla gamerule for a loaded built-in level. Vanilla rules remain shared according to Horizon's current vanilla level model. |
 | `world.custom_gamerule.get/set/clear` | Read, override or clear a gamerule override for an existing custom dimension. |
 | `world.dimension.unload` | Save and unload an idle custom level when no player or ticket uses it. |
+| `world.player_data.reset.prepare/commit` | Prepare a short-lived global reset plan and then remove its selected player-data categories. Commit creates a backup by default; `backup: false` skips it. Player data cannot be committed while sessions remain online. |
+| `server.maintenance.begin/status/end` | Temporarily refuse new logins, kick connected players, inspect admitted sessions, and reopen logins only after the server is empty. |
+| `scheduler.schedule/cancel` | Schedule a plugin callback (`event::SERVER_TASK`) after a bounded number of server ticks, optionally repeat it with `period_ticks`, or cancel it before the next run. |
+| `server.log` | Write a bounded INFO, WARN, or ERROR line to the server log. |
 | `scoreboard.sidebar.set/clear` | Show a title and up to 15 styled lines (optional right-side value) to one player. |
+| `player.stat.get` | Read one vanilla statistic for an online player (`type` and `key`, such as `custom` + `player_kills`). Returns zero for an unrecorded statistic. |
+| `player.stats.get` | Read the complete vanilla statistics JSON for an online player. |
 | `entity.text_display.create` | Create a vanilla text display in a loaded custom or built-in level, with alignment, billboard, background, shadow and width settings; useful for holograms. |
 | `entity.move/remove` | Move or remove an entity Horizon keeps as a non-simulated display/marker, by dimension and entity ID. |
 | `plugin.storage.get/set/delete/list` | Persist JSON values under `plugins/<PluginId>/storage.json`, atomically, for homes, warps, requests, listings, and other plugin state. Values are capped at 8 KiB each and 4 MiB per plugin file. Existing `plugins/data/<PluginId>.json` data is moved on first access. |
+
+For a dynamic word argument, register it as `word?` (for example `home [name:word?]`). During completion the existing `command` callback receives `COMMAND_COMPLETION_PREFIX` followed by the typed command line; detect and strip this public constant, then add filtered values with `command.suggestions.add`. The loader does not execute the typed command for a completion request. This keeps the C ABI layout unchanged.
 
 Example request for a sidebar:
 
@@ -143,9 +153,18 @@ Example request for a sidebar:
 {"operation":"scoreboard.sidebar.set","data":{"title":{"text":"Servidor","color":"gold"},"lines":[{"left":{"text":"Saldo: ","color":"gray"},"right":{"text":"120","color":"green"}}]}}
 ```
 
+Periodic tasks can include `period_ticks` (1–120000) alongside `delay_ticks`; their `SERVER_TASK`
+event repeats until cancelled. The AuraEssentials sidebar uses a 40-tick interval (2 seconds),
+reads vanilla kills, deaths and playtime through `player.stat.get`, and reads online balances through
+the generic economy API. Its title, lines, refresh interval, currency IDs and glyph catalog are
+editable in `plugins/AuraEssentials/scoreboard.json`; there are no scoreboard editing commands.
+Placeholders include `%kills%`, `%kills_short%`, `%deaths%`, `%deaths_short%`, `%saldo%`,
+`%saldo_short%`, `%credito%`, `%credito_short%`, `%online%`, `%playtime%`, `%player%`, `%world%`,
+`%x%`, `%y%`, `%z%`, `%rank_glyph%`, and `%glyph_<nome>%` for the Java resource-pack glyph catalog.
+
 Storage requests include the plugin's lowercase ID as `plugin` and a `key`; `set` also takes any JSON `value`. `list` may omit `key` or use it as a prefix, and supports `limit` (1–256) plus the previous response's `next` value as `after`. Keep each plugin on its own ID. Plugins are trusted native code, so this namespace is organization and collision avoidance, not a security boundary.
 
-Events currently include player join/quit, block break/place, menu close, dimension change, teleport, death, chat and Java resource-pack status. ABI v3 callbacks receive `{player,name,dimension,window_id,position,data_id,data}`. Current place events and chat events are notifications after the action; block-break events can be canceled. For plugin features that need cancellable place, chat formatting/interception, movement/interaction protection, or entity damage events, the engine still needs a hook before the action is committed.
+Events currently include player join/quit, block break/place, menu close, dimension change, teleport, death, chat, Java resource-pack status, and scheduled server tasks. ABI v3 callbacks receive `{player,name,dimension,window_id,position,data_id,data}`. Current place events and chat events are notifications after the action; block-break events can be canceled. For plugin features that need cancellable place, chat formatting/interception, movement/interaction protection, or entity damage events, the engine still needs a hook before the action is committed.
 
 Dimension APIs expose the engine's existing model: the three built-in dimensions, custom dimensions defined by the world's loaded data packs, and fallback custom dimensions opened with the Overworld generator. They do not yet create/rename/reset dimensions or select a new Nether/End/flat generator at runtime. Those need a separate world-registry/generation capability before a plugin can promise those operations. Text displays provide a vanilla primitive for holograms; actual player-model NPCs with skins need a fake-player/profile and entity-tracking API that this ABI does not expose yet. Java resource packs are sent by Horizon; Bedrock packs and Geyser extensions belong to the separate Velocity/Geyser proxy and are outside this backend API.
 
@@ -171,7 +190,7 @@ The host catches Rust panics at plugin callbacks and disables a plugin that pani
 
 `aura-loja/` is the legacy crate directory and Cargo package name; the plugin's public name in `/plugins` is `AuraEssentials`. Feature code is split under `aura-loja/src/`: `essentials/` for player commands, `shop/` for the chest shop, and `plugin_api.rs` for shared SDK calls. Persistent files live in `plugins/AuraEssentials/`; files from the former `AuraEssentialsHorizon/` folder migrate without overwriting newer files. The shop creates `config.json` and `shop.json` without overwriting files already present. `shop.json` contains the eight Portuguese categories and their products; edit a category array to add/remove products, set `icon`, `lore`, `itemModel` or `components`, and products are paginated automatically to fit the chest. `config.json` controls the menu title and the normal/VIP currency IDs. An operator can run `/loja recarregar` to validate and apply both files without restarting. Buying and selling use the generic transaction API. `aura:coins` and `aura:credits` start at zero; an economy/admin plugin or an operator-managed `balances.json` entry must credit a player before purchases succeed. Selling still requires the corresponding plain items in the online player's inventory.
 
-Essentials currently exposes homes and warps (including delete/list), `/tpa`, `/tpahere`, `/aceitar`, `/negar`, `/back`, `/rtp`, and `/mundo` for listing/creating/teleporting to dimensions, custom gamerules, delete confirmation, aliases, and prepared global data reset. TPA requests expire after 30 seconds and are discarded on quit. RTP searches only already loaded chunks; it does not generate chunks asynchronously and reports failure when it cannot find a safe loaded location. Dimension aliases preserve stable IDs. Global player-data reset refuses to run while any player is online. Auctions, direct player trade, persistent hologram CRUD, and fake-player NPC models still need generic inventory transaction, scheduled-job, display ownership, and fake-player APIs respectively; do not treat them as implemented by the current command set.
+Essentials currently exposes homes and warps (including delete/list), `/tpa`, `/tpahere`, `/aceitar`, `/negar`, `/back`, `/rtp`, and `/mundo` for listing, creating, loading/unloading, teleporting, custom gamerules, display aliases, and global data reset. TPA requests expire after 30 seconds and are discarded on quit. RTP searches only already loaded chunks; it does not generate chunks asynchronously and reports failure when it cannot find a safe loaded location. Dimension IDs remain stable; built-in IDs stay `minecraft:overworld`, `minecraft:the_nether` and `minecraft:the_end`, while `/mundo criar <nome> <preset>` creates `minecraft:<nome-em-minusculas>` and uses the supplied name in commands and suggestions. `/mundo definirprincipal <nome>` loads and keeps that dimension open at startup; it does not require a previously defined spawn. `/mundo tp <nome>` uses a saved spawn or the player's current location for the first visit, then `/mundo definirspawn` saves that dimension's spawn. `/mundo reset conquistas` and `/mundo reset estatisticas` run immediately with a backup. `/mundo reset jogadores force` immediately blocks new logins, kicks active players, waits for their sessions to save and close, then deletes player data without creating a backup. The engine reset token remains internal to the scheduled operation; players do not need a token or second confirmation command. The generic maintenance, scheduler and dimension load APIs can also support future plugin operations. Auctions, direct player trade, persistent hologram CRUD, and fake-player NPC models still need additional plugin APIs; do not treat them as implemented by the current command set.
 
 Menu item models are Java-side item components. They can point at models/textures supplied by a Java resource pack; the plugin can request several Java packs in one API batch, but clients still receive and report each pack separately. Bedrock item textures are controlled by Geyser/Floodgate's proxy resource-pack setup, not by the Horizon backend plugin API.
 

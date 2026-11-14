@@ -463,6 +463,8 @@ pub struct Shared {
     turned_away: Mutex<(usize, Option<Instant>)>,
     /// A stop waits for a proxy to move the players out (`arrivals::StopWait`): no login comes in.
     shutting_down: AtomicBool,
+    /// A temporary, plugin-controlled maintenance window: new logins are refused until it ends.
+    maintenance: AtomicBool,
 }
 impl Shared {
     /// The registries and tags a new connection is sent.
@@ -485,7 +487,10 @@ impl Shared {
         uuid: u128,
         name: &str,
     ) -> Option<horizon_world::nbt::Tag> {
-        if self.shutting_down.load(Ordering::Relaxed) {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Some(translatable("multiplayer.disconnect.server_shutdown", &[]));
+        }
+        if self.maintenance.load(Ordering::Acquire) {
             return Some(translatable("multiplayer.disconnect.server_shutdown", &[]));
         }
         // IntegratedPlayerList.canPlayerLogin: the owner's name (ignoring case,
@@ -530,6 +535,12 @@ impl Shared {
     /// A stop has begun: every login from now on is refused as the server's shutdown.
     pub fn refuse_logins(&self) {
         self.shutting_down.store(true, Ordering::Relaxed);
+    }
+    pub fn maintenance_active(&self) -> bool {
+        self.maintenance.load(Ordering::Acquire)
+    }
+    pub fn set_maintenance(&self, active: bool) {
+        self.maintenance.store(active, Ordering::Release);
     }
     fn is_online(&self, uuid: u128) -> bool {
         self.online.lock().unwrap().iter().any(|(u, _)| *u == uuid)
@@ -720,6 +731,7 @@ impl Lan {
             closing: AtomicUsize::new(0),
             turned_away: Mutex::new((0, None)),
             shutting_down: AtomicBool::new(false),
+            maintenance: AtomicBool::new(false),
             random: Mutex::new(crate::server::java_properties::now_millis() as u64 | 1),
             config,
         });

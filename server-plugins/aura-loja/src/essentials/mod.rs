@@ -5,21 +5,28 @@ use horizon_server_plugin_api::{HostApiV3, operation};
 
 const STORAGE_ID: &str = "AuraEssentials";
 
+mod resource_packs;
+mod scoreboard;
 mod teleport;
 mod worlds;
 
+pub fn ensure_resource_pack_config() {
+    resource_packs::ensure_default_file();
+}
+
 pub fn register_commands(host: &HostApiV3) {
+    scoreboard::start(host);
     teleport::register_commands(host);
     worlds::register_commands(host);
     for (usage, level, permission) in [
         ("sethome <nome:word>", 0, None),
-        ("home [nome:word]", 0, None),
+        ("home [nome:word?]", 0, None),
         ("homes", 0, None),
-        ("delhome <nome:word>", 0, None),
+        ("delhome <nome:word?>", 0, None),
         ("setwarp <nome:word>", 2, Some("auraessentials.warp.admin")),
-        ("warp <nome:word>", 0, None),
+        ("warp [nome:word?]", 0, None),
         ("warps", 0, None),
-        ("delwarp <nome:word>", 2, Some("auraessentials.warp.admin")),
+        ("delwarp <nome:word?>", 2, Some("auraessentials.warp.admin")),
         ("rtp", 0, None),
     ] {
         let mut data = serde_json::json!({"usage": usage, "default_level": level});
@@ -58,16 +65,192 @@ pub fn command(host: &HostApiV3, player: u128, command: &str) -> bool {
         "homes" if args.is_empty() => list_homes(host, player),
         "delhome" if args.len() == 1 => delete_home(host, player, args[0]),
         "setwarp" if args.len() == 1 => save_warp(host, player, args[0]),
-        "warp" if args.len() == 1 => teleport_warp(host, player, args[0]),
-        "warps" if args.is_empty() => list_warps(host, player),
+        "warp" if args.len() <= 1 => args.first().map_or_else(
+            || open_warps(host, player),
+            |name| teleport_warp(host, player, name),
+        ),
+        "warps" if args.is_empty() => open_warps(host, player),
         "delwarp" if args.len() == 1 => delete_warp(host, player, args[0]),
         "rtp" if args.is_empty() => worlds::random_teleport(host, player),
         _ => false,
     }
 }
 
+pub fn suggestions(host: &HostApiV3, player: u128, line: &str) {
+    let trailing = line.ends_with(' ');
+    let words: Vec<_> = line.split_whitespace().collect();
+    let (root, args) = words.split_first().map_or(("", &[][..]), |(r, a)| (*r, a));
+    let mut candidates = Vec::new();
+    let admin = player_snapshot(host, player)
+        .and_then(|snapshot| snapshot["permission_level"].as_u64())
+        .is_some_and(|level| level >= 2);
+    match (root, args) {
+        ("home", []) | ("home", [_]) | ("delhome", []) | ("delhome", [_]) => {
+            if let Some(snapshot) = player_snapshot(host, player) {
+                let prefix = format!("home:{}:", snapshot["uuid"].as_str().unwrap_or_default());
+                candidates.extend(
+                    storage_list(host, &prefix)
+                        .into_iter()
+                        .map(|key| key[prefix.len()..].to_owned()),
+                );
+            }
+        }
+        ("warp", []) | ("warp", [_]) | ("delwarp", []) | ("delwarp", [_]) => {
+            if root == "delwarp" && !admin {
+                return;
+            }
+            candidates.extend(
+                storage_list(host, "warp:")
+                    .into_iter()
+                    .map(|key| key[5..].to_owned()),
+            );
+        }
+        ("mundo", []) => {
+            if admin {
+                candidates.extend(
+                    [
+                        "listar",
+                        "criar",
+                        "tp",
+                        "carregar",
+                        "descarregar",
+                        "spawn",
+                        "definirspawn",
+                        "definirprincipal",
+                        "removerprincipal",
+                        "gamerule",
+                        "apagar",
+                        "confirmar",
+                        "reset",
+                        "renomear",
+                        "remover",
+                    ]
+                    .map(str::to_owned),
+                );
+            } else {
+                candidates.extend(["listar", "tp", "spawn"].map(str::to_owned));
+            }
+        }
+        ("mundo", ["tp"])
+        | ("mundo", ["tp", _])
+        | ("mundo", ["carregar"])
+        | ("mundo", ["carregar", _])
+        | ("mundo", ["descarregar"])
+        | ("mundo", ["descarregar", _])
+        | ("mundo", ["spawn"])
+        | ("mundo", ["spawn", _])
+        | ("mundo", ["definirprincipal"])
+        | ("mundo", ["definirprincipal", _]) => {
+            if admin
+                || !matches!(
+                    args.first().copied(),
+                    Some("carregar" | "descarregar" | "definirprincipal")
+                )
+            {
+                candidates.extend(worlds::dimension_names(host, player));
+            }
+        }
+        ("mundo", ["apagar"])
+        | ("mundo", ["apagar", _])
+        | ("mundo", ["remover"])
+        | ("mundo", ["remover", _])
+        | ("mundo", ["renomear"])
+        | ("mundo", ["renomear", _]) => {
+            if admin {
+                candidates.extend(worlds::dimension_names(host, player));
+            }
+        }
+        ("mundo", ["gamerule"]) => {
+            if admin {
+                candidates.extend(worlds::dimension_names(host, player));
+            }
+        }
+        ("mundo", ["gamerule", _]) => {
+            if admin {
+                candidates.extend(
+                    [
+                        "keep_inventory",
+                        "do_daylight_cycle",
+                        "do_mob_spawning",
+                        "do_fire_tick",
+                        "mob_griefing",
+                        "random_tick_speed",
+                    ]
+                    .map(str::to_owned),
+                );
+            }
+        }
+        ("mundo", ["gamerule", _, rule])
+            if admin
+                && matches!(
+                    *rule,
+                    "keep_inventory"
+                        | "do_daylight_cycle"
+                        | "do_mob_spawning"
+                        | "do_fire_tick"
+                        | "mob_griefing"
+                ) =>
+        {
+            candidates.extend(["true", "false"].map(str::to_owned));
+        }
+        ("mundo", ["confirmar"]) | ("mundo", ["confirmar", _]) => {
+            if admin {
+                candidates.extend(worlds::pending_delete_token(player));
+            }
+        }
+        ("mundo", ["reset"]) => {
+            if admin {
+                candidates.extend(["conquistas", "estatisticas", "jogadores"].map(str::to_owned));
+            }
+        }
+        ("mundo", ["reset", category])
+            if matches!(
+                *category,
+                "jogadores" | "all" | "tudo" | "playerdata" | "dados"
+            ) =>
+        {
+            if admin {
+                candidates.push("force".to_owned());
+            }
+        }
+        ("mundo", ["reset", _]) => {
+            if admin {
+                candidates.extend(["conquistas", "estatisticas", "jogadores"].map(str::to_owned));
+            }
+        }
+        ("mundo", ["criar", _]) => {
+            if admin {
+                candidates.extend(["overworld", "nether", "end", "flat"].map(str::to_owned))
+            }
+        }
+        _ => {}
+    }
+    let current = if trailing {
+        ""
+    } else {
+        words.last().copied().unwrap_or_default()
+    };
+    candidates.retain(|candidate| {
+        candidate
+            .to_lowercase()
+            .starts_with(&current.to_lowercase())
+    });
+    candidates.sort_unstable();
+    candidates.dedup();
+    for value in candidates.into_iter().take(1000) {
+        let _ = call_json(
+            host,
+            player,
+            serde_json::json!({"operation": operation::COMMAND_SUGGESTION_ADD, "data": {"value": value}}),
+        );
+    }
+}
+
 pub fn event(host: &HostApiV3, kind: u32, payload: &serde_json::Value) {
     teleport::event(host, kind, payload);
+    worlds::event(host, kind, payload);
+    resource_packs::event(host, kind, payload);
+    scoreboard::event(host, kind, payload);
 }
 
 fn valid_name(name: &str) -> bool {
@@ -272,20 +455,6 @@ fn save_warp(host: &HostApiV3, player: u128, name: &str) -> bool {
     true
 }
 
-fn list_warps(host: &HostApiV3, player: u128) -> bool {
-    let prefix = "warp:";
-    let names = storage_list(host, prefix)
-        .into_iter()
-        .map(|key| key[prefix.len()..].to_owned())
-        .collect::<Vec<_>>();
-    if names.is_empty() {
-        message(host, player, "Não há warps configurados.");
-    } else {
-        message(host, player, &format!("Warps: {}", names.join(", ")));
-    }
-    true
-}
-
 fn delete_warp(host: &HostApiV3, player: u128, name: &str) -> bool {
     if !valid_name(name) {
         message(host, player, "Nome de warp inválido.");
@@ -311,7 +480,7 @@ fn delete_warp(host: &HostApiV3, player: u128, name: &str) -> bool {
     true
 }
 
-fn teleport_warp(host: &HostApiV3, player: u128, name: &str) -> bool {
+pub(crate) fn teleport_warp(host: &HostApiV3, player: u128, name: &str) -> bool {
     if !valid_name(name) {
         message(host, player, "Nome de warp inválido.");
         return true;
@@ -325,6 +494,61 @@ fn teleport_warp(host: &HostApiV3, player: u128, name: &str) -> bool {
             player,
             &format!("Warp '{name}' não encontrado. Use /warps."),
         ),
+    }
+    true
+}
+
+fn open_warps(host: &HostApiV3, player: u128) -> bool {
+    open_warps_page(host, player, 0)
+}
+
+pub(crate) fn open_warps_page(host: &HostApiV3, player: u128, page: usize) -> bool {
+    let keys = storage_list(host, "warp:");
+    if keys.is_empty() {
+        message(host, player, "Não há warps configurados.");
+        return true;
+    }
+    let pages = keys.len().div_ceil(45);
+    let page = page.min(pages.saturating_sub(1));
+    let start = page * 45;
+    let mut mapping = std::collections::HashMap::new();
+    let mut items: Vec<_> = keys.iter().skip(start).take(45).enumerate().map(|(slot, key)| {
+        let name = key[5..].to_owned();
+        mapping.insert(slot as i32, name.clone());
+        serde_json::json!({"slot": slot, "item": "minecraft:ender_pearl", "name": {"text": name, "color": "aqua", "italic": false}, "lore": ["Clique para teleportar"]})
+    }).collect();
+    if page > 0 {
+        items.push(serde_json::json!({"slot":45,"item":"minecraft:arrow","name":{"text":"Página anterior","italic":false}}));
+    }
+    items.push(serde_json::json!({"slot":49,"item":"minecraft:paper","name":{"text":format!("Página {}/{}", page + 1, pages),"italic":false}}));
+    if page + 1 < pages {
+        items.push(serde_json::json!({"slot":53,"item":"minecraft:arrow","name":{"text":"Próxima página","italic":false}}));
+    }
+    let result = call_json(
+        host,
+        player,
+        serde_json::json!({"operation": operation::MENU_OPEN, "data": {"title": {"text": "Warps", "italic": false}, "rows": 6, "items": items}}),
+    );
+    if let Some(window) = result
+        .as_ref()
+        .filter(|v| v["ok"] == true)
+        .and_then(|v| v["window_id"].as_i64())
+        .and_then(|n| i32::try_from(n).ok())
+    {
+        crate::shop::state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .views
+            .insert(
+                (player, window),
+                crate::shop::View::Warps {
+                    page,
+                    pages,
+                    slots: mapping,
+                },
+            );
+    } else {
+        message(host, player, "Não foi possível abrir a lista de warps.");
     }
     true
 }
@@ -352,13 +576,13 @@ fn teleport(host: &HostApiV3, player: u128, target: &serde_json::Value, success:
             },
         }),
     );
-    if result.is_some_and(|result| result["ok"] == true) {
-        message(host, player, success);
-    } else {
-        message(
+    match result {
+        Some(result) if result["ok"] == true => message(host, player, success),
+        Some(_) => message(
             host,
             player,
-            "O destino existe, mas a dimensão não está carregada ou o teleporte falhou.",
-        );
+            "O Horizon recusou o teleporte; confirme a dimensão e a posição de destino.",
+        ),
+        None => message(host, player, "A API de teleporte do Horizon não respondeu."),
     }
 }

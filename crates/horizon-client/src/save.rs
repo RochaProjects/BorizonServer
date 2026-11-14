@@ -3468,7 +3468,7 @@ pub fn world_gen_settings(world: &Path) -> Option<Tag> {
 pub fn set_custom_dimension_generator(world: &Path, dimension: &str, preset: &str) -> Result<()> {
     let (namespace, path) = dimension
         .split_once(':')
-        .ok_or_else(|| anyhow::anyhow!("dimension id must be namespaced"))?;
+        .ok_or_else(|| std::io::Error::other("dimension id must be namespaced"))?;
     if namespace == "minecraft"
         || namespace.is_empty()
         || path.is_empty()
@@ -3476,22 +3476,22 @@ pub fn set_custom_dimension_generator(world: &Path, dimension: &str, preset: &st
             .split('/')
             .any(|part| part.is_empty() || part == "." || part == "..")
     {
-        anyhow::bail!("invalid custom dimension id");
+        return Err(std::io::Error::other("invalid custom dimension id").into());
     }
     let mut settings = world_gen_settings(world)
-        .ok_or_else(|| anyhow::anyhow!("world generator settings are missing"))?;
+        .ok_or_else(|| std::io::Error::other("world generator settings are missing"))?;
     let (kind, generator) = match preset {
         "overworld" => ("minecraft:overworld", "minecraft:overworld"),
         "nether" => ("minecraft:the_nether", "minecraft:the_nether"),
         "end" => ("minecraft:the_end", "minecraft:the_end"),
         "flat" => ("minecraft:overworld", "minecraft:flat"),
-        _ => anyhow::bail!("unknown dimension preset"),
+        _ => return Err(std::io::Error::other("unknown dimension preset").into()),
     };
     let source = settings
         .get("dimensions")
         .and_then(|dimensions| dimensions.get(kind))
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("generator template is missing"))?;
+        .ok_or_else(|| std::io::Error::other("generator template is missing"))?;
     let dimension_data = if preset == "flat" {
         Tag::compound([
             ("type", string("minecraft:overworld")),
@@ -3538,7 +3538,7 @@ pub fn set_custom_dimension_generator(world: &Path, dimension: &str, preset: &st
         source
     };
     let Some(Tag::Compound(dimensions)) = settings.get_mut("dimensions") else {
-        anyhow::bail!("world dimension registry is invalid");
+        return Err(std::io::Error::other("world dimension registry is invalid").into());
     };
     dimensions.insert(dimension.into(), dimension_data);
     write_saved_data(world, "world_gen_settings", settings)
@@ -3548,9 +3548,9 @@ pub fn set_custom_dimension_generator(world: &Path, dimension: &str, preset: &st
 /// backed up and deleted.
 pub fn remove_custom_dimension_generator(world: &Path, dimension: &str) -> Result<()> {
     let mut settings = world_gen_settings(world)
-        .ok_or_else(|| anyhow::anyhow!("world generator settings are missing"))?;
+        .ok_or_else(|| std::io::Error::other("world generator settings are missing"))?;
     let Some(Tag::Compound(dimensions)) = settings.get_mut("dimensions") else {
-        anyhow::bail!("world dimension registry is invalid");
+        return Err(std::io::Error::other("world dimension registry is invalid").into());
     };
     dimensions.remove(&dimension.into());
     write_saved_data(world, "world_gen_settings", settings)

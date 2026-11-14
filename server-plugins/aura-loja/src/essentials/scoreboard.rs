@@ -26,7 +26,8 @@ const DEFAULT_CONFIG: &str = r#"{
     "youtube": "\uE810", "atirador": "\uE811", "comando": "\uE812", "construtor": "\uE813",
     "lendas": "\uE814", "discord": "\uE815", "ajudante": "\uE816", "reino": "\uE817",
     "morto": "\uE818", "hacker": "\uE819", "designer": "\uE81A", "abate": "\uE81B",
-    "pixel": "\uE81C", "dev": "\uE81D"
+    "pixel": "\uE81C", "dev": "\uE81D",
+    "time_vermelho": "\uE120", "time_azul": "\uE121", "time_sem_time": "\uE127"
   },
   "lines": [
     "&c🗡 &fᴋɪʟʟs: &c%kills_short%",
@@ -156,9 +157,6 @@ pub(super) fn event(host: &HostApiV3, kind: u32, payload: &serde_json::Value) {
     };
     let mode = u8::from(config.enabled) + 1;
     let previous_mode = LAST_MODE.swap(mode, Ordering::Relaxed);
-    if !config.enabled && previous_mode == mode {
-        return;
-    }
     for player in &online {
         let Some(uuid) = player["uuid"]
             .as_str()
@@ -166,14 +164,19 @@ pub(super) fn event(host: &HostApiV3, kind: u32, payload: &serde_json::Value) {
         else {
             continue;
         };
+        // Balance changes through the economy API have no dedicated event yet;
+        // refresh the role/nametag on the same lightweight scoreboard cadence.
+        super::roles::refresh_visuals(host, uuid);
         if !config.enabled {
-            let _ = call_json(
-                host,
-                uuid,
-                serde_json::json!({
-                    "operation": operation::SCOREBOARD_SIDEBAR_CLEAR, "data": {}
-                }),
-            );
+            if previous_mode != mode {
+                let _ = call_json(
+                    host,
+                    uuid,
+                    serde_json::json!({
+                        "operation": operation::SCOREBOARD_SIDEBAR_CLEAR, "data": {}
+                    }),
+                );
+            }
             continue;
         }
         render_player(host, uuid, &player, &config, online.len());
@@ -197,14 +200,14 @@ fn render_player(
             .glyphs
             .get(key)
             .cloned()
+            .or_else(|| glyph_catalog_value(key).map(str::to_owned))
             .unwrap_or_else(|| fallback.to_owned())
     };
-    let is_admin = snapshot["permission_level"].as_u64().unwrap_or(0) >= 2;
-    let rank = if is_admin {
-        glyph("admin", "\u{e801}")
-    } else {
-        glyph("membro", "\u{e802}")
-    };
+    let rank_name = super::roles::role_for_player(host, player);
+    let rank = glyph(
+        &rank_name,
+        glyph_catalog_value(&rank_name).unwrap_or("\u{e802}"),
+    );
     let values = std::collections::HashMap::from([
         ("player", snapshot["name"].as_str().unwrap_or("").to_owned()),
         (
@@ -240,30 +243,9 @@ fn render_player(
         ("vip_glyph", rank.clone()),
         ("cargo", rank.clone()),
         ("vip", rank.clone()),
-        (
-            "rank_label",
-            if is_admin {
-                "Admin".into()
-            } else {
-                "Membro".into()
-            },
-        ),
-        (
-            "cargo_label",
-            if is_admin {
-                "Admin".into()
-            } else {
-                "Membro".into()
-            },
-        ),
-        (
-            "vip_label",
-            if is_admin {
-                "Admin".into()
-            } else {
-                "Membro".into()
-            },
-        ),
+        ("rank_label", rank_name.clone()),
+        ("cargo_label", rank_name.clone()),
+        ("vip_label", rank_name.clone()),
         ("money_glyph", glyph("ouro", "\u{e806}")),
         ("clan_glyph", glyph("reino", "\u{e817}")),
         ("clan", "".into()),
@@ -298,6 +280,45 @@ fn render_player(
             "data": {"title": legacy_colors(&title), "lines": lines}
         }),
     );
+}
+
+fn glyph_catalog_value(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "dono" => "\u{e800}",
+        "admin" => "\u{e801}",
+        "membro" => "\u{e802}",
+        "vip" => "\u{e803}",
+        "diamante" => "\u{e804}",
+        "ferro" => "\u{e805}",
+        "ouro" => "\u{e806}",
+        "pedra" => "\u{e807}",
+        "novato" => "\u{e808}",
+        "fim" => "\u{e809}",
+        "nether" => "\u{e80a}",
+        "espaco" => "\u{e80b}",
+        "fogo" => "\u{e80c}",
+        "agua" => "\u{e80d}",
+        "ar" => "\u{e80e}",
+        "twitch" => "\u{e80f}",
+        "youtube" => "\u{e810}",
+        "atirador" => "\u{e811}",
+        "comando" => "\u{e812}",
+        "construtor" => "\u{e813}",
+        "lendas" => "\u{e814}",
+        "discord" => "\u{e815}",
+        "ajudante" => "\u{e816}",
+        "reino" => "\u{e817}",
+        "morto" => "\u{e818}",
+        "hacker" => "\u{e819}",
+        "designer" => "\u{e81a}",
+        "abate" => "\u{e81b}",
+        "pixel" => "\u{e81c}",
+        "dev" => "\u{e81d}",
+        "time_vermelho" => "\u{e120}",
+        "time_azul" => "\u{e121}",
+        "time_sem_time" => "\u{e127}",
+        _ => return None,
+    })
 }
 
 fn stat(host: &HostApiV3, player: u128, key: &str) -> i32 {

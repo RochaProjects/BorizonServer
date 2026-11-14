@@ -1972,9 +1972,14 @@ dependencies = [
 name = "horizon-plugin-aura-loja"
 version = "0.1.0"
 dependencies = [
+ "glam",
  "horizon-server-plugin-api",
  "serde",
  "serde_json",
+ "sha1",
+ "ureq",
+ "url",
+ "zip 9.1.3",
 ]
 
 [[package]]

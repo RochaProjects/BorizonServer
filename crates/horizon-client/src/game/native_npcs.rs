@@ -13,6 +13,17 @@ use horizon_world::nbt::{Compound, Tag};
 // Native mods use these; nothing in Horizon does.
 #[allow(dead_code)]
 impl Game<'_> {
+    pub(super) fn native_entity_identity_by_id(&self, id: u32) -> Option<(u128, String)> {
+        let target = self.level_entity(i32::try_from(id).ok()?)?;
+        if !matches!(target, Target::Other(_)) {
+            return None;
+        }
+        let words = *self.persist.uuids.get(&id)?;
+        Some((
+            horizon_client::lan::playerdata::ints_uuid(words),
+            self.target_type(target),
+        ))
+    }
     /// The entity with `uuid` in any loaded level (Bukkit's
     /// `Server.getEntity(UUID)`, `ServerLevel.getEntity(UUID)` over every
     /// level): its dimension, its id there and its type (`minecraft:zombie`).

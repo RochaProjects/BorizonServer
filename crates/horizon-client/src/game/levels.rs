@@ -249,6 +249,8 @@ impl Game<'_> {
     /// A new level for `dim`, opened from the save (`MinecraftServer.createLevels`).
     fn open_level(&self, dim: Dim) -> Result<Parked> {
         let dimension_facts = self.dimension_type_of(dim);
+        let seed = horizon_client::save::custom_dimension_seed(&self.world_root, dim.id())
+            .unwrap_or(self.level.seed);
         let (streaming, save, locator) = super::world_loading::make_streaming(
             &self.res,
             &self.pack,
@@ -258,10 +260,10 @@ impl Game<'_> {
             dim,
             self.level_shapes.get(dim.id()),
             dimension_facts,
-            self.level.seed,
+            seed,
             &self.level.enabled_features,
         )?;
-        let mut world = World::new(self.res.facts().air, self.level.seed);
+        let mut world = World::new(self.res.facts().air, seed);
         world.attachments = save.load_attachments();
         world.shape = self.level_shapes.get(dim.id());
         world.fast_lava = dimension_facts.fast_lava;
@@ -271,7 +273,7 @@ impl Game<'_> {
             streaming,
             locator,
             save,
-            block_ticks: Ticks::new(self.level.seed as i32),
+            block_ticks: Ticks::new(seed as i32),
             tick_chunks: Default::default(),
             tickets,
             random_tick_sections: Default::default(),

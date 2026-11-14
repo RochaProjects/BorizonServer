@@ -36,21 +36,14 @@ struct PlayerDataResetPlan {
 }
 
 #[cfg(feature = "server-plugins")]
-struct DimensionDeletePlan {
-    dimension: String,
-    expires: Instant,
-}
-
-#[cfg(feature = "server-plugins")]
 static PLAYER_DATA_RESET_PLANS: OnceLock<Mutex<HashMap<String, PlayerDataResetPlan>>> =
     OnceLock::new();
 #[cfg(feature = "server-plugins")]
 static PLAYER_DATA_RESET_NONCE: AtomicU64 = AtomicU64::new(1);
 #[cfg(feature = "server-plugins")]
-static DIMENSION_DELETE_PLANS: OnceLock<Mutex<HashMap<String, DimensionDeletePlan>>> =
-    OnceLock::new();
-#[cfg(feature = "server-plugins")]
 static SAFE_LOCATION_RNG: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
+#[cfg(feature = "server-plugins")]
+static DIMENSION_SEED_NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(feature = "server-plugins")]
 struct ScheduledPluginTask {
@@ -109,6 +102,24 @@ fn valid_custom_dimension_id(id: &str) -> bool {
         && !path
             .split('/')
             .any(|part| part.is_empty() || part == "." || part == "..")
+}
+
+#[cfg(feature = "server-plugins")]
+fn valid_plugin_identifier(id: &str) -> bool {
+    id.len() <= 256
+        && id.split_once(':').is_some_and(|(namespace, path)| {
+            !namespace.is_empty()
+                && !path.is_empty()
+                && namespace
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.-".contains(&b))
+                && path
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_./-".contains(&b))
+                && !path
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == "..")
+        })
 }
 
 #[cfg(feature = "server-plugins")]
@@ -313,11 +324,39 @@ fn create_custom_dimension(game: &mut Game<'_>, data: &serde_json::Value) -> ser
         let _ = horizon_client::save::remove_custom_dimension_generator(&game.world_root, id);
         return serde_json::json!({"ok": false, "error": "dimension_create_failed", "detail": error.to_string()});
     }
-    serde_json::json!({"ok": true, "dimension": id, "preset": preset, "loaded": false})
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64);
+    let nonce = DIMENSION_SEED_NONCE.fetch_add(1, Ordering::Relaxed);
+    let id_hash = id.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
+    });
+    let mut seed = now ^ nonce.rotate_left(17) ^ id_hash ^ (game.level.seed as u64);
+    seed = (seed ^ (seed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    seed = (seed ^ (seed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    let seed = (seed ^ (seed >> 31)) as i64;
+    if let Err(error) = horizon_client::save::set_custom_dimension_seed(&game.world_root, id, seed)
+    {
+        let _ = fs::remove_dir_all(&path);
+        let _ = horizon_client::save::remove_custom_dimension_generator(&game.world_root, id);
+        return serde_json::json!({"ok": false, "error": "dimension_seed_save_failed", "detail": error.to_string()});
+    }
+    let opened = load_dimension(game, &serde_json::json!({"dimension": id}));
+    if opened["ok"] != true {
+        let _ = fs::remove_dir_all(&path);
+        let _ = horizon_client::save::remove_custom_dimension_generator(&game.world_root, id);
+        return serde_json::json!({
+            "ok": false,
+            "error": "dimension_prepare_failed",
+            "detail": opened["detail"].as_str().or_else(|| opened["error"].as_str()).unwrap_or("falha ao abrir o gerador"),
+        });
+    }
+    let unloaded = game.native_unload_dimension(id);
+    serde_json::json!({"ok": true, "dimension": id, "preset": preset, "loaded": !unloaded})
 }
 
 #[cfg(feature = "server-plugins")]
-fn prepare_custom_dimension_delete(game: &Game<'_>, data: &serde_json::Value) -> serde_json::Value {
+fn delete_custom_dimension(game: &mut Game<'_>, data: &serde_json::Value) -> serde_json::Value {
     let Some(id) = data.get("dimension").and_then(serde_json::Value::as_str) else {
         return serde_json::json!({"ok": false, "error": "invalid_dimension_id"});
     };
@@ -331,101 +370,124 @@ fn prepare_custom_dimension_delete(game: &Game<'_>, data: &serde_json::Value) ->
     {
         return serde_json::json!({"ok": false, "error": "players_in_dimension"});
     }
-    let path = horizon_client::save::dimension_dir(&game.world_root, id);
-    if !path.is_dir() {
-        return serde_json::json!({"ok": false, "error": "dimension_not_found"});
-    }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos() as u64);
-    let nonce = PLAYER_DATA_RESET_NONCE.fetch_add(1, Ordering::Relaxed);
-    let token = format!("{now:016x}{nonce:016x}");
-    let plans = DIMENSION_DELETE_PLANS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut plans = plans.lock().unwrap_or_else(|error| error.into_inner());
-    plans.retain(|_, plan| plan.expires > Instant::now());
-    plans.insert(
-        token.clone(),
-        DimensionDeletePlan {
-            dimension: id.to_owned(),
-            expires: Instant::now() + Duration::from_secs(60),
-        },
-    );
-    serde_json::json!({
-        "ok": true,
-        "token": token,
-        "dimension": id,
-        "expires_in_seconds": 60,
-        "backup_required": true,
-    })
-}
-
-#[cfg(feature = "server-plugins")]
-fn commit_custom_dimension_delete(
-    game: &mut Game<'_>,
-    data: &serde_json::Value,
-) -> serde_json::Value {
-    let Some(token) = data.get("token").and_then(serde_json::Value::as_str) else {
-        return serde_json::json!({"ok": false, "error": "missing_token"});
-    };
-    let plans = DIMENSION_DELETE_PLANS.get_or_init(|| Mutex::new(HashMap::new()));
-    let plan = plans
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .remove(token);
-    let Some(plan) = plan else {
-        return serde_json::json!({"ok": false, "error": "invalid_or_expired_token"});
-    };
-    if plan.expires <= Instant::now() {
-        return serde_json::json!({"ok": false, "error": "invalid_or_expired_token"});
-    }
-    if game
-        .native_server_players()
-        .iter()
-        .any(|player| player.dimension == plan.dimension)
-    {
-        return serde_json::json!({"ok": false, "error": "players_in_dimension"});
-    }
-    if !game.native_unload_dimension(&plan.dimension) {
-        return serde_json::json!({"ok": false, "error": "dimension_busy_or_unload_failed"});
-    }
     let world_root = match game.world_root.canonicalize() {
         Ok(root) => root,
         Err(_) => return serde_json::json!({"ok": false, "error": "world_unavailable"}),
     };
-    let target = horizon_client::save::dimension_dir(&world_root, &plan.dimension);
-    let metadata = match fs::symlink_metadata(&target) {
+    let path = horizon_client::save::dimension_dir(&world_root, id);
+    let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(_) => return serde_json::json!({"ok": false, "error": "dimension_not_found"}),
     };
-    let canonical = match target.canonicalize() {
+    let canonical = match path.canonicalize() {
         Ok(path) => path,
         Err(_) => return serde_json::json!({"ok": false, "error": "unsafe_dimension_path"}),
     };
     if metadata.file_type().is_symlink() || !canonical.starts_with(&world_root) {
         return serde_json::json!({"ok": false, "error": "unsafe_dimension_path"});
     }
-    let Ok(server_root) = std::env::current_dir() else {
-        return serde_json::json!({"ok": false, "error": "backup_unavailable"});
-    };
-    let backup = server_root
-        .join("plugins")
-        .join("AuraEssentials")
-        .join("backups")
-        .join(format!("dimension-{token}"));
-    if let Err(error) = copy_directory(&target, &backup) {
-        let _ = fs::remove_dir_all(&backup);
-        return serde_json::json!({"ok": false, "error": "backup_failed", "detail": error.to_string()});
+    if !game.native_unload_dimension(id) {
+        return serde_json::json!({"ok": false, "error": "dimension_busy_or_unload_failed"});
     }
-    if let Err(error) = fs::remove_dir_all(&target) {
-        return serde_json::json!({"ok": false, "error": "dimension_delete_failed", "backup": backup.to_string_lossy(), "detail": error.to_string()});
+    if let Err(error) = fs::remove_dir_all(&canonical) {
+        return serde_json::json!({"ok": false, "error": "dimension_delete_failed", "detail": error.to_string()});
+    }
+    if let Err(error) = horizon_client::save::remove_custom_dimension_generator(&world_root, id) {
+        return serde_json::json!({"ok": false, "error": "generator_entry_remove_failed", "detail": error.to_string()});
+    }
+    let _ = game.native_dimension_clear_game_rule_overrides(id);
+    serde_json::json!({"ok": true, "dimension": id})
+}
+
+#[cfg(feature = "server-plugins")]
+fn copy_import_files(source: &Path, target: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(target)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let destination = target.join(entry.file_name());
+        if kind.is_dir() {
+            copy_import_files(&entry.path(), &destination)?;
+        } else if kind.is_file() {
+            fs::copy(entry.path(), destination)?;
+        }
+        // Never follow symlinks found in an imported archive/save.
+    }
+    Ok(())
+}
+
+#[cfg(feature = "server-plugins")]
+fn copy_import_dimension_data(source: &Path, target: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(target)?;
+    for folder in ["region", "entities", "poi"] {
+        let from = source.join(folder);
+        if from.is_dir() {
+            copy_import_files(&from, &target.join(folder))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "server-plugins")]
+fn import_custom_dimension(game: &mut Game<'_>, data: &serde_json::Value) -> serde_json::Value {
+    let Some(id) = data
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| valid_custom_dimension_id(id))
+    else {
+        return serde_json::json!({"ok":false,"error":"invalid_dimension_id"});
+    };
+    let Some(source) = data.get("source_dir").and_then(serde_json::Value::as_str) else {
+        return serde_json::json!({"ok":false,"error":"invalid_source"});
+    };
+    let Some(root) = std::env::current_dir().ok() else {
+        return serde_json::json!({"ok":false,"error":"server_root_unavailable"});
+    };
+    let staging = root.join("plugins/.horizon-world-imports");
+    let (Ok(staging), Ok(source)) = (staging.canonicalize(), Path::new(source).canonicalize())
+    else {
+        return serde_json::json!({"ok":false,"error":"import_source_not_found"});
+    };
+    if !source.starts_with(&staging)
+        || horizon_client::save::level_dat_issue(&source, false).is_some()
+    {
+        return serde_json::json!({"ok":false,"error":"invalid_imported_world"});
+    }
+    let Some(source_dimension) = [
+        source.join("dimensions/minecraft/overworld"),
+        source.clone(),
+    ]
+    .into_iter()
+    .find(|path| path.join("region").is_dir()) else {
+        return serde_json::json!({"ok":false,"error":"overworld_region_missing"});
+    };
+    let destination = horizon_client::save::dimension_dir(&game.world_root, id);
+    if destination.exists()
+        || game
+            .world_dimensions()
+            .iter()
+            .any(|dimension| dimension.id() == id)
+    {
+        return serde_json::json!({"ok":false,"error":"dimension_already_exists"});
+    }
+    if let Err(error) = copy_import_dimension_data(&source_dimension, &destination) {
+        let _ = fs::remove_dir_all(&destination);
+        return serde_json::json!({"ok":false,"error":"import_copy_failed","detail":error.to_string()});
     }
     if let Err(error) =
-        horizon_client::save::remove_custom_dimension_generator(&world_root, &plan.dimension)
+        horizon_client::save::import_overworld_dimension(&game.world_root, &source, id)
     {
-        return serde_json::json!({"ok": false, "error": "generator_entry_remove_failed", "backup": backup.to_string_lossy(), "detail": error.to_string()});
+        let _ = fs::remove_dir_all(&destination);
+        return serde_json::json!({"ok":false,"error":"invalid_world_generator","detail":error.to_string()});
     }
-    let _ = game.native_dimension_clear_game_rule_overrides(&plan.dimension);
-    serde_json::json!({"ok": true, "dimension": plan.dimension, "backup": backup.to_string_lossy()})
+    let opened = load_dimension(game, &serde_json::json!({"dimension":id}));
+    if opened["ok"] != true {
+        let _ = fs::remove_dir_all(&destination);
+        let _ = horizon_client::save::remove_custom_dimension_generator(&game.world_root, id);
+        return serde_json::json!({"ok":false,"error":"imported_dimension_open_failed","detail":opened["detail"].as_str().or_else(||opened["error"].as_str()).unwrap_or("failed to open imported dimension")});
+    }
+    let _ = game.native_unload_dimension(id);
+    serde_json::json!({"ok":true,"dimension":id,"chunks_imported":true})
 }
 
 #[cfg(feature = "server-plugins")]
@@ -975,6 +1037,24 @@ impl Host for GameHost<'_, '_, '_> {
                     fail("commands_can_only_be_registered_during_startup")
                 }
             }
+            op::PLAYER_COMMAND_EXECUTE => {
+                let Some(uuid) = data
+                    .get("uuid")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| u128::from_str_radix(value, 16).ok())
+                else {
+                    return fail("invalid_player_uuid");
+                };
+                let Some(command) = data
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|v| !v.trim().is_empty() && v.len() <= 2048)
+                else {
+                    return fail("invalid_command");
+                };
+                let result = self.game.native_run_command_as(uuid, command);
+                serde_json::json!({"ok":result.ran,"output":result.output})
+            }
             op::CHAT_SEND => {
                 let Some(component) = data.get("component") else {
                     return fail("missing_component");
@@ -1072,6 +1152,28 @@ impl Host for GameHost<'_, '_, '_> {
                 }
                 let window = self.game.native_open_menu(player, rows, title, stacks);
                 serde_json::json!({"ok": window.is_some(), "window_id": window})
+            }
+            op::INVENTORY_VIEW_OPEN => {
+                let Some(target) = data
+                    .get("target")
+                    .and_then(|value| value.as_str())
+                    .and_then(|value| {
+                        u128::from_str_radix(value.trim_start_matches("0x"), 16).ok()
+                    })
+                else {
+                    return fail("invalid_target");
+                };
+                let Some(kind) = data.get("kind").and_then(|value| value.as_str()) else {
+                    return fail("invalid_inventory_kind");
+                };
+                let title = data
+                    .get("title")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("Inventário");
+                let opened = self
+                    .game
+                    .native_open_inventory_view(player, target, kind, title);
+                serde_json::json!({"ok": opened.is_some(), "window": opened})
             }
             op::RESOURCE_PACK_SEND | op::RESOURCE_PACK_SEND_BATCH => {
                 let packs: Vec<&serde_json::Value> = if operation == op::RESOURCE_PACK_SEND {
@@ -1384,8 +1486,8 @@ impl Host for GameHost<'_, '_, '_> {
             }
             op::WORLD_DIMENSION_LOAD => load_dimension(self.game, &data),
             op::WORLD_DIMENSION_CREATE => create_custom_dimension(self.game, &data),
-            op::WORLD_DIMENSION_DELETE_PREPARE => prepare_custom_dimension_delete(self.game, &data),
-            op::WORLD_DIMENSION_DELETE_COMMIT => commit_custom_dimension_delete(self.game, &data),
+            op::WORLD_DIMENSION_IMPORT => import_custom_dimension(self.game, &data),
+            op::WORLD_DIMENSION_DELETE => delete_custom_dimension(self.game, &data),
             op::SCOREBOARD_SIDEBAR_SET => {
                 let Some(title) = data.get("title") else {
                     return fail("missing_title");
@@ -1430,6 +1532,56 @@ impl Host for GameHost<'_, '_, '_> {
             }
             op::SCOREBOARD_SIDEBAR_CLEAR => {
                 serde_json::json!({"ok": self.game.native_sidebar(player, None)})
+            }
+            op::PLAYER_DISPLAY_SET => {
+                let Some(uuid) = data
+                    .get("uuid")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| u128::from_str_radix(value, 16).ok())
+                else {
+                    return fail("invalid_player_uuid");
+                };
+                let parse_name = |key: &str| -> Result<Option<Text>, ()> {
+                    let Some(value) = data.get(key) else {
+                        return Ok(None);
+                    };
+                    if value.is_null() {
+                        return Ok(None);
+                    }
+                    if let Some(value) = value.as_str() {
+                        return Ok(Some(Text::literal(value).resolve_legacy()));
+                    }
+                    if value.is_object() {
+                        return Ok(Some(horizon_client::packs::component(value)));
+                    }
+                    Err(())
+                };
+                let Ok(chat) = parse_name("chat") else {
+                    return fail("invalid_chat_component");
+                };
+                let Ok(tab) = parse_name("tab") else {
+                    return fail("invalid_tab_component");
+                };
+                let Ok(nametag_prefix) = parse_name("nametag_prefix") else {
+                    return fail("invalid_nametag_prefix_component");
+                };
+                let Ok(nametag_suffix) = parse_name("nametag_suffix") else {
+                    return fail("invalid_nametag_suffix_component");
+                };
+                let chat_ok = self.game.native_set_display_name(uuid, chat.as_ref());
+                let tab_ok = self.game.native_set_list_name(uuid, tab.as_ref());
+                let nametag_ok = if data.get("nametag_prefix").is_some()
+                    || data.get("nametag_suffix").is_some()
+                {
+                    self.game.native_set_name_tag_style(
+                        uuid,
+                        nametag_prefix.as_ref(),
+                        nametag_suffix.as_ref(),
+                    )
+                } else {
+                    true
+                };
+                serde_json::json!({"ok": chat_ok && tab_ok && nametag_ok, "chat": chat_ok, "tab": tab_ok, "nametag": nametag_ok})
             }
             op::ENTITY_TEXT_DISPLAY_CREATE => {
                 let Some(dimension) = data.get("dimension").and_then(|value| value.as_str()) else {
@@ -1507,6 +1659,303 @@ impl Host for GameHost<'_, '_, '_> {
                     Some(entity_id) => serde_json::json!({"ok": true, "entity_id": entity_id}),
                     None => fail("entity_spawn_failed"),
                 }
+            }
+            op::ENTITY_SPAWN => {
+                let Some(dimension) = data.get("dimension").and_then(|v| v.as_str()) else {
+                    return fail("invalid_dimension");
+                };
+                let Some(kind) = data
+                    .get("entity_type")
+                    .and_then(|v| v.as_str())
+                    .filter(|v| {
+                        v.len() <= 128
+                            && v.split_once(':').is_some_and(|(namespace, path)| {
+                                !namespace.is_empty() && !path.is_empty()
+                            })
+                            && v.bytes().all(|b| {
+                                b.is_ascii_lowercase()
+                                    || b.is_ascii_digit()
+                                    || b"_:/. -".contains(&b)
+                            })
+                            && !v.contains(' ')
+                    })
+                else {
+                    return fail("invalid_entity_type");
+                };
+                let Some(uuid) = data
+                    .get("uuid")
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| u128::from_str_radix(v, 16).ok())
+                else {
+                    return fail("invalid_uuid");
+                };
+                let Some(position) = json_position(data.get("position")) else {
+                    return fail("invalid_position");
+                };
+                let mut nbt = Compound::new();
+                for (key, field) in [
+                    ("NoAI", "no_ai"),
+                    ("Invulnerable", "invulnerable"),
+                    ("Silent", "silent"),
+                    ("PersistenceRequired", "persistent"),
+                    ("CustomNameVisible", "name_visible"),
+                ] {
+                    if let Some(enabled) = data.get(field).and_then(|v| v.as_bool()) {
+                        nbt.insert(key.into(), Tag::Byte(i8::from(enabled)));
+                    }
+                }
+                if let Some(name) = data.get("custom_name").and_then(|v| v.as_str()) {
+                    if name.len() > 256 {
+                        return fail("custom_name_too_long");
+                    }
+                    let component = Text::literal(name).resolve_legacy().component();
+                    nbt.insert("CustomName".into(), component_nbt(&component));
+                }
+                match self
+                    .game
+                    .native_summon_with_uuid(dimension, kind, position, nbt, uuid)
+                {
+                    Some(entity_id) => {
+                        serde_json::json!({"ok": true, "uuid": format!("{uuid:032x}"), "entity_id": entity_id})
+                    }
+                    None => fail("entity_spawn_failed"),
+                }
+            }
+            op::ENTITY_DISPLAY_UPSERT => {
+                let Some(dimension) = data.get("dimension").and_then(|v| v.as_str()) else {
+                    return fail("invalid_dimension");
+                };
+                let Some(uuid) = data
+                    .get("uuid")
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| u128::from_str_radix(v, 16).ok())
+                else {
+                    return fail("invalid_uuid");
+                };
+                let Some(position) = json_position(data.get("position")) else {
+                    return fail("invalid_position");
+                };
+                let Some(text) = data.get("text") else {
+                    return fail("missing_text");
+                };
+                let component = if let Some(text) = text.as_str() {
+                    Text::literal(text).resolve_legacy().component()
+                } else if text.is_object() {
+                    text.clone()
+                } else {
+                    return fail("invalid_text");
+                };
+                let mut nbt = Compound::new();
+                nbt.insert("text".into(), component_nbt(&component));
+                nbt.insert(
+                    "line_width".into(),
+                    Tag::Int(
+                        data.get("line_width")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(200)
+                            .clamp(1, 2000) as i32,
+                    ),
+                );
+                nbt.insert(
+                    "background".into(),
+                    Tag::Int(
+                        data.get("background")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0x4000_0000)
+                            .min(u64::from(u32::MAX)) as u32 as i32,
+                    ),
+                );
+                nbt.insert("text_opacity".into(), Tag::Byte(-1));
+                for (key, field) in [("shadow", "shadow"), ("see_through", "see_through")] {
+                    nbt.insert(
+                        key.into(),
+                        Tag::Byte(i8::from(
+                            data.get(field).and_then(|v| v.as_bool()).unwrap_or(false),
+                        )),
+                    );
+                }
+                let alignment = match data
+                    .get("alignment")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("center")
+                {
+                    "left" => 0,
+                    "center" => 1,
+                    "right" => 2,
+                    _ => return fail("invalid_alignment"),
+                };
+                let billboard = match data
+                    .get("billboard")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("center")
+                {
+                    "fixed" => 0,
+                    "vertical" => 1,
+                    "horizontal" => 2,
+                    "center" => 3,
+                    _ => return fail("invalid_billboard"),
+                };
+                nbt.insert("alignment".into(), Tag::Byte(alignment));
+                nbt.insert("billboard".into(), Tag::Byte(billboard));
+                if let Some((old_dimension, old_id, old_kind)) =
+                    self.game.native_entity_by_uuid(uuid)
+                {
+                    if old_kind != "minecraft:text_display" {
+                        return fail("uuid_is_not_text_display");
+                    }
+                    if !self.game.native_remove_entity(&old_dimension, old_id) {
+                        return fail("old_display_remove_failed");
+                    }
+                }
+                match self.game.native_summon_with_uuid(
+                    dimension,
+                    "minecraft:text_display",
+                    position,
+                    nbt,
+                    uuid,
+                ) {
+                    Some(entity_id) => {
+                        serde_json::json!({"ok": true, "uuid": format!("{uuid:032x}"), "entity_id": entity_id})
+                    }
+                    None => fail("entity_spawn_failed"),
+                }
+            }
+            op::ENTITY_DISPLAY_DELETE => {
+                let Some(uuid) = data
+                    .get("uuid")
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| u128::from_str_radix(v, 16).ok())
+                else {
+                    return fail("invalid_uuid");
+                };
+                let Some((dimension, id, kind)) = self.game.native_entity_by_uuid(uuid) else {
+                    return fail("entity_not_found");
+                };
+                if kind != "minecraft:text_display" {
+                    return fail("uuid_is_not_text_display");
+                }
+                serde_json::json!({"ok": self.game.native_remove_entity(&dimension, id)})
+            }
+            op::ENTITY_ITEM_DISPLAY_UPSERT => {
+                let Some(dimension) = data.get("dimension").and_then(|v| v.as_str()) else {
+                    return fail("invalid_dimension");
+                };
+                let Some(uuid) = data
+                    .get("uuid")
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| u128::from_str_radix(v, 16).ok())
+                else {
+                    return fail("invalid_uuid");
+                };
+                let Some(position) = json_position(data.get("position")) else {
+                    return fail("invalid_position");
+                };
+                let Some(item_model) = data
+                    .get("item_model")
+                    .and_then(|v| v.as_str())
+                    .filter(|v| valid_plugin_identifier(v))
+                else {
+                    return fail("invalid_item_model");
+                };
+                let vector = |key: &str, len: usize, default: &[f32]| -> Option<Vec<f32>> {
+                    let Some(value) = data.get(key) else {
+                        return Some(default.to_vec());
+                    };
+                    let values = value.as_array()?;
+                    if values.len() != len {
+                        return None;
+                    }
+                    values
+                        .iter()
+                        .map(|v| {
+                            v.as_f64()
+                                .filter(|n| n.is_finite() && n.abs() <= 1.0e6)
+                                .map(|n| n as f32)
+                        })
+                        .collect()
+                };
+                let Some(translation) = vector("translation", 3, &[0.0; 3]) else {
+                    return fail("invalid_translation");
+                };
+                let Some(rotation) = vector("rotation", 4, &[0.0, 0.0, 0.0, 1.0]) else {
+                    return fail("invalid_rotation");
+                };
+                let Some(scale) = vector("scale", 3, &[1.0; 3]) else {
+                    return fail("invalid_scale");
+                };
+                let norm = rotation.iter().map(|n| n * n).sum::<f32>().sqrt();
+                if norm < 1.0e-6 {
+                    return fail("invalid_rotation");
+                }
+                let floats = |v: &[f32]| {
+                    Tag::List(
+                        v.iter()
+                            .map(|n| Tag::Float(if *n == 0.0 { 0 } else { n.to_bits() }))
+                            .collect(),
+                    )
+                };
+                let mut transformation = Compound::new();
+                transformation.insert("translation".into(), floats(&translation));
+                transformation.insert(
+                    "left_rotation".into(),
+                    floats(&rotation.iter().map(|n| n / norm).collect::<Vec<_>>()),
+                );
+                transformation.insert("scale".into(), floats(&scale));
+                transformation.insert("right_rotation".into(), floats(&[0.0, 0.0, 0.0, 1.0]));
+                let mut stack = ItemStack::new("minecraft:paper", 1);
+                stack.data_mut().other.push((
+                    "minecraft:item_model".into(),
+                    Tag::String(item_model.into()),
+                ));
+                let mut nbt = Compound::new();
+                nbt.insert(
+                    "item".into(),
+                    horizon_client::items::item_nbt::item_to_nbt(&stack),
+                );
+                nbt.insert("item_display".into(), Tag::String("fixed".into()));
+                nbt.insert("transformation".into(), Tag::Compound(transformation));
+                nbt.insert("billboard".into(), Tag::Byte(0));
+                nbt.insert("view_range".into(), Tag::Float(0.8f32.to_bits()));
+                nbt.insert("shadow_radius".into(), Tag::Float(0));
+                nbt.insert("shadow_strength".into(), Tag::Float(0));
+                if let Some((old_dimension, old_id, old_kind)) =
+                    self.game.native_entity_by_uuid(uuid)
+                {
+                    if old_kind != "minecraft:item_display" {
+                        return fail("uuid_is_not_item_display");
+                    }
+                    if !self.game.native_remove_entity(&old_dimension, old_id) {
+                        return fail("old_display_remove_failed");
+                    }
+                }
+                match self.game.native_summon_with_uuid(
+                    dimension,
+                    "minecraft:item_display",
+                    position,
+                    nbt,
+                    uuid,
+                ) {
+                    Some(entity_id) => {
+                        serde_json::json!({"ok": true, "uuid": format!("{uuid:032x}"), "entity_id": entity_id})
+                    }
+                    None => fail("entity_spawn_failed"),
+                }
+            }
+            op::ENTITY_REMOVE_UUID => {
+                let Some(uuid) = data
+                    .get("uuid")
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| u128::from_str_radix(v, 16).ok())
+                else {
+                    return fail("invalid_uuid");
+                };
+                let Some((dimension, id, kind)) = self.game.native_entity_by_uuid(uuid) else {
+                    return fail("entity_not_found");
+                };
+                if kind == "minecraft:player" {
+                    return fail("cannot_remove_player");
+                }
+                serde_json::json!({"ok": self.game.native_remove_entity(&dimension, id), "entity_type": kind})
             }
             op::ENTITY_MOVE => {
                 let Some(dimension) = data.get("dimension").and_then(|value| value.as_str()) else {

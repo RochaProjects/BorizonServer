@@ -391,6 +391,8 @@ pub struct Hub {
     /// The names a server mod shows over players' heads
     /// (`native_set_name_tag`), by UUID: their list entries' profile name.
     pub name_tags: std::collections::HashMap<u128, String>,
+    /// A player's team prefix/suffix for the rendered nametag, independent of chat and Tab.
+    pub name_tag_styles: std::collections::HashMap<u128, (Tag, Tag)>,
     /// The name the server's user cache knew a joining player by, by UUID, looked up before the
     /// cache learns the new one (PlayerList.placeNewPlayer's `oldName`); taken by the join line.
     pub former_names: std::collections::HashMap<u128, String>,
@@ -787,6 +789,7 @@ impl Hub {
             list_names: std::collections::HashMap::new(),
             display_names: std::collections::HashMap::new(),
             name_tags: std::collections::HashMap::new(),
+            name_tag_styles: std::collections::HashMap::new(),
             former_names: std::collections::HashMap::new(),
         }
     }
@@ -4757,6 +4760,18 @@ impl Hub {
             }
             o.moved = true;
         }
+    }
+
+    pub fn set_name_tag_style(&mut self, uuid: u128, style: Option<(Tag, Tag)>) {
+        match style {
+            Some(style) => {
+                self.name_tag_styles.insert(uuid, style);
+            }
+            None => {
+                self.name_tag_styles.remove(&uuid);
+            }
+        }
+        // The scoreboard sync on the next game tick sends team changes to every viewer.
     }
 
     /// Set a guest's flying speed and tell it (`Abilities.setFlyingSpeed`, then

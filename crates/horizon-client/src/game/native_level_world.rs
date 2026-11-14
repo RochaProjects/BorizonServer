@@ -17,10 +17,21 @@ fn weather_flags((rain, thunder): (f32, f32)) -> (bool, bool) {
 }
 
 impl Game<'_> {
-    /// The world's seed (`WorldOptions.seed`), as `/seed` shows it. API
+    /// This dimension's persisted generation seed (vanilla dimensions use
+    /// `WorldOptions.seed`; custom dimensions may have their own). API
     /// @API:level_world@.
     pub(super) fn native_level_seed(&self, level: LevelRef) -> Option<i64> {
         self.native_level_world(level)?;
+        if !matches!(
+            level.dimension(),
+            "minecraft:overworld" | "minecraft:the_nether" | "minecraft:the_end"
+        ) {
+            return horizon_client::save::custom_dimension_seed(
+                &self.world_root,
+                level.dimension(),
+            )
+            .or(Some(self.level.seed));
+        }
         Some(self.level.seed)
     }
     /// The difficulty (`Level.getDifficulty`): `peaceful`, `easy`, `normal`

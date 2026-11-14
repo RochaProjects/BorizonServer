@@ -2566,6 +2566,30 @@ impl Game<'_> {
                     self.lan_swing_back(host, conn, swung);
                     return;
                 }
+                #[cfg(feature = "server-plugins")]
+                if let Ok(entity_id) = u32::try_from(p.id)
+                    && let Some((entity_uuid, entity_type)) =
+                        self.native_entity_identity_by_id(entity_id)
+                {
+                    let (player_uuid, player_name) = {
+                        let guest = &host.hub.guests[gi];
+                        (guest.uuid, guest.name.clone())
+                    };
+                    super::server_plugins::dispatch_event(
+                        self,
+                        horizon_server_plugin_api::event::PLAYER_INTERACT_ENTITY,
+                        player_uuid,
+                        &player_name,
+                        [0; 3],
+                        0,
+                        serde_json::json!({
+                            "entity_uuid": format!("{entity_uuid:032x}"),
+                            "entity_type": entity_type,
+                            "hand": if p.hand == 1 { "off" } else { "main" },
+                            "secondary": p.secondary,
+                        }),
+                    );
+                }
                 let before = host.hub.guests[gi].vehicle;
                 if self
                     .look_at_entity(host, gi, p.id, Some(p.location))

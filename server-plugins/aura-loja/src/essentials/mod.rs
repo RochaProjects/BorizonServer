@@ -1,11 +1,14 @@
 //! Comandos essenciais que usam apenas operações genéricas do SDK público.
 
 use crate::plugin_api::{call_json, message};
-use horizon_server_plugin_api::{HostApiV3, operation};
+use horizon_server_plugin_api::{HostApiV3, event, operation};
 
 const STORAGE_ID: &str = "AuraEssentials";
 
+mod holograms;
+mod npcs;
 mod resource_packs;
+mod roles;
 mod scoreboard;
 mod teleport;
 mod worlds;
@@ -16,6 +19,9 @@ pub fn ensure_resource_pack_config() {
 
 pub fn register_commands(host: &HostApiV3) {
     scoreboard::start(host);
+    roles::register_commands(host);
+    holograms::register_commands(host);
+    npcs::register_commands(host);
     teleport::register_commands(host);
     worlds::register_commands(host);
     for (usage, level, permission) in [
@@ -28,6 +34,16 @@ pub fn register_commands(host: &HostApiV3) {
         ("warps", 0, None),
         ("delwarp <nome:word?>", 2, Some("auraessentials.warp.admin")),
         ("rtp", 0, None),
+        (
+            "invsee <jogador:player_name>",
+            2,
+            Some("auraessentials.inventario.ver"),
+        ),
+        (
+            "endersee <jogador:player_name>",
+            2,
+            Some("auraessentials.inventario.ver"),
+        ),
     ] {
         let mut data = serde_json::json!({"usage": usage, "default_level": level});
         if let Some(permission) = permission {
@@ -42,6 +58,15 @@ pub fn register_commands(host: &HostApiV3) {
 }
 
 pub fn command(host: &HostApiV3, player: u128, command: &str) -> bool {
+    if roles::command(host, player, command) {
+        return true;
+    }
+    if holograms::command(host, player, command) {
+        return true;
+    }
+    if npcs::command(host, player, command) {
+        return true;
+    }
     if teleport::command(host, player, command) {
         return true;
     }
@@ -72,11 +97,17 @@ pub fn command(host: &HostApiV3, player: u128, command: &str) -> bool {
         "warps" if args.is_empty() => open_warps(host, player),
         "delwarp" if args.len() == 1 => delete_warp(host, player, args[0]),
         "rtp" if args.is_empty() => worlds::random_teleport(host, player),
+        "invsee" | "endersee" if args.len() == 1 => {
+            open_inventory_view(host, player, args[0], root == "endersee")
+        }
         _ => false,
     }
 }
 
 pub fn suggestions(host: &HostApiV3, player: u128, line: &str) {
+    roles::suggestions(host, player, line);
+    holograms::suggestions(host, player, line);
+    npcs::suggestions(host, player, line);
     let trailing = line.ends_with(' ');
     let words: Vec<_> = line.split_whitespace().collect();
     let (root, args) = words.split_first().map_or(("", &[][..]), |(r, a)| (*r, a));
@@ -119,11 +150,10 @@ pub fn suggestions(host: &HostApiV3, player: u128, line: &str) {
                         "definirprincipal",
                         "removerprincipal",
                         "gamerule",
-                        "apagar",
-                        "confirmar",
                         "reset",
                         "renomear",
                         "remover",
+                        "importar",
                     ]
                     .map(str::to_owned),
                 );
@@ -150,9 +180,7 @@ pub fn suggestions(host: &HostApiV3, player: u128, line: &str) {
                 candidates.extend(worlds::dimension_names(host, player));
             }
         }
-        ("mundo", ["apagar"])
-        | ("mundo", ["apagar", _])
-        | ("mundo", ["remover"])
+        ("mundo", ["remover"])
         | ("mundo", ["remover", _])
         | ("mundo", ["renomear"])
         | ("mundo", ["renomear", _]) => {
@@ -182,6 +210,30 @@ pub fn suggestions(host: &HostApiV3, player: u128, line: &str) {
         }
         ("mundo", ["gamerule", _, rule])
             if admin
+                && !matches!(
+                    *rule,
+                    "keep_inventory"
+                        | "do_daylight_cycle"
+                        | "do_mob_spawning"
+                        | "do_fire_tick"
+                        | "mob_griefing"
+                        | "random_tick_speed"
+                ) =>
+        {
+            candidates.extend(
+                [
+                    "keep_inventory",
+                    "do_daylight_cycle",
+                    "do_mob_spawning",
+                    "do_fire_tick",
+                    "mob_griefing",
+                    "random_tick_speed",
+                ]
+                .map(str::to_owned),
+            );
+        }
+        ("mundo", ["gamerule", _, rule])
+            if admin
                 && matches!(
                     *rule,
                     "keep_inventory"
@@ -191,11 +243,10 @@ pub fn suggestions(host: &HostApiV3, player: u128, line: &str) {
                         | "mob_griefing"
                 ) =>
         {
-            candidates.extend(["true", "false"].map(str::to_owned));
-        }
-        ("mundo", ["confirmar"]) | ("mundo", ["confirmar", _]) => {
-            if admin {
-                candidates.extend(worlds::pending_delete_token(player));
+            if *rule == "random_tick_speed" {
+                candidates.extend(["0", "1", "3"].map(str::to_owned));
+            } else {
+                candidates.extend(["true", "false"].map(str::to_owned));
             }
         }
         ("mundo", ["reset"]) => {
@@ -223,9 +274,61 @@ pub fn suggestions(host: &HostApiV3, player: u128, line: &str) {
                 candidates.extend(["overworld", "nether", "end", "flat"].map(str::to_owned))
             }
         }
+        ("invsee", []) | ("invsee", [_]) | ("endersee", []) | ("endersee", [_]) => {
+            if let Some(result) = call_json(
+                host,
+                player,
+                serde_json::json!({"operation": operation::PLAYER_ONLINE_LIST, "data": {}}),
+            ) {
+                candidates.extend(
+                    result["players"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|entry| entry["name"].as_str().map(str::to_owned)),
+                );
+            }
+        }
         _ => {}
     }
-    let current = if trailing {
+    let branch_is_complete = match (root, args) {
+        ("mundo", [command])
+            if matches!(
+                *command,
+                "listar"
+                    | "criar"
+                    | "tp"
+                    | "carregar"
+                    | "descarregar"
+                    | "spawn"
+                    | "definirspawn"
+                    | "definirprincipal"
+                    | "removerprincipal"
+                    | "gamerule"
+                    | "remover"
+                    | "reset"
+                    | "renomear"
+            ) =>
+        {
+            true
+        }
+        ("mundo", ["criar", _]) | ("mundo", ["gamerule", _]) | ("mundo", ["reset", _]) => true,
+        ("mundo", ["gamerule", _, rule])
+            if matches!(
+                *rule,
+                "keep_inventory"
+                    | "do_daylight_cycle"
+                    | "do_mob_spawning"
+                    | "do_fire_tick"
+                    | "mob_griefing"
+                    | "random_tick_speed"
+            ) =>
+        {
+            true
+        }
+        _ => false,
+    };
+    let current = if trailing || args.is_empty() || branch_is_complete {
         ""
     } else {
         words.last().copied().unwrap_or_default()
@@ -246,11 +349,93 @@ pub fn suggestions(host: &HostApiV3, player: u128, line: &str) {
     }
 }
 
+fn open_inventory_view(host: &HostApiV3, player: u128, name: &str, ender: bool) -> bool {
+    let Some(target) = call_json(
+        host,
+        player,
+        serde_json::json!({"operation": operation::PLAYER_LOOKUP, "data": {"name": name}}),
+    )
+    .filter(|value| value["ok"] == true)
+    .and_then(|value| value["players"].as_array()?.first().cloned()) else {
+        message(host, player, "Jogador não está online.");
+        return true;
+    };
+    let Some(uuid) = target["uuid"].as_str() else {
+        message(host, player, "Não consegui identificar o jogador.");
+        return true;
+    };
+    let kind = if ender { "ender" } else { "player" };
+    let title = if ender {
+        format!("Ender Chest de {}", target["name"].as_str().unwrap_or(name))
+    } else {
+        format!("Inventário de {}", target["name"].as_str().unwrap_or(name))
+    };
+    let scheduled = call_json(
+        host,
+        player,
+        serde_json::json!({
+            "operation": operation::SCHEDULER_SCHEDULE,
+            "data": {"plugin": "AuraEssentials", "delay_ticks": 1,
+                "data": {"kind": "inventory_view_open", "viewer": format!("{player:032x}"),
+                    "target": uuid, "inventory": kind, "title": title}},
+        }),
+    );
+    if scheduled.as_ref().is_some_and(|value| value["ok"] == true) {
+        message(host, player, &format!("Abrindo o {title}."));
+    } else {
+        message(
+            host,
+            player,
+            "Não foi possível agendar a abertura desse inventário.",
+        );
+    }
+    true
+}
+
 pub fn event(host: &HostApiV3, kind: u32, payload: &serde_json::Value) {
+    if kind == event::SERVER_TASK && payload["data"]["kind"] == "inventory_view_open" {
+        finish_inventory_view(host, &payload["data"]);
+        return;
+    }
     teleport::event(host, kind, payload);
     worlds::event(host, kind, payload);
+    npcs::event(host, kind, payload);
     resource_packs::event(host, kind, payload);
     scoreboard::event(host, kind, payload);
+    roles::event(host, kind, payload);
+}
+
+fn finish_inventory_view(host: &HostApiV3, task: &serde_json::Value) {
+    let Some(viewer) = task["viewer"]
+        .as_str()
+        .and_then(|value| u128::from_str_radix(value, 16).ok())
+    else {
+        return;
+    };
+    let (Some(target), Some(kind), Some(title)) = (
+        task["target"].as_str(),
+        task["inventory"].as_str(),
+        task["title"].as_str(),
+    ) else {
+        return;
+    };
+    let result = call_json(
+        host,
+        viewer,
+        serde_json::json!({
+            "operation": operation::INVENTORY_VIEW_OPEN,
+            "data": {"target": target, "kind": kind, "title": title},
+        }),
+    );
+    if result.as_ref().is_some_and(|value| value["ok"] == true) {
+        message(host, viewer, &format!("Inventário de {title} aberto."));
+    } else {
+        message(
+            host,
+            viewer,
+            "Não foi possível abrir esse inventário; o jogador pode ter saído ou morrido.",
+        );
+    }
 }
 
 fn valid_name(name: &str) -> bool {
@@ -563,6 +748,46 @@ fn location(snapshot: &serde_json::Value) -> serde_json::Value {
 }
 
 fn teleport(host: &HostApiV3, player: u128, target: &serde_json::Value, success: &str) {
+    let snapshot = player_snapshot(host, player);
+    let current = snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot["dimension"].as_str().map(str::to_owned));
+    let destination = target["dimension"].as_str();
+    if current.as_deref() == destination
+        && snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot["position"] == target["position"]
+                && snapshot["yaw"] == target["yaw"]
+                && snapshot["pitch"] == target["pitch"]
+        })
+    {
+        message(host, player, "Você já está nesse local.");
+        return;
+    }
+    if let (Some(current), Some(destination)) = (current, destination)
+        && current != destination
+    {
+        let loaded = call_json(
+            host,
+            player,
+            serde_json::json!({
+                "operation": operation::WORLD_DIMENSION_LOAD,
+                "data": {"dimension": destination},
+            }),
+        );
+        if loaded.as_ref().is_none_or(|result| result["ok"] != true) {
+            let reason = loaded
+                .as_ref()
+                .and_then(|value| value["detail"].as_str())
+                .or_else(|| loaded.as_ref().and_then(|value| value["error"].as_str()))
+                .unwrap_or("falha ao abrir a dimensão");
+            message(
+                host,
+                player,
+                &format!("Não foi possível abrir a dimensão de destino: {reason}"),
+            );
+            return;
+        }
+    }
     let result = call_json(
         host,
         player,
@@ -578,10 +803,13 @@ fn teleport(host: &HostApiV3, player: u128, target: &serde_json::Value, success:
     );
     match result {
         Some(result) if result["ok"] == true => message(host, player, success),
-        Some(_) => message(
+        Some(result) => message(
             host,
             player,
-            "O Horizon recusou o teleporte; confirme a dimensão e a posição de destino.",
+            &format!(
+                "O Horizon recusou o teleporte: {}.",
+                result["error"].as_str().unwrap_or("destino inválido")
+            ),
         ),
         None => message(host, player, "A API de teleporte do Horizon não respondeu."),
     }

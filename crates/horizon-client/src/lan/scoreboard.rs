@@ -117,6 +117,54 @@ impl View {
         }
     }
 
+    /// Adds per-player nametag styling as private synthetic teams, leaving the actual scoreboard
+    /// model and chat/list names untouched. Existing team formatting is retained around it.
+    pub fn of_with_name_tags(board: &Scoreboard, styles: &[(String, u128, Tag, Tag)]) -> Self {
+        let mut view = Self::of(board);
+        for (player, uuid, prefix, suffix) in styles {
+            let prior = view.teams.iter().find_map(|(name, (params, players))| {
+                players
+                    .contains(player)
+                    .then(|| (name.clone(), params.clone()))
+            });
+            let mut params = prior
+                .as_ref()
+                .map(|(_, params)| params.clone())
+                .unwrap_or_else(|| TeamParameters {
+                    display_name: component_tag(&serde_json::json!({"text":""})),
+                    prefix: component_tag(&serde_json::json!({"text":""})),
+                    suffix: component_tag(&serde_json::json!({"text":""})),
+                    name_tag_visibility: 0,
+                    collision_rule: 0,
+                    color: None,
+                    options: 3,
+                });
+            if let Some((old_team, _)) = prior {
+                if let Some((_, players)) = view.teams.get_mut(&old_team) {
+                    players.retain(|member| member != player);
+                }
+            }
+            let combine = |a: &Tag, b: &Tag| {
+                component_tag(
+                    &serde_json::json!({"text":"","extra":[crate::scoreboard::tag_to_json(a), crate::scoreboard::tag_to_json(b)]}),
+                )
+            };
+            params.prefix = combine(&params.prefix, prefix);
+            params.suffix = combine(&params.suffix, suffix);
+            // Synthetic team names are limited to 16 characters by the protocol.
+            // Find an unused name so a UUID collision cannot replace a real team.
+            let base = format!("a{:011x}", uuid & 0x0000_ffff_ffff_ffff);
+            let Some(team) = (0u8..=u8::MAX)
+                .map(|suffix| format!("{base}{suffix:02x}"))
+                .find(|name| !view.teams.contains_key(name))
+            else {
+                continue;
+            };
+            view.teams.insert(team, (params, vec![player.clone()]));
+        }
+        view
+    }
+
     /// The packets that take a client from `self` to `next`.
     pub fn changes(&self, next: &View) -> Vec<C> {
         let mut out = Vec::new();

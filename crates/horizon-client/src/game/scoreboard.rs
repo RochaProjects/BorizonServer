@@ -465,7 +465,26 @@ impl Game<'_> {
         }
         self.load_scoreboard();
         host.hub.teams.clone_from(&self.score.board.teams);
-        let view = horizon_client::lan::scoreboard::View::of(&self.score.board);
+        let styles: Vec<_> = host
+            .hub
+            .guests
+            .iter()
+            .filter_map(|guest| {
+                host.hub
+                    .name_tag_styles
+                    .get(&guest.uuid)
+                    .map(|(prefix, suffix)| {
+                        (
+                            guest.name.clone(),
+                            guest.uuid,
+                            prefix.clone(),
+                            suffix.clone(),
+                        )
+                    })
+            })
+            .collect();
+        let view =
+            horizon_client::lan::scoreboard::View::of_with_name_tags(&self.score.board, &styles);
         for g in host.hub.guests.iter_mut().filter(|g| g.placed) {
             if g.scoreboard != view {
                 g.send_all(&g.scoreboard.changes(&view));

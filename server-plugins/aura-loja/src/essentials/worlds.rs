@@ -1,29 +1,24 @@
 //! World utilities built on generic dimension, gamerule and location calls.
 
 use super::{player_snapshot, storage_get, storage_set, teleport, valid_name};
-use crate::plugin_api::{call_json, message};
+use crate::plugin_api::{call_json, get_public_http_bytes, message};
 use horizon_server_plugin_api::{HostApiV3, operation};
 use std::{
     collections::HashMap,
+    fs,
+    io::{Read, Write},
+    path::{Component, Path, PathBuf},
     sync::{Mutex, OnceLock},
-    time::{Duration, Instant},
+    time::{SystemTime, UNIX_EPOCH},
 };
+use zip::ZipArchive;
 
-static PENDING_DELETE_CONFIRMATIONS: OnceLock<Mutex<HashMap<u128, (String, Instant)>>> =
-    OnceLock::new();
-
-fn pending_deletions() -> &'static Mutex<HashMap<u128, (String, Instant)>> {
-    PENDING_DELETE_CONFIRMATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+enum ImportState {
+    Running,
+    Ready(PathBuf),
+    Failed(String),
 }
-
-pub(super) fn pending_delete_token(player: u128) -> Option<String> {
-    let mut pending = pending_deletions()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    pending.retain(|_, (_, expires)| *expires > Instant::now());
-    pending.get(&player).map(|(token, _)| token.clone())
-}
-
+static IMPORTS: OnceLock<Mutex<HashMap<u128, ImportState>>> = OnceLock::new();
 pub(super) fn register_commands(host: &HostApiV3) {
     for usage in [
         "mundo",
@@ -36,23 +31,21 @@ pub(super) fn register_commands(host: &HostApiV3) {
         "mundo definirspawn",
         "mundo definirprincipal <nome:word?>",
         "mundo removerprincipal",
-        "mundo gamerule <nome:word?> <regra:word> <valor:greedy_string>",
-        "mundo apagar <nome:word?>",
+        "mundo gamerule <nome:word?> <regra:word> <valor:word>",
         "mundo remover <nome:word?>",
-        "mundo confirmar <token:word?>",
         "mundo reset <categoria:word?>",
         "mundo reset <categoria:word?> force",
-        "mundo renomear <nome:word?> <novo_nome:greedy_string>",
+        "mundo renomear <nome:word?> <novo_nome:word>",
+        "mundo importar <nome:word> <url:text>",
     ] {
         let permission = if usage.contains("criar")
             || usage.contains("carregar")
             || usage.contains("descarregar")
-            || usage.contains("apagar")
             || usage.contains("mundo remover")
-            || usage.contains("confirmar")
             || usage.contains("reset")
             || usage.contains("gamerule")
             || usage.contains("renomear")
+            || usage.contains("importar")
             || usage.contains("definirspawn")
             || usage.contains("principal")
         {
@@ -101,13 +94,13 @@ pub(super) fn command(host: &HostApiV3, player: u128, command: &str) -> bool {
         ["mundo", "definirprincipal", id] => set_primary(host, player, id),
         ["mundo", "removerprincipal"] => clear_primary(host, player),
         ["mundo", "gamerule", id, rule, value] => gamerule(host, player, id, rule, value),
-        ["mundo", "apagar", name] | ["mundo", "remover", name] => {
-            prepare_delete(host, player, name)
-        }
-        ["mundo", "confirmar", token] => delete(host, player, token),
+        ["mundo", "remover", name] => delete(host, player, name),
         ["mundo", "reset", category] => prepare_reset(host, player, category),
         ["mundo", "reset", category, "force"] => force_reset(host, player, category),
         ["mundo", "renomear", id, name] => rename(host, player, id, name),
+        ["mundo", "importar", name, url @ ..] if !url.is_empty() => {
+            start_import(host, player, name, &url.join(" "))
+        }
         _ => {
             message(
                 host,
@@ -122,20 +115,10 @@ pub(super) fn command(host: &HostApiV3, player: u128, command: &str) -> bool {
 pub(super) fn event(host: &HostApiV3, kind: u32, payload: &serde_json::Value) {
     if kind == horizon_server_plugin_api::event::SERVER_TASK {
         run_reset_task(host, payload);
+        run_import_task(host, payload);
         return;
     }
     if kind != horizon_server_plugin_api::event::PLAYER_JOIN {
-        if kind == horizon_server_plugin_api::event::PLAYER_QUIT
-            && let Some(player) = payload
-                .get("player")
-                .and_then(serde_json::Value::as_str)
-                .and_then(|value| u128::from_str_radix(value, 16).ok())
-        {
-            pending_deletions()
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .remove(&player);
-        }
         return;
     }
     let Some(primary) =
@@ -330,6 +313,243 @@ fn reserved_dimension_name(name: &str) -> bool {
     )
 }
 
+fn start_import(host: &HostApiV3, player: u128, name: &str, url: &str) -> bool {
+    if !valid_name(name) || reserved_dimension_name(name) || name.contains(':') {
+        message(host, player, "Nome de dimensão inválido ou reservado.");
+        return true;
+    }
+    let url = url.trim().to_owned();
+    if !(url.starts_with("https://") || url.starts_with("http://")) || url.len() > 2048 {
+        message(host, player, "A URL precisa ser HTTP ou HTTPS.");
+        return true;
+    }
+    let id = format!("minecraft:{}", name.to_ascii_lowercase());
+    if dimension_exists(host, player, &id) {
+        message(host, player, "Já existe uma dimensão com esse nome.");
+        return true;
+    }
+    let jobs = IMPORTS.get_or_init(Default::default);
+    let mut jobs = jobs.lock().unwrap_or_else(|e| e.into_inner());
+    if matches!(jobs.get(&player), Some(ImportState::Running)) {
+        message(host, player, "Você já tem uma importação em andamento.");
+        return true;
+    }
+    jobs.insert(player, ImportState::Running);
+    drop(jobs);
+    let scheduled = call_json(
+        host,
+        player,
+        serde_json::json!({"operation":operation::SCHEDULER_SCHEDULE,"data":{"plugin":"AuraEssentials","delay_ticks":20,"period_ticks":20,"data":{"kind":"world_import_poll","player":format!("{player:032x}"),"id":id}}}),
+    );
+    if !scheduled.as_ref().is_some_and(|v| v["ok"] == true) {
+        IMPORTS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&player);
+        message(
+            host,
+            player,
+            "Não foi possível agendar a validação da importação.",
+        );
+        return true;
+    }
+    let world_name = name.to_owned();
+    std::thread::spawn(move || {
+        let result = download_world(&url, &world_name);
+        let mut jobs = IMPORTS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        jobs.insert(
+            player,
+            result.map_or_else(ImportState::Failed, ImportState::Ready),
+        );
+    });
+    message(
+        host,
+        player,
+        "Download e validação iniciados em background; o servidor continua respondendo.",
+    );
+    true
+}
+
+fn download_world(url: &str, name: &str) -> Result<PathBuf, String> {
+    const MAX_ARCHIVE: u64 = 512 * 1024 * 1024;
+    const MAX_EXTRACTED: u64 = 2 * 1024 * 1024 * 1024;
+    let bytes =
+        get_public_http_bytes(url, MAX_ARCHIVE).map_err(|e| format!("Download falhou: {e}"))?;
+    let mut archive = ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|e| format!("Arquivo ZIP inválido: {e}"))?;
+    let candidates: Vec<String> = archive
+        .file_names()
+        .filter(|path| {
+            path.ends_with("level.dat")
+                && !path.ends_with("level.dat_old")
+                && path.split('/').count() <= 4
+        })
+        .map(|path| path.trim_end_matches("level.dat").to_owned())
+        .collect();
+    if candidates.len() != 1 {
+        return Err(if candidates.is_empty() {
+            "O ZIP não contém level.dat em uma pasta de mundo válida.".into()
+        } else {
+            "O ZIP contém mais de um mundo; envie um arquivo com apenas um mundo.".into()
+        });
+    }
+    let prefix = &candidates[0];
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |v| v.as_millis());
+    let root = std::env::current_dir()
+        .map_err(|e| e.to_string())?
+        .join("plugins/.horizon-world-imports");
+    fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let stem = format!("{}-{now}", name.to_ascii_lowercase());
+    let mut destination = root.join(&stem);
+    let mut suffix = 0;
+    while destination.exists() {
+        suffix += 1;
+        destination = root.join(format!("{stem}-{suffix}"));
+    }
+    fs::create_dir(&destination).map_err(|e| e.to_string())?;
+    let extracted = (|| -> Result<(), String> {
+        let mut total = 0u64;
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).map_err(|e| e.to_string())?;
+            let Some(enclosed) = entry.enclosed_name() else {
+                continue;
+            };
+            let raw = entry.name();
+            let Some(relative) = raw.strip_prefix(prefix) else {
+                continue;
+            };
+            if relative.is_empty() {
+                continue;
+            }
+            let rel = Path::new(relative);
+            if rel.components().any(|c| !matches!(c, Component::Normal(_))) {
+                return Err("O ZIP contém caminho inseguro.".into());
+            }
+            let target = destination.join(enclosed.strip_prefix(prefix).unwrap_or(rel));
+            if entry.is_dir() {
+                fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+                continue;
+            }
+            let Some(parent) = target.parent() else {
+                return Err("Caminho inválido no ZIP.".into());
+            };
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            let mut file = fs::File::create(&target).map_err(|e| e.to_string())?;
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                let read = entry.read(&mut buffer).map_err(|e| e.to_string())?;
+                if read == 0 {
+                    break;
+                }
+                total = total.saturating_add(read as u64);
+                if total > MAX_EXTRACTED {
+                    return Err("O conteúdo extraído excede 2 GB.".into());
+                }
+                file.write_all(&buffer[..read]).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = extracted {
+        let _ = fs::remove_dir_all(&destination);
+        return Err(error);
+    }
+    if !destination.join("level.dat").is_file() {
+        let _ = fs::remove_dir_all(&destination);
+        return Err("O ZIP não contém level.dat no diretório selecionado.".into());
+    }
+    Ok(destination)
+}
+
+fn run_import_task(host: &HostApiV3, payload: &serde_json::Value) {
+    if payload["data"]["kind"] != "world_import_poll" {
+        return;
+    }
+    let Some(player) = payload["data"]["player"]
+        .as_str()
+        .and_then(|s| u128::from_str_radix(s, 16).ok())
+    else {
+        return;
+    };
+    let Some(id) = payload["data"]["id"].as_str().map(str::to_owned) else {
+        return;
+    };
+    let state = IMPORTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&player);
+    let Some(state) = state else { return };
+    let Some(task) = payload["task_id"]
+        .as_str()
+        .and_then(|v| v.parse::<u64>().ok())
+    else {
+        return;
+    };
+    let finish = |host: &HostApiV3| {
+        let _ = call_json(
+            host,
+            player,
+            serde_json::json!({"operation":operation::SCHEDULER_CANCEL,"data":{"task_id":task}}),
+        );
+    };
+    match state {
+        ImportState::Running => {
+            IMPORTS
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(player, ImportState::Running);
+        }
+        ImportState::Failed(error) => {
+            finish(host);
+            message(host, player, &format!("Importação cancelada: {error}"));
+        }
+        ImportState::Ready(path) => {
+            let result = call_json(
+                host,
+                player,
+                serde_json::json!({"operation":operation::WORLD_DIMENSION_IMPORT,"data":{"id":id,"source_dir":path}}),
+            );
+            let _ = fs::remove_dir_all(&path);
+            finish(host);
+            if result.as_ref().is_some_and(|v| v["ok"] == true) {
+                let alias = id.strip_prefix("minecraft:").unwrap_or(&id);
+                let mut aliases = storage_get(host, "world:aliases")
+                    .and_then(|v| v.as_object().cloned())
+                    .unwrap_or_default();
+                aliases.insert(id.clone(), serde_json::Value::String(alias.into()));
+                let _ = storage_set(host, "world:aliases", serde_json::Value::Object(aliases));
+                message(
+                    host,
+                    player,
+                    &format!(
+                        "Mundo importado como dimensão {alias}. Use /mundo tp {alias} para visitar."
+                    ),
+                );
+            } else {
+                message(
+                    host,
+                    player,
+                    &format!(
+                        "Mundo baixado, mas a validação/importação falhou: {}.",
+                        result
+                            .as_ref()
+                            .and_then(|v| v["error"].as_str())
+                            .unwrap_or("falha")
+                    ),
+                );
+            }
+        }
+    }
+}
+
 pub(super) fn dimension_names(host: &HostApiV3, player: u128) -> Vec<String> {
     call_json(
         host,
@@ -358,20 +578,28 @@ fn go_to(host: &HostApiV3, player: u128, id: &str) -> bool {
         message(host, player, "Não consegui consultar sua posição.");
         return true;
     };
-    let target = storage_get(host, &format!("world:spawn:{id}")).unwrap_or_else(|| {
+    let target = storage_get(host, &format!("world:spawn:{id}"));
+    if snapshot["dimension"].as_str() == Some(id.as_str()) && target.is_none() {
+        message(
+            host,
+            player,
+            "Você já está nessa dimensão. Defina o ponto de chegada com /mundo definirspawn.",
+        );
+        return true;
+    }
+    let target = target.unwrap_or_else(|| {
         serde_json::json!({
             "dimension": id,
-            "position": snapshot["position"],
+            "position": [0.5, 100.0, 0.5],
             "yaw": snapshot["yaw"],
             "pitch": snapshot["pitch"],
         })
     });
-    let has_spawn = storage_get(host, &format!("world:spawn:{id}")).is_some();
     let display = dimension_name(host, &id);
-    let notice = if has_spawn {
+    let notice = if storage_get(host, &format!("world:spawn:{id}")).is_some() {
         format!("Teleportado para {display}.")
     } else {
-        format!("Primeira entrada em {display}. Defina o spawn com /mundo definirspawn.")
+        format!("Primeira entrada em {display}. Defina o ponto de chegada com /mundo definirspawn.")
     };
     teleport(host, player, &target, &notice);
     true
@@ -663,88 +891,50 @@ fn gamerule(host: &HostApiV3, player: u128, id: &str, rule: &str, text: &str) ->
     true
 }
 
-fn prepare_delete(host: &HostApiV3, player: u128, id: &str) -> bool {
+fn delete(host: &HostApiV3, player: u128, id: &str) -> bool {
     let id = resolve_dimension(host, id);
     let result = call_json(
         host,
         player,
         serde_json::json!({
-            "operation": operation::WORLD_DIMENSION_DELETE_PREPARE,
+            "operation": operation::WORLD_DIMENSION_DELETE,
             "data": {"dimension": id},
         }),
     );
-    if result.as_ref().is_some_and(|value| value["ok"] == true) {
-        let token = result
-            .as_ref()
-            .and_then(|value| value["token"].as_str())
-            .unwrap_or_default();
-        if !token.is_empty() {
-            pending_deletions()
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .insert(
-                    player,
-                    (token.to_owned(), Instant::now() + Duration::from_secs(60)),
-                );
+    let text = if result.as_ref().is_some_and(|value| value["ok"] == true) {
+        if storage_get(host, "world:primary")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .as_deref()
+            == Some(id.as_str())
+        {
+            let _ = call_json(
+                host,
+                player,
+                serde_json::json!({"operation": operation::PLUGIN_STORAGE_DELETE, "data": {"plugin": "AuraEssentials", "key": "world:primary"}}),
+            );
         }
-        message(
+        let _ = call_json(
             host,
             player,
-            &format!(
-                "Backup obrigatório será criado. Confirme em 60 segundos: /mundo confirmar {token}"
-            ),
+            serde_json::json!({"operation": operation::PLUGIN_STORAGE_DELETE, "data": {"plugin": "AuraEssentials", "key": format!("world:spawn:{id}")}}),
         );
+        if let Some(mut aliases) =
+            storage_get(host, "world:aliases").and_then(|value| value.as_object().cloned())
+        {
+            aliases.remove(&id);
+            let _ = storage_set(host, "world:aliases", serde_json::Value::Object(aliases));
+        }
+        format!("Dimensão {} removida.", dimension_name(host, &id))
     } else {
-        message(
-            host,
-            player,
-            &format!(
-                "Não foi possível preparar remoção: {}.",
-                result
-                    .as_ref()
-                    .and_then(|value| value["error"].as_str())
-                    .unwrap_or("falha")
-            ),
-        );
-    }
-    true
-}
-
-fn delete(host: &HostApiV3, player: u128, token: &str) -> bool {
-    pending_deletions()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .remove(&player);
-    let result = call_json(
-        host,
-        player,
-        serde_json::json!({
-            "operation": operation::WORLD_DIMENSION_DELETE_COMMIT,
-            "data": {"token": token},
-        }),
-    );
-    message(
-        host,
-        player,
-        if result.as_ref().is_some_and(|value| value["ok"] == true) {
-            format!(
-                "Dimensão removida; backup em {}.",
-                result
-                    .as_ref()
-                    .and_then(|value| value["backup"].as_str())
-                    .unwrap_or("plugins/AuraEssentials/backups")
-            )
-        } else {
-            format!(
-                "Remoção cancelada: {}.",
-                result
-                    .as_ref()
-                    .and_then(|value| value["error"].as_str())
-                    .unwrap_or("falha")
-            )
-        }
-        .as_str(),
-    );
+        format!(
+            "Não foi possível remover a dimensão: {}.",
+            result
+                .as_ref()
+                .and_then(|value| value["error"].as_str())
+                .unwrap_or("falha")
+        )
+    };
+    message(host, player, &text);
     true
 }
 

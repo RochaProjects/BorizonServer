@@ -23,11 +23,14 @@ pub mod event {
     pub const PLAYER_TELEPORT: u32 = 10;
     pub const PLAYER_MOVE: u32 = 11;
     pub const SERVER_TASK: u32 = 12;
+    pub const PLAYER_INTERACT_ENTITY: u32 = 13;
 }
 
 /// Stable operation names accepted by `HostApiV3::call_json`.
 pub mod operation {
     pub const COMMAND_REGISTER: &str = "command.register";
+    /// Runs a command as an online player, preserving that player's permissions.
+    pub const PLAYER_COMMAND_EXECUTE: &str = "player.command.execute";
     /// Appends one Brigadier completion while the loader is querying plugins.
     pub const COMMAND_SUGGESTION_ADD: &str = "command.suggestions.add";
     pub const CHAT_SEND: &str = "chat.send";
@@ -39,8 +42,13 @@ pub mod operation {
     pub const PLAYER_STAT_GET: &str = "player.stat.get";
     /// Reads all saved vanilla statistics for an online player.
     pub const PLAYER_STATS_GET: &str = "player.stats.get";
+    /// Opens an interactive view of another player's live/file inventory.
+    pub const INVENTORY_VIEW_OPEN: &str = "inventory.view.open";
     pub const PLAYER_TELEPORT: &str = "player.teleport";
     pub const PLAYER_GAME_MODE_SET: &str = "player.game_mode.set";
+    /// Sets generic styled names shown in chat and the player list. Each field accepts a
+    /// legacy-formatted string or a JSON text component; null clears that override.
+    pub const PLAYER_DISPLAY_SET: &str = "player.display.set";
     pub const RESOURCE_PACK_SEND: &str = "resource_pack.send";
     pub const RESOURCE_PACK_SEND_BATCH: &str = "resource_pack.send_batch";
     pub const RESOURCE_PACK_REMOVE: &str = "resource_pack.remove";
@@ -54,8 +62,10 @@ pub mod operation {
     pub const WORLD_CUSTOM_GAMERULE_CLEAR: &str = "world.custom_gamerule.clear";
     pub const WORLD_DIMENSION_UNLOAD: &str = "world.dimension.unload";
     pub const WORLD_DIMENSION_CREATE: &str = "world.dimension.create";
-    pub const WORLD_DIMENSION_DELETE_PREPARE: &str = "world.dimension.delete.prepare";
-    pub const WORLD_DIMENSION_DELETE_COMMIT: &str = "world.dimension.delete.commit";
+    /// Imports a validated extracted save as this server world's custom dimension.
+    pub const WORLD_DIMENSION_IMPORT: &str = "world.dimension.import";
+    /// Deletes one unloaded custom dimension and its generator metadata, without a backup.
+    pub const WORLD_DIMENSION_DELETE: &str = "world.dimension.delete";
     pub const WORLD_LOCATION_FIND_SAFE: &str = "world.location.find_safe";
     /// Creates a short-lived reset plan. Its response reports whether online players require force mode.
     pub const WORLD_PLAYER_DATA_RESET_PREPARE: &str = "world.player_data.reset.prepare";
@@ -81,11 +91,19 @@ pub mod operation {
     pub const PLUGIN_STORAGE_DELETE: &str = "plugin.storage.delete";
     pub const PLUGIN_STORAGE_LIST: &str = "plugin.storage.list";
     pub const ENTITY_TEXT_DISPLAY_CREATE: &str = "entity.text_display.create";
+    /// Spawns a namespaced vanilla entity with generic persistence/AI/display options and a caller UUID.
+    pub const ENTITY_SPAWN: &str = "entity.spawn";
     pub const ENTITY_MOVE: &str = "entity.move";
     pub const ENTITY_REMOVE: &str = "entity.remove";
+    /// Removes an entity of any supported type by its stable UUID.
+    pub const ENTITY_REMOVE_UUID: &str = "entity.remove_uuid";
+    /// Creates/replaces a persistent text_display addressed by a stable UUID.
     pub const ENTITY_DISPLAY_UPSERT: &str = "entity.display.upsert";
-    pub const ENTITY_DISPLAY_LIST: &str = "entity.display.list";
+    /// Removes a text_display by the same stable UUID used by upsert.
     pub const ENTITY_DISPLAY_DELETE: &str = "entity.display.delete";
+    /// Creates/replaces a vanilla item_display using an item model from a Java resource pack.
+    /// `item_model` is a namespaced key such as `aura:npc/namespace_entity/cube_0`.
+    pub const ENTITY_ITEM_DISPLAY_UPSERT: &str = "entity.item_display.upsert";
     pub const INVENTORY_STACK_INSPECT: &str = "inventory.stack.inspect";
     pub const TRANSACTION_COMMIT: &str = "transaction.commit";
     pub const INVENTORY_DELIVERY_LIST: &str = "inventory.delivery.list";

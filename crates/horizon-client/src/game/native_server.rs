@@ -693,6 +693,37 @@ impl Game<'_> {
         host.hub.set_name_tag(uuid, tag.map(str::to_owned));
         true
     }
+    /// Sets the rich prefix/suffix shown only over the player's head using a synthetic scoreboard team.
+    pub(super) fn native_set_name_tag_style(
+        &mut self,
+        uuid: u128,
+        prefix: Option<&Text>,
+        suffix: Option<&Text>,
+    ) -> bool {
+        let Some(host) = &mut self.lan else {
+            return false;
+        };
+        if !host.hub.guests.iter().any(|g| g.placed && g.uuid == uuid) {
+            return false;
+        }
+        match (prefix, suffix) {
+            (None, None) => host.hub.set_name_tag_style(uuid, None),
+            (prefix, suffix) => host.hub.set_name_tag_style(
+                uuid,
+                Some((
+                    prefix.map_or_else(
+                        || crate::lan::data::component_nbt(&serde_json::json!({"text":""})),
+                        |t| crate::lan::data::component_nbt(&t.component()),
+                    ),
+                    suffix.map_or_else(
+                        || crate::lan::data::component_nbt(&serde_json::json!({"text":""})),
+                        |t| crate::lan::data::component_nbt(&t.component()),
+                    ),
+                )),
+            ),
+        }
+        true
+    }
     /// Whether the server's chat filter (`server.toml` `[chat_filter]`)
     /// lets `text` through: true without a filter, None inside a player's
     /// hook (where the server is out of reach). API 62.

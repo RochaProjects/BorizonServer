@@ -857,6 +857,29 @@ impl Game<'_> {
 /// Another player's inventory in a menu, for server mods. API @API:inventory_menu@.
 #[allow(dead_code)]
 impl Game<'_> {
+    /// Opens another player's inventory by its public kind name, for the JSON
+    /// server-plugin API. The native mod API continues to use the typed form.
+    pub(super) fn native_open_inventory_view(
+        &mut self,
+        viewer: u128,
+        target: u128,
+        kind: &str,
+        title: &str,
+    ) -> Option<i32> {
+        let kind = match kind {
+            "player" => NativeInventoryKind::Player,
+            "ender" => NativeInventoryKind::Ender,
+            _ => return None,
+        };
+        let rows = if kind == NativeInventoryKind::Player {
+            6
+        } else {
+            3
+        };
+        let layout: Vec<_> = (0..kind.size()).map(Some).collect();
+        self.native_open_inventory_menu(viewer, rows, Text::literal(title), (target, kind), &layout)
+    }
+
     /// Opens a chest menu of `rows` rows titled `title` for the player
     /// `viewer` (in place of the menu they had open, as `native_open_menu`)
     /// that shows the inventory `kind` of the player `target`, live: menu slot

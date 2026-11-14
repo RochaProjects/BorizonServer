@@ -138,6 +138,22 @@ pub fn dimension_dir(world: &Path, dimension: &str) -> PathBuf {
         .unwrap_or(("minecraft", dimension));
     world.join("dimensions").join(namespace).join(path)
 }
+
+/// Stable per-dimension seed for custom server dimensions. Vanilla dimensions
+/// continue to share the world's seed; a new custom dimension gets its own.
+pub fn custom_dimension_seed(world: &Path, dimension: &str) -> Option<i64> {
+    fs::read_to_string(dimension_dir(world, dimension).join("horizon.seed"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Persists a custom dimension's independent seed beside its region data.
+pub fn set_custom_dimension_seed(world: &Path, dimension: &str, seed: i64) -> Result<()> {
+    let path = dimension_dir(world, dimension).join("horizon.seed");
+    write_durable(&path, seed.to_string().as_bytes())
+}
 /// `DirectoryLock`: `session.lock` holds "\u{2603}" (UTF-16BE) under an exclusive
 /// file lock for as long as the world is open, so two instances cannot share it.
 pub struct SessionLock(fs::File);
@@ -3462,6 +3478,39 @@ pub fn world_gen_settings(world: &Path) -> Option<Tag> {
     })
 }
 
+/// Adds a validated imported save's overworld as a custom dimension in the active save.
+/// Only the source's generator entry and per-dimension chunk directories are imported;
+/// level.dat/player data from the source can never replace the active server world.
+pub fn import_overworld_dimension(world: &Path, source: &Path, dimension: &str) -> Result<()> {
+    if level_dat_issue(source, false).is_some() {
+        return Err(std::io::Error::other("source does not contain a valid level.dat").into());
+    }
+    let mut target_settings = world_gen_settings(world)
+        .ok_or_else(|| std::io::Error::other("active world generator settings are missing"))?;
+    let source_settings = world_gen_settings(source)
+        .ok_or_else(|| std::io::Error::other("imported world generator settings are missing"))?;
+    let imported = source_settings
+        .get("dimensions")
+        .and_then(|dimensions| dimensions.get("minecraft:overworld"))
+        .cloned()
+        .ok_or_else(|| std::io::Error::other("imported save has no Overworld generator"))?;
+    if imported.get("generator").is_none() || imported.get("type").is_none() {
+        return Err(std::io::Error::other("imported Overworld generator is invalid").into());
+    }
+    let Some(Tag::Compound(dimensions)) = target_settings.get_mut("dimensions") else {
+        return Err(std::io::Error::other("active world dimension registry is invalid").into());
+    };
+    if dimensions.contains_key(&dimension.into()) {
+        return Err(std::io::Error::other("dimension already exists").into());
+    }
+    dimensions.insert(dimension.into(), imported);
+    if let Some(seed) = number(source_settings.get("seed")) {
+        set_custom_dimension_seed(world, dimension, seed)?;
+    }
+    write_saved_data(world, "world_gen_settings", target_settings)?;
+    Ok(())
+}
+
 /// Add or replace the generator used by a custom dimension in the world's
 /// saved registry. The dimension ID remains stable; callers create/remove its
 /// storage directory separately.
@@ -3538,6 +3587,11 @@ pub fn set_custom_dimension_generator(world: &Path, dimension: &str, preset: &st
             ),
         ])
     } else {
+        let mut source = source;
+        let Some(Tag::Compound(generator)) = source.get_mut("generator") else {
+            return Err(std::io::Error::other("dimension generator template is invalid").into());
+        };
+        generator.insert("type".into(), string("minecraft:noise"));
         source
     };
     let Some(Tag::Compound(dimensions)) = settings.get_mut("dimensions") else {
@@ -3547,8 +3601,7 @@ pub fn set_custom_dimension_generator(world: &Path, dimension: &str, preset: &st
     write_saved_data(world, "world_gen_settings", settings)
 }
 
-/// Remove a custom dimension's generator entry after its region data is safely
-/// backed up and deleted.
+/// Remove a custom dimension's generator entry after its region data is deleted.
 pub fn remove_custom_dimension_generator(world: &Path, dimension: &str) -> Result<()> {
     let mut settings = world_gen_settings(world)
         .ok_or_else(|| std::io::Error::other("world generator settings are missing"))?;

@@ -728,9 +728,11 @@ fn reset_connected_player_records(game: &mut Game<'_>, categories: &[String]) {
     if !reset_advancements && !reset_stats {
         return;
     }
-    let advancement_count = reset_advancements
-        .then(|| game.advancement_tree().list.len())
-        .unwrap_or_default();
+    let advancement_count = if reset_advancements {
+        game.advancement_tree().list.len()
+    } else {
+        0
+    };
     let Some(lan) = game.lan.as_mut() else {
         return;
     };

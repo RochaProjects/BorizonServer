@@ -1000,7 +1000,7 @@ pub(super) fn suggestions(host: &HostApiV3, player: u128, line: &str) {
             }
             commands
         }
-        ["npc", "criar"] if admin => models(),
+        ["npc", "criar", _] if admin => models(),
         ["npc", "editar"] | ["npc", "remover"] if admin => {
             read().into_iter().map(|npc| npc.id).collect()
         }

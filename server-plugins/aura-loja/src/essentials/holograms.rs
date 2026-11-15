@@ -24,7 +24,9 @@ impl Default for Hologram {
             position: [0.0; 3],
             title: String::new(),
             description: String::new(),
-            split_background: true,
+            // AuraEssentials Java keeps a multiline hologram in one TextDisplay
+            // by default; split backgrounds are an explicit per-hologram option.
+            split_background: false,
             background: 0x900a0a0a,
         }
     }
@@ -68,7 +70,9 @@ fn lines(entry: &Hologram) -> Vec<String> {
         let text = if description.is_empty() {
             title
         } else {
-            format!("{title}\n{description}")
+            // The Java plugin inserts &r before the description so style codes
+            // from the title do not bleed into the next section.
+            format!("{title}\n&r{description}")
         };
         return vec![text];
     }
@@ -233,7 +237,7 @@ fn apply(host: &HostApiV3, entry: &Hologram) -> bool {
             0,
             serde_json::json!({"operation":operation::ENTITY_DISPLAY_UPSERT,"data":{
             "dimension":entry.dimension,"uuid":uuid(&entry.id,index),"position":position,"text":legacy_component(text),
-                "line_width":220,"background":background,"shadow":true,"see_through":false,"alignment":"center","billboard":"center"
+                "line_width":220,"view_range":0.25,"background":background,"shadow":false,"see_through":false,"alignment":"center","billboard":"center"
             }}),
         );
         ok &= result.is_some_and(|value| value["ok"] == true);
@@ -338,7 +342,7 @@ pub(super) fn command(host: &HostApiV3, player: u128, command: &str) -> bool {
                 snapshot["dimension"].as_str(),
                 snapshot["position"]
                     .as_array()
-                    .and_then(|p| Some([p[0].as_f64()?, p[1].as_f64()? + 2.0, p[2].as_f64()?])),
+                    .and_then(|p| Some([p[0].as_f64()?, p[1].as_f64()? + 1.2, p[2].as_f64()?])),
             ) else {
                 return true;
             };
@@ -398,7 +402,7 @@ pub(super) fn command(host: &HostApiV3, player: u128, command: &str) -> bool {
                 snapshot["dimension"].as_str(),
                 snapshot["position"]
                     .as_array()
-                    .and_then(|p| Some([p[0].as_f64()?, p[1].as_f64()? + 2.0, p[2].as_f64()?])),
+                    .and_then(|p| Some([p[0].as_f64()?, p[1].as_f64()? + 1.2, p[2].as_f64()?])),
             ) else {
                 return true;
             };
@@ -492,6 +496,11 @@ pub(super) fn suggestions(host: &HostApiV3, player: u128, line: &str) {
         ["holograma", "editar", _, "fundo"] if admin => {
             ["separado", "unico"].map(str::to_owned).into()
         }
+        ["holograma", "editar", _, "cor"] if admin => [
+            "FFFFFF", "000000", "0A0A0A", "FF5555", "55FF55", "5555FF", "FFFF55", "55FFFF",
+        ]
+        .map(str::to_owned)
+        .into(),
         _ => Vec::new(),
     };
     add_suggestions(host, player, current, candidates);

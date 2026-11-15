@@ -59,7 +59,10 @@ fn parser(kind: &str) -> Option<(&'static str, Value)> {
 /// too. `lan::commands` sends any of them as `minecraft:ask_server`.
 fn asks_server(kind: &str) -> Option<&'static str> {
     match kind {
-        "word?" | "text?" => Some("minecraft:ask_server"),
+        // Word arguments may be plugin-owned names, IDs, presets, or enum-like
+        // values. Ask the server for every word argument so a plugin's one
+        // completion callback can cover required and optional arguments alike.
+        "word" | "word?" | "text?" => Some("minecraft:ask_server"),
         "player_name" => Some(PLAYER_NAMES),
         _ => None,
     }
@@ -2128,7 +2131,10 @@ mod tests {
         );
         let who = &stage["bring"]["children"]["who"];
         assert_eq!(who["suggestions"], PLAYER_NAMES);
-        assert!(who["children"]["where"].get("suggestions").is_none());
+        assert_eq!(
+            who["children"]["where"]["suggestions"],
+            "minecraft:ask_server"
+        );
         assert_eq!(
             tree(&[NativeCommand::new("a <x:text?> <y:word>")]).2.len(),
             1

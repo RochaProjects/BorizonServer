@@ -1614,10 +1614,15 @@ impl Host for GameHost<'_, '_, '_> {
                     .and_then(|value| value.as_u64())
                     .unwrap_or(0x4000_0000)
                     .min(u64::from(u32::MAX)) as u32;
+                let view_range = match plugin_display_view_range(data) {
+                    Some(value) => value,
+                    None => return fail("invalid_view_range"),
+                };
                 let mut nbt = Compound::new();
                 nbt.insert("text".into(), component_nbt(&component));
                 nbt.insert("line_width".into(), Tag::Int(line_width));
                 nbt.insert("background".into(), Tag::Int(background as i32));
+                nbt.insert("view_range".into(), Tag::Float(view_range.to_bits()));
                 nbt.insert("text_opacity".into(), Tag::Byte(-1));
                 nbt.insert(
                     "shadow".into(),
@@ -1766,6 +1771,11 @@ impl Host for GameHost<'_, '_, '_> {
                             .min(u64::from(u32::MAX)) as u32 as i32,
                     ),
                 );
+                let view_range = match plugin_display_view_range(data) {
+                    Some(value) => value,
+                    None => return fail("invalid_view_range"),
+                };
+                nbt.insert("view_range".into(), Tag::Float(view_range.to_bits()));
                 nbt.insert("text_opacity".into(), Tag::Byte(-1));
                 for (key, field) in [("shadow", "shadow"), ("see_through", "see_through")] {
                     nbt.insert(
@@ -2180,6 +2190,15 @@ fn json_position(value: Option<&serde_json::Value>) -> Option<[f64; 3]> {
         .collect::<Option<Vec<_>>>()?
         .try_into()
         .ok()
+}
+
+#[cfg(feature = "server-plugins")]
+fn plugin_display_view_range(data: &serde_json::Value) -> Option<f32> {
+    let range = match data.get("view_range") {
+        Some(value) => value.as_f64()? as f32,
+        None => 1.0,
+    };
+    (range.is_finite() && (0.0..=16.0).contains(&range)).then_some(range)
 }
 
 #[cfg(feature = "server-plugins")]

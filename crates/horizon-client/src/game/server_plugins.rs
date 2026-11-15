@@ -1614,7 +1614,7 @@ impl Host for GameHost<'_, '_, '_> {
                     .and_then(|value| value.as_u64())
                     .unwrap_or(0x4000_0000)
                     .min(u64::from(u32::MAX)) as u32;
-                let view_range = match plugin_display_view_range(data) {
+                let view_range = match plugin_display_view_range(&data) {
                     Some(value) => value,
                     None => return fail("invalid_view_range"),
                 };
@@ -1771,7 +1771,7 @@ impl Host for GameHost<'_, '_, '_> {
                             .min(u64::from(u32::MAX)) as u32 as i32,
                     ),
                 );
-                let view_range = match plugin_display_view_range(data) {
+                let view_range = match plugin_display_view_range(&data) {
                     Some(value) => value,
                     None => return fail("invalid_view_range"),
                 };

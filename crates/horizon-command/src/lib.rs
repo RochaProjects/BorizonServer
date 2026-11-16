@@ -1113,9 +1113,9 @@ impl Dispatcher {
         let (range, list, _) = self.suggestions_within(parse, cursor, reg, reg.permission);
         (range, list)
     }
-    /// [`Self::client_suggestions`], and whether a node at the cursor asks
-    /// the server (`ask_server`): its completions come with the server's
-    /// reply, to be merged with these.
+    /// [`Self::client_suggestions`], and whether the visible command branch
+    /// has a server-backed provider (`ask_server`) at or below the cursor:
+    /// its completions come with the server's reply, to be merged with these.
     pub fn client_suggestions_asking(
         &self,
         parse: &ParseResults,
@@ -1140,7 +1140,15 @@ impl Dispatcher {
             if self.nodes[child].permission > permission {
                 continue;
             }
-            ask |= matches!(self.nodes[child].suggests, Some(Suggests::AskServer));
+            // A server-backed argument can be several literals below the
+            // current node (for example `/npc <TAB>` -> `editar <TAB>`).
+            // Ask the server while completing those literals too, so plugin
+            // completions can be merged with the local Brigadier tree and
+            // can reflect live data instead of only appearing after the
+            // player has already entered the literal path.
+            if parent != 0 {
+                ask |= self.has_server_suggestions(child, permission);
+            }
             let mut builder = SuggestionsBuilder::new(truncated, start);
             match &self.nodes[child].kind {
                 NodeKind::Literal(l) => {
@@ -1158,6 +1166,29 @@ impl Dispatcher {
         }
         let (range, list) = merge_suggestions(truncated, all);
         (range, list, ask)
+    }
+    fn has_server_suggestions(&self, node: usize, permission: u8) -> bool {
+        let mut pending = vec![node];
+        let mut visited = vec![false; self.nodes.len()];
+        while let Some(index) = pending.pop() {
+            let Some(seen) = visited.get_mut(index) else {
+                continue;
+            };
+            if std::mem::replace(seen, true) {
+                continue;
+            }
+            let Some(node) = self.nodes.get(index) else {
+                continue;
+            };
+            if node.permission > permission {
+                continue;
+            }
+            if matches!(node.suggests, Some(Suggests::AskServer)) {
+                return true;
+            }
+            pending.extend(node.children.iter().copied());
+        }
+        false
     }
     fn smart_usage_of(&self, node: usize, optional: bool, deep: bool, level: u8) -> Option<String> {
         let n = &self.nodes[node];

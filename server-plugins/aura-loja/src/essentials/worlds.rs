@@ -33,7 +33,7 @@ pub(super) fn register_commands(host: &HostApiV3) {
         "mundo gamerule <nome:word?> <regra:word> <valor:word>",
         "mundo remover <nome:word?>",
         "mundo reset <categoria:word?>",
-        "mundo reset <categoria:word?> force",
+        "mundo reset <categoria:word> force",
         "mundo renomear <nome:word?> <novo_nome:word>",
         "mundo importar <nome:word> <url:text>",
     ] {

@@ -111,13 +111,21 @@ pub fn suggestions(host: &HostApiV3, player: u128, line: &str) {
     npcs::suggestions(host, player, line);
     let (words, current) = completion_input(line);
     let (root, args) = words.split_first().map_or(("", &[][..]), |(r, a)| (*r, a));
+    if !matches!(
+        root,
+        "home" | "delhome" | "warp" | "delwarp" | "mundo" | "invsee" | "endersee"
+    ) {
+        return;
+    }
     let mut candidates = Vec::new();
-    let admin = player_snapshot(host, player)
+    let snapshot = player_snapshot(host, player);
+    let admin = snapshot
+        .as_ref()
         .and_then(|snapshot| snapshot["permission_level"].as_u64())
         .is_some_and(|level| level >= 2);
     match (root, args) {
         ("home", []) | ("home", [_]) | ("delhome", []) | ("delhome", [_]) => {
-            if let Some(snapshot) = player_snapshot(host, player) {
+            if let Some(snapshot) = snapshot.as_ref() {
                 let prefix = format!("home:{}:", snapshot["uuid"].as_str().unwrap_or_default());
                 candidates.extend(
                     storage_list(host, &prefix)

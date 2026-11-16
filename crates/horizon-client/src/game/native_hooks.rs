@@ -7337,12 +7337,13 @@ impl Game<'_> {
     /// the command's first word and `arguments` the words after it, split at
     /// each space, the last the one being typed (empty after a space; none
     /// while the label is typed). For a command a mod registered
-    /// (`native_register_commands`) the client asks only for an argument
-    /// whose kind asks the server (`word?`, `text?`, `player_name`); `range`
-    /// is then the word being typed, and for `player_name` `suggestions`
-    /// already holds the online players' names matching it. Push yours over
-    /// `range`. No player's state is swapped in and the server's players are
-    /// out of reach (`native_server_players` gives none). Server-side.
+    /// (`native_register_commands`), the client asks the server when the
+    /// current branch has a server-backed argument (`word?`, `text?`,
+    /// `player_name`) at or below it. `range` covers the active word; for
+    /// `player_name`, `suggestions` already holds the online players' names
+    /// matching it. Push yours over `range`. No player's state is swapped in;
+    /// the server's players are out of reach (`native_server_players` gives
+    /// none). Server-side.
     /// API @API:tab_complete_v2@.
     pub(super) fn native_tab_complete_v2(
         &mut self,

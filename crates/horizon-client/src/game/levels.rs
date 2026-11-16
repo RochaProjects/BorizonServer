@@ -7,10 +7,10 @@
 //! chunks by swapping it into place (`enter_level`), the way `as_guest` swaps a player
 //! in, so the tick code runs unchanged, one level at a time.
 //!
-//! Shared by every level: the game time, the day time and the weather, the
-//! vanilla game rules, the scoreboard, the maps and the entities waiting to
-//! arrive through a portal. Custom-dimension rule overrides are layered over
-//! the shared vanilla rules while that dimension is active.
+//! Shared by every level: the game time, vanilla game rules, the scoreboard,
+//! maps and entities waiting to arrive through a portal. A custom dimension
+//! with its own time or weather rule keeps that state with its saved level;
+//! other dimensions retain Horizon's shared clock and weather behavior.
 
 use super::{
     Dim, ExperienceOrb, FallingBlock, Game, ItemEntity, Mob, boats, commands,
@@ -495,14 +495,53 @@ impl Game<'_> {
             return Ok(());
         }
         if target != self.dim {
+            if self
+                .ui
+                .dimension_rule_overrides
+                .get(self.dim.id())
+                .is_some_and(|rules| rules.contains_key("advance_weather"))
+            {
+                self.ui.dimension_weather.insert(
+                    self.dim.id().to_owned(),
+                    super::chat::SavedDimensionWeather::capture(&self.world),
+                );
+            }
             let (mut p, opened) = match self.levels.parked.remove(&target) {
                 Some(p) => (p, false),
                 None => (self.open_level(target)?, true),
             };
             p.world.game_time = self.world.game_time;
-            p.world.day_time = self.world.day_time;
+            let local_rules = self.ui.dimension_rule_overrides.get(target.id());
+            if local_rules.is_some_and(|rules| rules.contains_key("advance_time")) {
+                let day_time = self
+                    .ui
+                    .command_clocks
+                    .get(target.id())
+                    .map_or(self.world.day_time, |(total, _)| *total);
+                p.world.day_time = day_time;
+                self.ui
+                    .command_clocks
+                    .entry(target.id().to_owned())
+                    .or_default()
+                    .0 = day_time;
+            } else {
+                p.world.day_time = self.world.day_time;
+            }
             p.world.end_clock = self.world.end_clock;
-            p.world.weather = self.world.weather;
+            if local_rules.is_some_and(|rules| rules.contains_key("advance_weather")) {
+                p.world.weather = self
+                    .ui
+                    .dimension_weather
+                    .get(target.id())
+                    .copied()
+                    .map_or(self.world.weather, |weather| weather.weather());
+                self.ui.dimension_weather.insert(
+                    target.id().to_owned(),
+                    super::chat::SavedDimensionWeather::capture(&p.world),
+                );
+            } else {
+                p.world.weather = self.world.weather;
+            }
             // Health flags are recalculated from the shared rules plus any
             // custom-dimension override after the level swap.
             p.world.health_rules = self.world.health_rules;

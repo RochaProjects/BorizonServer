@@ -191,6 +191,64 @@ impl Default for WorldClock {
         }
     }
 }
+
+fn write_clock(map: &mut horizon_world::nbt::Compound, total: i64, clock: WorldClock) {
+    use horizon_world::nbt::Tag;
+    map.insert("total_ticks".into(), Tag::Long(total));
+    for (key, value, default) in [
+        (
+            "partial_tick",
+            Tag::Float(clock.partial.to_bits()),
+            clock.partial == 0.0,
+        ),
+        ("rate", Tag::Float(clock.rate.to_bits()), clock.rate == 1.0),
+        ("paused", Tag::Byte(i8::from(clock.paused)), !clock.paused),
+    ] {
+        if default {
+            map.remove(&key.into());
+        } else {
+            map.insert(key.into(), value);
+        }
+    }
+}
+
+#[derive(Clone, Copy, serde::Deserialize, serde::Serialize)]
+pub(super) struct SavedDimensionWeather {
+    clear_time: i32,
+    rain_time: i32,
+    thunder_time: i32,
+    raining: bool,
+    thundering: bool,
+    rain_level: (f32, f32),
+    thunder_level: (f32, f32),
+}
+
+impl SavedDimensionWeather {
+    pub(super) fn capture(world: &horizon_client::world::World) -> Self {
+        let weather = world.weather;
+        Self {
+            clear_time: weather.clear_time,
+            rain_time: weather.rain_time,
+            thunder_time: weather.thunder_time,
+            raining: weather.raining,
+            thundering: weather.thundering,
+            rain_level: weather.rain_level,
+            thunder_level: weather.thunder_level,
+        }
+    }
+
+    pub(super) fn weather(self) -> horizon_client::world::Weather {
+        horizon_client::world::Weather {
+            clear_time: self.clear_time,
+            rain_time: self.rain_time,
+            thunder_time: self.thunder_time,
+            raining: self.raining,
+            thundering: self.thundering,
+            rain_level: self.rain_level,
+            thunder_level: self.thunder_level,
+        }
+    }
+}
 /// A clock time marker from the timelines (ClockTimeMarker).
 #[derive(Clone, Copy, Debug)]
 pub struct TimeMarker {
@@ -253,6 +311,8 @@ pub struct UiState {
     /// Optional overrides for custom dimensions, stored in the world save.
     pub dimension_rule_overrides:
         BTreeMap<String, BTreeMap<String, horizon_client::gamerules::Value>>,
+    /// Per-dimension weather state when a custom level overrides `advance_weather`.
+    pub dimension_weather: BTreeMap<String, SavedDimensionWeather>,
     /// Rules currently effective in `Game::dim`: global values plus a custom-dimension override.
     pub rules: GameRules,
     pub clock: WorldClock,
@@ -1858,23 +1918,58 @@ impl Game<'_> {
         if !self.ui.rules.bool("advance_time") {
             return;
         }
-        // The End's clock: one tick a tick, not paused or sped up by `/time` on the overworld's.
-        self.world.end_clock += 1;
-        if self.ui.clock.paused {
+        let local_clock = self
+            .ui
+            .dimension_rule_overrides
+            .get(self.dim.id())
+            .is_some_and(|rules| rules.contains_key("advance_time"));
+        if !local_clock {
+            // The End's clock: one tick a tick, not paused or sped up by `/time` on the overworld's.
+            self.world.end_clock += 1;
+        }
+        let c = if local_clock {
+            &mut self
+                .ui
+                .command_clocks
+                .entry(self.dim.id().to_owned())
+                .or_default()
+                .1
+        } else {
+            &mut self.ui.clock
+        };
+        if c.paused {
             return;
         }
-        let c = &mut self.ui.clock;
         c.partial += c.rate;
         let whole = c.partial.floor();
         c.partial -= whole;
         self.world.day_time += whole as i64;
+        if local_clock {
+            self.ui
+                .command_clocks
+                .entry(self.dim.id().to_owned())
+                .or_default()
+                .0 = self.world.day_time;
+        }
     }
     /// `ServerClockInstance.packNetworkState`: the rate players' clients
     /// advance the overworld clock at, 0 while it is paused (`/time pause`)
     /// or `advance_time` is off.
     pub(super) fn network_clock_rate(&self) -> f32 {
-        if self.ui.rules.bool("advance_time") && !self.ui.clock.paused {
-            self.ui.clock.rate
+        let clock = self
+            .ui
+            .dimension_rule_overrides
+            .get(self.dim.id())
+            .filter(|rules| rules.contains_key("advance_time"))
+            .and_then(|_| {
+                self.ui
+                    .command_clocks
+                    .get(self.dim.id())
+                    .map(|state| &state.1)
+            })
+            .unwrap_or(&self.ui.clock);
+        if self.ui.rules.bool("advance_time") && !clock.paused {
+            clock.rate
         } else {
             0.0
         }
@@ -1944,13 +2039,12 @@ impl Game<'_> {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
-        for overrides in self.ui.dimension_rule_overrides.values_mut() {
-            overrides.remove("advance_time");
-            overrides.remove("advance_weather");
-        }
-        self.ui
-            .dimension_rule_overrides
-            .retain(|id, values| !id.starts_with("minecraft:") && !values.is_empty());
+        self.ui.dimension_rule_overrides.retain(|id, values| {
+            !matches!(
+                id.as_str(),
+                "minecraft:overworld" | "minecraft:the_nether" | "minecraft:the_end"
+            ) && !values.is_empty()
+        });
     }
     /// `ServerClockManager.ServerClockInstance.loadFrom`: restore the existing
     /// Overworld state when a world opens; clear the other command-state cache.
@@ -1958,6 +2052,11 @@ impl Game<'_> {
         self.ui.global_rules =
             GameRules::load_with_features(&self.world_root, &self.level.enabled_features);
         self.load_dimension_rule_overrides();
+        self.ui.dimension_weather =
+            std::fs::read(self.world_root.join("data/horizon/dimension_weather.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
         self.ui.rules = self.effective_rules_for_dimension(self.dim.id());
         self.ui.clock = WorldClock::default();
         self.ui.command_clocks.clear();
@@ -1967,20 +2066,32 @@ impl Game<'_> {
             && let Ok(raw) = horizon_world::compression::Compression::Gzip.decode(&bytes, 1 << 20)
             && let Ok((root, _)) =
                 horizon_world::nbt::read_named(&raw, horizon_world::nbt::Limits::default())
-            && let Some(c) = root
-                .tag
-                .get("data")
-                .and_then(|d| d.get("minecraft:overworld"))
+            && let Some(horizon_world::nbt::Tag::Compound(clocks)) = root.tag.get("data")
         {
             use horizon_world::nbt::Tag;
-            if let Some(Tag::Float(r)) = c.get("rate") {
-                self.ui.clock.rate = f32::from_bits(*r);
-            }
-            if let Some(Tag::Float(p)) = c.get("partial_tick") {
-                self.ui.clock.partial = f32::from_bits(*p);
-            }
-            if let Some(Tag::Byte(p)) = c.get("paused") {
-                self.ui.clock.paused = *p != 0;
+            for (id, c) in clocks {
+                let Tag::Compound(_) = c else { continue };
+                let mut clock = WorldClock::default();
+                if let Some(Tag::Float(rate)) = c.get("rate") {
+                    clock.rate = f32::from_bits(*rate);
+                }
+                if let Some(Tag::Float(partial)) = c.get("partial_tick") {
+                    clock.partial = f32::from_bits(*partial);
+                }
+                if let Some(Tag::Byte(paused)) = c.get("paused") {
+                    clock.paused = *paused != 0;
+                }
+                if id.to_string_lossy() == "minecraft:overworld" {
+                    self.ui.clock = clock;
+                } else {
+                    let total = match c.get("total_ticks") {
+                        Some(Tag::Long(ticks)) => *ticks,
+                        _ => 0,
+                    };
+                    self.ui
+                        .command_clocks
+                        .insert(id.to_string_lossy(), (total, clock));
+                }
             }
         }
         self.ui.chat.clear();
@@ -1997,10 +2108,23 @@ impl Game<'_> {
             return;
         }
         use horizon_world::nbt::Tag;
-        let c = self.ui.clock;
+        let local_clock = self
+            .ui
+            .dimension_rule_overrides
+            .get(self.dim.id())
+            .is_some_and(|rules| rules.contains_key("advance_time"));
+        let c = if local_clock {
+            self.ui
+                .command_clocks
+                .get(self.dim.id())
+                .map_or(self.ui.clock, |(_, clock)| *clock)
+        } else {
+            self.ui.clock
+        };
         if let Err(e) = self.ui.global_rules.save(&self.world_root) {
             log::warn!("the game rules were not written: {e}");
         }
+        self.save_dimension_weather_states();
         // The other clocks stay as saved; the overworld one keeps the fields Horizon
         // does not model, and (like vanilla's codec) omits rate, partial tick and
         // pause while they have their defaults.
@@ -2014,26 +2138,44 @@ impl Game<'_> {
             Some(c @ Tag::Compound(_)) => c.clone(),
             _ => Tag::Compound(Default::default()),
         };
+        let overworld_day_time = if self.dim == super::Dim::Overworld {
+            self.world.day_time
+        } else {
+            self.levels
+                .parked_world(super::Dim::Overworld)
+                .map_or(self.level.day_time, |world| world.day_time)
+        };
         if let Tag::Compound(map) = &mut clock {
-            map.insert("total_ticks".into(), Tag::Long(self.world.day_time));
-            for (key, value, default) in [
-                (
-                    "partial_tick",
-                    Tag::Float(c.partial.to_bits()),
-                    c.partial == 0.0,
-                ),
-                ("rate", Tag::Float(c.rate.to_bits()), c.rate == 1.0),
-                ("paused", Tag::Byte(i8::from(c.paused)), !c.paused),
-            ] {
-                if default {
-                    map.remove(&key.into());
-                } else {
-                    map.insert(key.into(), value);
-                }
-            }
+            write_clock(map, overworld_day_time, self.ui.clock);
         }
         if let Tag::Compound(map) = &mut data {
             map.insert("minecraft:overworld".into(), clock);
+            for (id, (total, state)) in &self.ui.command_clocks {
+                if self
+                    .ui
+                    .dimension_rule_overrides
+                    .get(id)
+                    .is_none_or(|rules| !rules.contains_key("advance_time"))
+                {
+                    continue;
+                }
+                let key = id.as_str().into();
+                let mut clock = match map.get(&key) {
+                    Some(c @ Tag::Compound(_)) => c.clone(),
+                    _ => Tag::Compound(Default::default()),
+                };
+                if let Tag::Compound(fields) = &mut clock {
+                    write_clock(fields, *total, *state);
+                }
+                map.insert(id.as_str().into(), clock);
+            }
+            if local_clock && !self.ui.command_clocks.contains_key(self.dim.id()) {
+                let mut clock = Tag::Compound(Default::default());
+                if let Tag::Compound(fields) = &mut clock {
+                    write_clock(fields, self.world.day_time, c);
+                }
+                map.insert(self.dim.id().into(), clock);
+            }
         }
         let root = Tag::compound([
             ("data", data),
@@ -2041,6 +2183,54 @@ impl Game<'_> {
         ]);
         if let Err(e) = horizon_client::save::write_dat(&path, root) {
             log::warn!("the world clocks were not written: {e}");
+        }
+    }
+    fn save_dimension_weather_states(&mut self) {
+        let mut states = self.ui.dimension_weather.clone();
+        if self
+            .ui
+            .dimension_rule_overrides
+            .get(self.dim.id())
+            .is_some_and(|rules| rules.contains_key("advance_weather"))
+        {
+            states.insert(
+                self.dim.id().to_owned(),
+                SavedDimensionWeather::capture(&self.world),
+            );
+        }
+        for dimension in self.levels.parked_dims() {
+            if !self
+                .ui
+                .dimension_rule_overrides
+                .get(dimension.id())
+                .is_some_and(|rules| rules.contains_key("advance_weather"))
+            {
+                continue;
+            }
+            if let Some(world) = self.levels.parked_world(dimension) {
+                states.insert(
+                    dimension.id().to_owned(),
+                    SavedDimensionWeather::capture(world),
+                );
+            }
+        }
+        states.retain(|dimension, _| {
+            self.ui
+                .dimension_rule_overrides
+                .get(dimension)
+                .is_some_and(|rules| rules.contains_key("advance_weather"))
+        });
+        let path = self.world_root.join("data/horizon/dimension_weather.json");
+        let result = path
+            .parent()
+            .ok_or_else(|| "Pasta de dados do mundo inválida.".to_owned())
+            .and_then(|parent| std::fs::create_dir_all(parent).map_err(|e| e.to_string()))
+            .and_then(|()| serde_json::to_vec_pretty(&states).map_err(|e| e.to_string()))
+            .and_then(|bytes| std::fs::write(path, bytes).map_err(|e| e.to_string()));
+        if let Err(error) = result {
+            log::warn!("the dimension weather states were not written: {error}");
+        } else {
+            self.ui.dimension_weather = states;
         }
     }
     /// F1 hides the HUD (see `hud`); the screenshot key still works.

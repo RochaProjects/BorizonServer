@@ -865,18 +865,22 @@ impl Game<'_> {
         target: u128,
         kind: &str,
         title: &str,
+        rows: Option<u8>,
+        layout: Option<Vec<Option<usize>>>,
     ) -> Option<i32> {
         let kind = match kind {
             "player" => NativeInventoryKind::Player,
             "ender" => NativeInventoryKind::Ender,
             _ => return None,
         };
-        let rows = if kind == NativeInventoryKind::Player {
-            6
-        } else {
-            3
-        };
-        let layout: Vec<_> = (0..kind.size()).map(Some).collect();
+        let rows = rows.unwrap_or_else(|| {
+            if kind == NativeInventoryKind::Player {
+                6
+            } else {
+                3
+            }
+        });
+        let layout = layout.unwrap_or_else(|| (0..kind.size()).map(Some).collect());
         self.native_open_inventory_menu(viewer, rows, Text::literal(title), (target, kind), &layout)
     }
 

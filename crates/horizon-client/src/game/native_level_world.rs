@@ -61,7 +61,12 @@ impl Game<'_> {
     /// and the End. API @API:level_world@.
     pub(super) fn native_level_weather(&self, level: LevelRef) -> Option<(f32, f32)> {
         let world = self.native_level_world(level)?;
-        if level.dimension() != super::Dim::Overworld.id() {
+        let has_local_weather = self
+            .ui
+            .dimension_rule_overrides
+            .get(level.dimension())
+            .is_some_and(|rules| rules.contains_key("advance_weather"));
+        if level.dimension() != super::Dim::Overworld.id() && !has_local_weather {
             return Some((0.0, 0.0));
         }
         Some(world.weather.levels(1.0))
@@ -76,23 +81,73 @@ impl Game<'_> {
     pub(super) fn native_level_is_thundering(&self, level: LevelRef) -> Option<bool> {
         Some(weather_flags(self.native_level_weather(level)?).1)
     }
-    /// Sets the time of day, as `/time set <ticks>` does on the overworld clock: mods hear
-    /// `time_skip` (cause `mod`) first and can keep the old time, and the clock's fraction of a
-    /// tick restarts. False for a negative time, for a handle that isn't this open's on the
-    /// server, or when a mod kept the old time; a time the clock already shows is true and
-    /// changes nothing. API @API:level_world_setters@.
+    /// Sets the time of day, as `/time set <ticks>` does. A custom dimension
+    /// with its own `advance_time` override changes its own saved clock;
+    /// otherwise the shared Overworld clock changes. Mods hear `time_skip`
+    /// (cause `mod`) first and can keep the old time. API @API:level_world_setters@.
     pub(super) fn native_level_set_day_time(&mut self, level: LevelRef, time: i64) -> bool {
-        if time < 0 || self.native_level_world(level).is_none() {
+        let Some(world) = self.native_level_world(level) else {
+            return false;
+        };
+        if time < 0 {
             return false;
         }
-        let clock = "minecraft:overworld";
-        let total = self.command_clock_time(clock);
-        total == time || self.jump_clock(clock, total, time, "mod")
+        let clock = if self
+            .ui
+            .dimension_rule_overrides
+            .get(level.dimension())
+            .is_some_and(|rules| rules.contains_key("advance_time"))
+        {
+            level.dimension()
+        } else {
+            "minecraft:overworld"
+        };
+        let total = if level.dimension() == self.dim.id() {
+            self.command_clock_time(clock)
+        } else if clock == level.dimension() {
+            world.day_time
+        } else {
+            self.world.day_time
+        };
+        if total == time {
+            return true;
+        }
+        if level.dimension() == self.dim.id() {
+            return self.jump_clock(clock, total, time, "mod");
+        }
+        let mut cancel = false;
+        self.native_time_skip(level.dimension(), total, time, "mod", &mut cancel);
+        if cancel {
+            return false;
+        }
+        let Some(dim) = self
+            .levels
+            .parked_dims()
+            .into_iter()
+            .find(|dimension| dimension.id() == level.dimension())
+        else {
+            return false;
+        };
+        let Some(parked) = self.levels.parked_world_mut(dim) else {
+            return false;
+        };
+        parked.day_time = time;
+        self.ui
+            .command_clocks
+            .entry(level.dimension().to_owned())
+            .or_default()
+            .0 = time;
+        self.ui
+            .command_clocks
+            .entry(level.dimension().to_owned())
+            .or_default()
+            .1
+            .partial = 0.0;
+        true
     }
-    /// Sets game rule `rule` (`minecraft:advance_time` or `advance_time`) as `/gamerule` does,
-    /// so `advance_time` and `advance_weather` freeze and unfreeze the day clock and the weather
-    /// cycle. False for an unknown rule, a value of the wrong kind or out of the rule's range,
-    /// or a handle that isn't this open's on the server. API @API:level_world_setters@.
+    /// Sets a built-in dimension's rule globally or a custom dimension's
+    /// per-dimension override. `advance_time` and `advance_weather` control
+    /// that custom dimension's own clock and weather cycle. API @API:level_world_setters@.
     pub(super) fn native_level_set_game_rule(
         &mut self,
         level: LevelRef,
@@ -102,9 +157,16 @@ impl Game<'_> {
         let Some(rule) = gamerules::rule(rule) else {
             return false;
         };
-        if self.native_level_world(level).is_none()
-            || !self.ui.global_rules.clone().set(rule.name, value)
-        {
+        if self.native_level_world(level).is_none() {
+            return false;
+        }
+        if !matches!(
+            level.dimension(),
+            "minecraft:overworld" | "minecraft:the_nether" | "minecraft:the_end"
+        ) {
+            return self.native_dimension_set_game_rule(level.dimension(), rule.name, Some(value));
+        }
+        if !self.ui.global_rules.clone().set(rule.name, value) {
             return false;
         }
         self.set_game_rule(rule, value);
@@ -182,9 +244,6 @@ impl Game<'_> {
         let Some(definition) = gamerules::rule(rule) else {
             return false;
         };
-        if value.is_some() && matches!(definition.name, "advance_time" | "advance_weather") {
-            return false;
-        }
         if let Some(value) = value {
             if !self.ui.global_rules.clone().set(definition.name, value) {
                 return false;
@@ -194,10 +253,41 @@ impl Game<'_> {
                 .entry(dimension.to_owned())
                 .or_default()
                 .insert(definition.name.to_owned(), value);
+            if definition.name == "advance_time" && !self.ui.command_clocks.contains_key(dimension)
+            {
+                let total = if dimension == self.dim.id() {
+                    self.world.day_time
+                } else {
+                    self.levels
+                        .parked_dims()
+                        .into_iter()
+                        .find(|dim| dim.id() == dimension)
+                        .and_then(|dim| self.levels.parked_world(dim))
+                        .map_or(self.world.day_time, |world| world.day_time)
+                };
+                self.ui.command_clocks.insert(
+                    dimension.to_owned(),
+                    (total, super::chat::WorldClock::default()),
+                );
+            }
         } else if let Some(overrides) = self.ui.dimension_rule_overrides.get_mut(dimension) {
             overrides.remove(definition.name);
             if overrides.is_empty() {
                 self.ui.dimension_rule_overrides.remove(dimension);
+            }
+            if definition.name == "advance_time" {
+                self.ui.command_clocks.remove(dimension);
+                if dimension == self.dim.id() {
+                    self.world.day_time = if self.dim == super::Dim::Overworld {
+                        self.world.day_time
+                    } else {
+                        self.levels
+                            .parked_world(super::Dim::Overworld)
+                            .map_or(self.level.day_time, |world| world.day_time)
+                    };
+                }
+            } else if definition.name == "advance_weather" {
+                self.ui.dimension_weather.remove(dimension);
             }
         }
         if let Err(error) = self.save_dimension_rule_overrides() {
@@ -213,6 +303,14 @@ impl Game<'_> {
     #[allow(dead_code)]
     pub(super) fn native_dimension_clear_game_rule_overrides(&mut self, dimension: &str) -> bool {
         self.ui.dimension_rule_overrides.remove(dimension);
+        self.ui.command_clocks.remove(dimension);
+        self.ui.dimension_weather.remove(dimension);
+        if dimension == self.dim.id() && self.dim != super::Dim::Overworld {
+            self.world.day_time = self
+                .levels
+                .parked_world(super::Dim::Overworld)
+                .map_or(self.level.day_time, |world| world.day_time);
+        }
         if let Err(error) = self.save_dimension_rule_overrides() {
             log::error!("Horizon: could not save dimension game-rule overrides: {error}");
             return false;
@@ -239,6 +337,12 @@ impl Game<'_> {
                 );
                 return false;
             }
+        }
+        if let Some(clock) = self.ui.command_clocks.remove(old) {
+            self.ui.command_clocks.insert(new.to_owned(), clock);
+        }
+        if let Some(weather) = self.ui.dimension_weather.remove(old) {
+            self.ui.dimension_weather.insert(new.to_owned(), weather);
         }
         true
     }

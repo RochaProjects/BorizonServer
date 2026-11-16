@@ -91,10 +91,19 @@ impl Game<'_> {
         self.native_level_world(level)?;
         Some(self.world.game_time)
     }
-    /// The time of day in ticks (`Level.getOverworldClockTime`), shared by
-    /// every level; it keeps counting past 24000. API 381.
+    /// The time of day in ticks (`Level.getDayTime`), including a custom
+    /// dimension's own clock when it overrides `advance_time`. API 381.
     pub(super) fn native_level_day_time(&self, level: LevelRef) -> Option<i64> {
-        self.native_level_world(level)?;
-        Some(self.world.day_time)
+        let world = self.native_level_world(level)?;
+        let has_local_clock = self
+            .ui
+            .dimension_rule_overrides
+            .get(level.dimension())
+            .is_some_and(|rules| rules.contains_key("advance_time"));
+        Some(if has_local_clock {
+            world.day_time
+        } else {
+            self.world.day_time
+        })
     }
 }

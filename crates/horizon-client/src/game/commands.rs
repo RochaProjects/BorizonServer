@@ -2070,14 +2070,35 @@ impl Game<'_> {
     /// `ServerClockManager.getInstance`: commands address clock-keyed state.
     /// Keep the existing Overworld clock tied to the world's canonical day time.
     pub(super) fn command_clock_time(&self, clock: &str) -> i64 {
-        if clock == "minecraft:overworld" {
+        if clock == self.dim.id()
+            && self
+                .ui
+                .dimension_rule_overrides
+                .get(clock)
+                .is_some_and(|rules| rules.contains_key("advance_time"))
+        {
+            self.world.day_time
+        } else if clock == "minecraft:overworld" {
             self.world.day_time
         } else {
             self.ui.command_clocks.get(clock).map_or(0, |c| c.0)
         }
     }
     pub(super) fn set_command_clock_time(&mut self, clock: &str, total: i64) {
-        if clock == "minecraft:overworld" {
+        if clock == self.dim.id()
+            && self
+                .ui
+                .dimension_rule_overrides
+                .get(clock)
+                .is_some_and(|rules| rules.contains_key("advance_time"))
+        {
+            self.world.day_time = total;
+            self.ui
+                .command_clocks
+                .entry(clock.to_owned())
+                .or_default()
+                .0 = total;
+        } else if clock == "minecraft:overworld" {
             self.world.day_time = total;
         } else {
             self.ui
@@ -2088,7 +2109,20 @@ impl Game<'_> {
         }
     }
     pub(super) fn command_clock_state(&mut self, clock: &str) -> &mut super::chat::WorldClock {
-        if clock == "minecraft:overworld" {
+        if clock == self.dim.id()
+            && self
+                .ui
+                .dimension_rule_overrides
+                .get(clock)
+                .is_some_and(|rules| rules.contains_key("advance_time"))
+        {
+            &mut self
+                .ui
+                .command_clocks
+                .entry(clock.to_owned())
+                .or_default()
+                .1
+        } else if clock == "minecraft:overworld" {
             &mut self.ui.clock
         } else {
             &mut self
@@ -2110,6 +2144,14 @@ impl Game<'_> {
         // `time of <clock>` names the clock; otherwise the dimension's default clock.
         let clock = match ctx.get("clock") {
             Some(Arg::Resource(c)) => c.clone(),
+            _ if self
+                .ui
+                .dimension_rule_overrides
+                .get(self.dim.id())
+                .is_some_and(|rules| rules.contains_key("advance_time")) =>
+            {
+                self.dim.id().to_owned()
+            }
             _ => match self.dimension_type().default_clock.clone() {
                 Some(clock) => clock,
                 None => return Err(err("commands.time.no_default_clock", &[&self.dim.id()])),

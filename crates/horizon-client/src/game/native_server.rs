@@ -465,43 +465,98 @@ impl Game<'_> {
     /// world shows there, for this player, until they rejoin. False when
     /// they aren't on. API 49.
     pub(super) fn native_sidebar(&mut self, uuid: u128, sidebar: Option<&NativeSidebar>) -> bool {
+        let Some(conn) = self.native_conn(uuid) else {
+            return false;
+        };
         let objective = SIDEBAR_OBJECTIVE.to_owned();
-        // Removed first, so the new one's lines replace all the old ones.
-        let mut packets = vec![C::SetObjective(play::SetObjective {
-            name: objective.clone(),
-            method: 1,
-            display: None,
-        })];
-        if let Some(sidebar) = sidebar {
-            let title = component_nbt(&sidebar.title.component());
-            packets.push(C::SetObjective(play::SetObjective {
-                name: objective.clone(),
-                method: 0,
-                display: Some((title, 0, Some(play::NumberFormat::Blank))),
-            }));
-            // DisplaySlot.SIDEBAR.
-            packets.push(C::SetDisplayObjective(play::SetDisplayObjective {
-                slot: 1,
-                objective: objective.clone(),
-            }));
-            let lines = &sidebar.lines[..sidebar.lines.len().min(15)];
-            for (i, (left, right)) in lines.iter().enumerate() {
-                packets.push(C::SetScore(play::SetScore {
-                    // Highest first. The display name shows, not the owner;
-                    // an owner starting with '#' is hidden from the sidebar
-                    // (ScoreHolder's isHidden), and ':' is in no player's name.
-                    owner: format!("horizon:line{i:02}"),
-                    objective: objective.clone(),
-                    score: (lines.len() - i) as i32,
-                    display: Some(component_nbt(&left.component())),
-                    number_format: Some(match right {
-                        Some(t) => play::NumberFormat::Fixed(component_nbt(&t.component())),
-                        None => play::NumberFormat::Blank,
+        let previous = self
+            .native_sidebars
+            .get(&uuid)
+            .filter(|(previous_conn, _)| *previous_conn == conn)
+            .map(|(_, previous)| previous.clone());
+        let Some(sidebar) = sidebar else {
+            if previous.is_none() {
+                self.native_sidebars.remove(&uuid);
+                return true;
+            }
+            let sent = self.native_send_all(
+                uuid,
+                vec![
+                    C::SetObjective(play::SetObjective {
+                        name: objective,
+                        method: 1,
+                        display: None,
                     }),
+                    C::SetDisplayObjective(play::SetDisplayObjective {
+                        slot: 1,
+                        objective: String::new(),
+                    }),
+                ],
+            );
+            if sent {
+                self.native_sidebars.remove(&uuid);
+            }
+            return sent;
+        };
+        if previous.as_ref() == Some(sidebar) {
+            return true;
+        }
+        let mut packets = Vec::new();
+        match &previous {
+            Some(old) if old.title != sidebar.title => {
+                packets.push(C::SetObjective(play::SetObjective {
+                    name: objective.clone(),
+                    method: 2,
+                    display: Some((
+                        component_nbt(&sidebar.title.component()),
+                        0,
+                        Some(play::NumberFormat::Blank),
+                    )),
                 }));
             }
+            None => {
+                packets.push(C::SetObjective(play::SetObjective {
+                    name: objective.clone(),
+                    method: 0,
+                    display: Some((
+                        component_nbt(&sidebar.title.component()),
+                        0,
+                        Some(play::NumberFormat::Blank),
+                    )),
+                }));
+                packets.push(C::SetDisplayObjective(play::SetDisplayObjective {
+                    slot: 1,
+                    objective: objective.clone(),
+                }));
+            }
+            _ => {}
         }
-        self.native_send_all(uuid, packets)
+        let lines = &sidebar.lines[..sidebar.lines.len().min(15)];
+        for (i, (left, right)) in lines.iter().enumerate() {
+            packets.push(C::SetScore(play::SetScore {
+                // Highest first. The display name shows, not the owner.
+                owner: format!("horizon:line{i:02}"),
+                objective: objective.clone(),
+                score: (lines.len() - i) as i32,
+                display: Some(component_nbt(&left.component())),
+                number_format: Some(match right {
+                    Some(t) => play::NumberFormat::Fixed(component_nbt(&t.component())),
+                    None => play::NumberFormat::Blank,
+                }),
+            }));
+        }
+        let old_len = previous.as_ref().map_or(0, |old| old.lines.len().min(15));
+        for index in lines.len()..old_len {
+            packets.push(C::ResetScore(play::ResetScore {
+                owner: format!("horizon:line{index:02}"),
+                objective: Some(objective.clone()),
+            }));
+        }
+        let sent = self.native_send_all(uuid, packets);
+        if sent {
+            self.native_sidebars.insert(uuid, (conn, sidebar.clone()));
+        }
+        sent
     }
     /// The lines over and under that player's list of players (Tab):
     /// `ClientboundTabListPacket`, an empty text for none. False when they

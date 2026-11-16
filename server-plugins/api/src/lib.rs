@@ -43,6 +43,8 @@ pub mod operation {
     /// Reads all saved vanilla statistics for an online player.
     pub const PLAYER_STATS_GET: &str = "player.stats.get";
     /// Opens an interactive view of another player's live/file inventory.
+    /// Optional `rows` and `layout` select a menu grid; each layout entry is
+    /// an inventory slot index or null for an empty plugin-owned slot.
     pub const INVENTORY_VIEW_OPEN: &str = "inventory.view.open";
     pub const PLAYER_TELEPORT: &str = "player.teleport";
     pub const PLAYER_GAME_MODE_SET: &str = "player.game_mode.set";
@@ -91,7 +93,10 @@ pub mod operation {
     pub const PLUGIN_STORAGE_DELETE: &str = "plugin.storage.delete";
     pub const PLUGIN_STORAGE_LIST: &str = "plugin.storage.list";
     pub const ENTITY_TEXT_DISPLAY_CREATE: &str = "entity.text_display.create";
-    /// Spawns a namespaced vanilla entity with generic persistence/AI/display options and a caller UUID.
+    /// Spawns a namespaced vanilla entity with generic persistence/AI/display options and a caller-selected UUID. For
+    /// `minecraft:interaction`, optional `interaction_width`,
+    /// `interaction_height`, and `interaction_response` configure its vanilla
+    /// clickable hitbox; this is not tied to any plugin or NPC implementation.
     pub const ENTITY_SPAWN: &str = "entity.spawn";
     pub const ENTITY_MOVE: &str = "entity.move";
     pub const ENTITY_REMOVE: &str = "entity.remove";

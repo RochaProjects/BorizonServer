@@ -2907,6 +2907,9 @@ struct Game<'a> {
     pub(super) studio: studio::Studio,
     /// This world is open to the network (game/lan.rs).
     lan: Option<lan::LanHost>,
+    /// Per-connection objectives already created for server plugin sidebars.
+    /// Keeping the objective alive avoids a visible blink on every refresh.
+    native_sidebars: HashMap<u128, (u32, native_server::NativeSidebar)>,
     /// Single player's server thread, which `remote` is connected to.
     integrated: Option<integrated::Integrated>,
     /// The shapes of the open world's levels, from its dimension types.
@@ -11850,6 +11853,7 @@ impl<'a> Game<'a> {
             replay: Default::default(),
             studio: Default::default(),
             lan: None,
+            native_sidebars: HashMap::new(),
             integrated: None,
             level_shapes: Default::default(),
             serving: None,

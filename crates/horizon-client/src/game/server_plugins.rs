@@ -1186,9 +1186,36 @@ impl Host for GameHost<'_, '_, '_> {
                     .get("title")
                     .and_then(|value| value.as_str())
                     .unwrap_or("Inventário");
+                let rows = data
+                    .get("rows")
+                    .and_then(|value| value.as_u64())
+                    .and_then(|value| u8::try_from(value).ok());
+                let layout = if let Some(value) = data.get("layout") {
+                    let Some(slots) = value.as_array() else {
+                        return fail("invalid_inventory_layout");
+                    };
+                    let Some(layout) = slots
+                        .iter()
+                        .map(|slot| {
+                            if slot.is_null() {
+                                Some(None)
+                            } else {
+                                slot.as_u64()
+                                    .and_then(|slot| usize::try_from(slot).ok())
+                                    .map(Some)
+                            }
+                        })
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        return fail("invalid_inventory_layout");
+                    };
+                    Some(layout)
+                } else {
+                    None
+                };
                 let opened = self
                     .game
-                    .native_open_inventory_view(player, target, kind, title);
+                    .native_open_inventory_view(player, target, kind, title, rows, layout);
                 serde_json::json!({"ok": opened.is_some(), "window": opened})
             }
             op::RESOURCE_PACK_SEND | op::RESOURCE_PACK_SEND_BATCH => {
@@ -1724,6 +1751,28 @@ impl Host for GameHost<'_, '_, '_> {
                 ] {
                     if let Some(enabled) = data.get(field).and_then(|v| v.as_bool()) {
                         nbt.insert(key.into(), Tag::Byte(i8::from(enabled)));
+                    }
+                }
+                // Generic clickable hitboxes for plugin-created NPCs. This is
+                // vanilla `minecraft:interaction` entity data, exposed through
+                // the generic entity.spawn operation rather than NPC-specific code.
+                if kind == "minecraft:interaction" {
+                    for (key, field) in [
+                        ("width", "interaction_width"),
+                        ("height", "interaction_height"),
+                    ] {
+                        if let Some(size) = data.get(field).and_then(|value| value.as_f64())
+                            && size.is_finite()
+                            && (0.0..=64.0).contains(&size)
+                        {
+                            nbt.insert(key.into(), Tag::Float((size as f32).to_bits()));
+                        }
+                    }
+                    if let Some(response) = data
+                        .get("interaction_response")
+                        .and_then(|value| value.as_bool())
+                    {
+                        nbt.insert("response".into(), Tag::Byte(i8::from(response)));
                     }
                 }
                 if let Some(name) = data.get("custom_name").and_then(|v| v.as_str()) {

@@ -9,7 +9,7 @@ quando o grafo de dependências ou os comandos de release mudarem.
 O workflow de release compila:
 
 ```sh
-cargo build --locked --release -p horizon-client --no-default-features --features server-plugins --bin horizon-client
+cargo build --locked --release -p horizon-client --no-default-features --features server-plugins,dedicated-server --bin horizon-client
 cargo build --locked --release -p horizon-server -p horizon-prepare
 ```
 
@@ -21,7 +21,10 @@ Aura Loja não faz parte desse build do GitHub.
 
 `--no-default-features` desliga `audio`, `controllers` e `horizon-extras`. Isso evita dependências
 de áudio/controladores e não ativa recursos extras específicos do cliente. A feature
-`server-plugins` habilita apenas o carregador e a API de plugins do servidor.
+`server-plugins` habilita o carregador e a API de plugins do servidor. `dedicated-server` troca
+cosméticos/emotes Horizon por hooks vazios no alvo dedicado e torna `horizon-cosmetics` opcional,
+retirando essa crate do engine do servidor. O build de cliente sem
+essa feature continua incluindo o sistema completo quando `horizon-extras` está ligado.
 
 ## Dependências ainda compartilhadas
 
@@ -34,6 +37,8 @@ módulos. Excluir essas dependências isoladamente não é um corte seguro.
 
 ## Decisão desta alteração
 
+- Cosméticos e emotes Horizon foram excluídos do alvo dedicado por feature; eles não fazem parte da
+  simulação vanilla nem da API pública de plugins.
 - Nenhum crate gráfico foi removido: o código compartilhado ainda depende dele ao compilar o
   executável dedicado.
 - Nenhum artefato de cliente, launcher ou dado Mojang foi adicionado ao pacote do servidor.

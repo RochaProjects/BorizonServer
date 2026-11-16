@@ -52,7 +52,7 @@ jobs:
       - name: Build server engine, server supervisor, and resource preparer
         run: |
           set -euo pipefail
-          cargo build --locked --release -p horizon-client --no-default-features --features server-plugins --bin horizon-client
+          cargo build --locked --release -p horizon-client --no-default-features --features server-plugins,dedicated-server --bin horizon-client
           cargo build --locked --release -p horizon-server -p horizon-prepare
           mkdir -p dist/auraessentials-server
           cp target/release/horizon-server dist/auraessentials-server/

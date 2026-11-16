@@ -2234,8 +2234,9 @@ A native server tick hook can call `native_server_block` with its context, a dim
 ### Server commands and players
 
 For mods that run where the world is simulated: a dedicated server, a LAN host, single player's server thread
-(`crates/horizon-client/src/game/native_server.rs`). The SMP mod of the official server is built on them
-([smp.md](smp.md)).
+(`crates/horizon-client/src/game/native_server.rs`). Older designs for a server SMP mod are described
+in [smp.md](smp.md); the BorizonServer runtime plugin host uses the separate public C ABI in
+`server-plugins/` instead.
 
 - **`native_register_commands(commands)`**: push a `NativeCommand` per usage, asked once when a world opens to
   players. A usage is words, then arguments `<name:kind>`, optional ones last in brackets:

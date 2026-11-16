@@ -929,6 +929,7 @@ impl Game<'_> {
                 self.previous_position = to;
                 ok()
             }
+            #[cfg(not(feature = "dedicated-server"))]
             "emote" => match words.get(1).copied() {
                 None => {
                     let owned: Vec<String> =
@@ -946,6 +947,8 @@ impl Game<'_> {
                     Err(format!("can't play emote {id} now (not owned, or not standing)").into())
                 }
             },
+            #[cfg(feature = "dedicated-server")]
+            "emote" => Err("emotes are unavailable on a dedicated server".into()),
             "hotbar" => {
                 let slot: usize = arg(1)?.parse()?;
                 if !(1..=9).contains(&slot) {

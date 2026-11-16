@@ -162,38 +162,11 @@ impl BalanceStore {
         if self.path.is_some() {
             return;
         }
-        let plugin_dir = plugins_dir.join("AuraEssentials");
-        let legacy_dir = plugins_dir.join("AuraEssentialsHorizon");
-        if legacy_dir.is_dir() {
-            if !plugin_dir.exists() {
-                let _ = fs::rename(&legacy_dir, &plugin_dir);
-            } else if let Ok(entries) = fs::read_dir(&legacy_dir) {
-                for entry in entries.flatten() {
-                    let from = entry.path();
-                    let to = plugin_dir.join(entry.file_name());
-                    if !to.exists() {
-                        let _ = fs::rename(from, to);
-                    }
-                }
-            }
-        }
-        let path = plugin_dir.join("balances.json");
+        let path = plugins_dir.join(".horizon").join("balances.json");
         self.path = Some(path.clone());
         self.available = true;
         if !path.exists() {
-            let legacy = plugins_dir.join("balances.json");
-            if legacy.exists()
-                && let Err(error) =
-                    fs::create_dir_all(&plugin_dir).and_then(|()| fs::rename(&legacy, &path))
-            {
-                self.available = false;
-                log::error!(
-                    "Não foi possível migrar {} para {}: {error}",
-                    legacy.display(),
-                    path.display()
-                );
-                return;
-            }
+            migrate_legacy_balance_files(plugins_dir, &path);
         }
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -310,6 +283,97 @@ impl BalanceStore {
             );
         }
         true
+    }
+}
+
+/// Imports the old shared balance file from any plugin directory. Keeping the
+/// scan schema-based avoids coupling the server loader to one plugin name.
+fn migrate_legacy_balance_files(plugins_dir: &Path, target: &Path) {
+    let mut candidates = Vec::new();
+    if let Ok(entries) = fs::read_dir(plugins_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_plugin_dir = entry.file_type().is_ok_and(|file_type| file_type.is_dir());
+            if is_plugin_dir
+                && path
+                    .file_name()
+                    .is_some_and(|name| name != std::ffi::OsStr::new(".horizon"))
+            {
+                candidates.push(path.join("balances.json"));
+            }
+        }
+    }
+    candidates.sort();
+    candidates.push(plugins_dir.join("balances.json"));
+
+    let mut accounts = std::collections::HashMap::new();
+    for source in candidates {
+        let Ok(bytes) = fs::read(&source) else {
+            continue;
+        };
+        let Ok(file) = serde_json::from_slice::<BalanceFile>(&bytes) else {
+            continue;
+        };
+        if file.version != 1 {
+            continue;
+        }
+        for account in file.accounts {
+            let Some(player) = u128::from_str_radix(&account.player, 16).ok() else {
+                continue;
+            };
+            if account.units >= 0 && valid_currency(&account.currency) {
+                accounts
+                    .entry((account.currency, player))
+                    .or_insert(account.units);
+            }
+        }
+    }
+    if accounts.is_empty() {
+        return;
+    }
+
+    let mut serialized: Vec<_> = accounts
+        .iter()
+        .map(|((currency, player), units)| BalanceAccount {
+            currency: currency.clone(),
+            player: format!("{player:032x}"),
+            units: *units,
+        })
+        .collect();
+    serialized.sort_by(|a, b| (&a.currency, &a.player).cmp(&(&b.currency, &b.player)));
+    let Ok(bytes) = serde_json::to_vec(&BalanceFile {
+        version: 1,
+        accounts: serialized,
+    }) else {
+        return;
+    };
+    let Some(parent) = target.parent() else {
+        return;
+    };
+    if let Err(error) = fs::create_dir_all(parent) {
+        log::warn!(
+            "Não foi possível criar {} para migrar saldos: {error}",
+            parent.display()
+        );
+        return;
+    }
+    let temp = target.with_extension("json.migration-tmp");
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temp, target)
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temp);
+        log::warn!(
+            "Não foi possível migrar saldos para {}: {error}",
+            target.display()
+        );
     }
 }
 

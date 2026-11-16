@@ -99,7 +99,7 @@ public API that mods, desktop-class ports and the Horizon layer build on.
   Horizon feature builds on them instead of editing or copying engine code.
 - **Examples:** `horizon-shader-api`, `horizon-shaders`, `horizon-optifine` (`cem/`), `horizon-polytone`,
   `horizon-hdr`, `horizon-dualsense`, `horizon-mods`, `cargo-horizon-mod`, `horizon-anticheat`, `horizon-mcp`,
-  `horizon-theme`, `horizon-plugin-aura-loja` (an independently loaded example plugin). Still in engine crates today: `game/mod_api_host.rs`, `game/native_*.rs`, `shader_ui.rs`,
+  `horizon-theme`. Independently loaded server plugins live outside the engine workspace and depend on its public plugin API. Still in engine crates today: `game/mod_api_host.rs`, `game/native_*.rs`, `shader_ui.rs`,
   `hdr_calibration.rs`.
 - **Never:** a built-in address (every address comes from the player, a file or a setting), anything that names
   a Horizon crate, cosmetics, the shop, official or partner servers, uploads to playhorizon.dev.

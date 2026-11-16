@@ -437,13 +437,20 @@ fn import_custom_dimension(game: &mut Game<'_>, data: &serde_json::Value) -> ser
     else {
         return serde_json::json!({"ok":false,"error":"invalid_dimension_id"});
     };
+    let Some(plugin) = data
+        .get("plugin")
+        .and_then(serde_json::Value::as_str)
+        .filter(|plugin| valid_plugin_namespace(plugin))
+    else {
+        return serde_json::json!({"ok":false,"error":"invalid_plugin_id"});
+    };
     let Some(source) = data.get("source_dir").and_then(serde_json::Value::as_str) else {
         return serde_json::json!({"ok":false,"error":"invalid_source"});
     };
     let Some(root) = std::env::current_dir().ok() else {
         return serde_json::json!({"ok":false,"error":"server_root_unavailable"});
     };
-    let staging = root.join("plugins/AuraEssentials/.imports");
+    let staging = root.join("plugins").join(plugin).join(".imports");
     let (Ok(staging), Ok(source)) = (staging.canonicalize(), Path::new(source).canonicalize())
     else {
         return serde_json::json!({"ok":false,"error":"import_source_not_found"});
@@ -637,8 +644,7 @@ fn commit_player_data_reset(game: &mut Game<'_>, data: &serde_json::Value) -> se
             return serde_json::json!({"ok": false, "error": "backup_unavailable"});
         };
         let backup_root = server_root
-            .join("plugins")
-            .join("AuraEssentials")
+            .join(".horizon")
             .join("backups")
             .join(format!("player-data-{token}"));
         for target in &targets {
@@ -2014,14 +2020,7 @@ fn plugin_storage(operation: &str, data: &serde_json::Value) -> serde_json::Valu
     let Some(namespace) = data.get("plugin").and_then(|value| value.as_str()) else {
         return serde_json::json!({"ok": false, "error": "invalid_plugin_id"});
     };
-    if namespace.is_empty()
-        || namespace.len() > 64
-        || namespace == "."
-        || namespace == ".."
-        || !namespace
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
-    {
+    if !valid_plugin_namespace(namespace) {
         return serde_json::json!({"ok": false, "error": "invalid_plugin_id"});
     }
     let key = data.get("key").and_then(|value| value.as_str());
@@ -2042,27 +2041,11 @@ fn plugin_storage(operation: &str, data: &serde_json::Value) -> serde_json::Valu
     };
     let plugin_dir: PathBuf = root.join("plugins").join(namespace);
     let path = plugin_dir.join("storage.json");
-    if namespace == "AuraEssentials" && !path.exists() {
-        let legacy = root
-            .join("plugins")
-            .join("AuraEssentialsHorizon")
-            .join("storage.json");
-        if legacy.exists() {
-            let _ = fs::create_dir_all(&plugin_dir);
-            let _ = fs::rename(legacy, &path);
-        }
-    }
     if !path.exists() {
-        let mut legacy = root
+        let legacy = root
             .join("plugins")
             .join("data")
             .join(format!("{namespace}.json"));
-        if namespace == "AuraEssentials" && !legacy.exists() {
-            legacy = root
-                .join("plugins")
-                .join("data")
-                .join("AuraEssentialsHorizon.json");
-        }
         if legacy.exists()
             && fs::create_dir_all(&plugin_dir)
                 .and_then(|()| fs::rename(&legacy, &path))
@@ -2133,6 +2116,17 @@ fn plugin_storage(operation: &str, data: &serde_json::Value) -> serde_json::Valu
         }
         _ => serde_json::json!({"ok": false, "error": "unsupported_operation"}),
     }
+}
+
+#[cfg(feature = "server-plugins")]
+fn valid_plugin_namespace(namespace: &str) -> bool {
+    !namespace.is_empty()
+        && namespace.len() <= 64
+        && namespace != "."
+        && namespace != ".."
+        && namespace
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
 }
 
 #[cfg(feature = "server-plugins")]

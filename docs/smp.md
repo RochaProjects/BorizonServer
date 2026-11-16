@@ -1,4 +1,8 @@
-# Survival multiplayer (SMP): the official server's mod
+# Survival multiplayer (SMP): archived design
+
+> Historical design for the former native SMP mod. Its implementation lived in a separate repository
+> and was later replaced in BorizonServer by independent runtime plugins using `server-plugins/api`.
+> This page is retained as historical context; it does not describe the current plugin architecture.
 
 The official Horizon server (play.playhorizon.dev) wants an organised survival game: a currency players earn in
 game, a server market, safe player-to-player trades, small games of chance with that currency, and spawn, homes,

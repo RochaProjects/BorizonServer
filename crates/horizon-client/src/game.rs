@@ -112,6 +112,10 @@ mod control;
 mod copper_golems;
 #[cfg(test)]
 mod core_tests;
+#[cfg(not(feature = "dedicated-server"))]
+mod cosmetics;
+#[cfg(feature = "dedicated-server")]
+#[path = "game/cosmetics_dedicated.rs"]
 mod cosmetics;
 mod creaking;
 mod creative_hotbar;
@@ -2727,6 +2731,7 @@ struct Game<'a> {
     skin_profiles: RefCell<horizon_client::skins::Resolver>,
     skin_slots: horizon_client::skins::SkinSlots,
     /// Cosmetics on players (game/cosmetics.rs), off by default.
+    #[cfg(not(feature = "dedicated-server"))]
     cosmetics: cosmetics::Cosmetics,
     /// 3D skin layers: each player's outer layer as one slab per painted
     /// texel, built once per (skin, slim) (`mobs::skin_layers`).
@@ -11753,6 +11758,7 @@ impl<'a> Game<'a> {
             }),
             skin_profiles: RefCell::new(horizon_client::skins::Resolver::new()),
             skin_slots: horizon_client::skins::SkinSlots::new(horizon_client::hud::SKIN_SLOTS),
+            #[cfg(not(feature = "dedicated-server"))]
             cosmetics: Default::default(),
             skin_3d: Default::default(),
             trim_slots: Default::default(),

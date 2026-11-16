@@ -3830,6 +3830,10 @@ impl Game<'_> {
         else {
             return;
         };
+        let requester = host
+            .hub
+            .guest(conn)
+            .map(|guest| super::native_server::server_player(host, guest));
         let skip = usize::from(text.starts_with('/'));
         let command = &text[skip..];
         let d = vanilla::game_dispatcher_with_features(&self.level.enabled_features);
@@ -3929,7 +3933,7 @@ impl Game<'_> {
         // current partial line fail native usage matching).
         if Self::native_command_level(host, command).is_some() {
             suggestions.extend(
-                super::server_plugins::tab_complete(self, player_uuid, command)
+                super::server_plugins::tab_complete(self, player_uuid, command, requester)
                     .into_iter()
                     .map(|text| horizon_client::command::Suggestion {
                         range: (start, end),

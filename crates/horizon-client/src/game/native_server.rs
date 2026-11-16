@@ -342,7 +342,10 @@ fn vanilla_command_info(d: &Dispatcher, label: &str) -> Option<NativeCommandInfo
 }
 
 /// A guest as server hooks see them, from the hub's record.
-fn server_player(host: &LanHost, g: &horizon_client::lan::guest::Guest) -> NativeServerPlayer {
+pub(super) fn server_player(
+    host: &LanHost,
+    g: &horizon_client::lan::guest::Guest,
+) -> NativeServerPlayer {
     // Abilities.invulnerable, flying and mayfly, as `ServerPlayer.onUpdateAbilities` sends them.
     let abilities = g.ability_flags();
     // LivingEntity.DATA_LIVING_ENTITY_FLAGS: 1 while using, 2 when it is the off hand's item.

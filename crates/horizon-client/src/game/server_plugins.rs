@@ -66,6 +66,10 @@ struct GameHost<'g, 'a, 'c> {
     game: &'g mut Game<'a>,
     commands: Option<&'c mut Vec<NativeCommand>>,
     suggestions: Option<Vec<String>>,
+    /// The guest whose completion request is being handled. During this path
+    /// `Game::lan` is temporarily taken by the LAN tick, so player.get cannot
+    /// discover this player through the game's global guest list.
+    requester: Option<NativeServerPlayer>,
 }
 
 #[cfg(feature = "server-plugins")]
@@ -1243,10 +1247,16 @@ impl Host for GameHost<'_, '_, '_> {
             }
             op::PLAYER_GET => {
                 let snapshot = self
-                    .game
-                    .native_server_players()
-                    .into_iter()
-                    .find(|snapshot| snapshot.uuid == player)
+                    .requester
+                    .as_ref()
+                    .filter(|snapshot| snapshot.uuid == player)
+                    .cloned()
+                    .or_else(|| {
+                        self.game
+                            .native_server_players()
+                            .into_iter()
+                            .find(|snapshot| snapshot.uuid == player)
+                    })
                     .or_else(|| {
                         self.game
                             .native_acting_player()
@@ -2213,6 +2223,7 @@ pub(super) fn register_commands(game: &mut Game<'_>, commands: &mut Vec<NativeCo
         game,
         commands: Some(commands),
         suggestions: None,
+        requester: None,
     };
     horizon_server_plugin_loader::register_commands(&root, &mut host);
 }
@@ -2268,12 +2279,18 @@ pub(super) fn perform_command(
         game,
         commands: None,
         suggestions: None,
+        requester: None,
     };
     *ran = horizon_server_plugin_loader::perform_command(&root, &mut host, player.uuid, command);
 }
 
 #[cfg(feature = "server-plugins")]
-pub(super) fn tab_complete(game: &mut Game<'_>, player: u128, line: &str) -> Vec<String> {
+pub(super) fn tab_complete(
+    game: &mut Game<'_>,
+    player: u128,
+    line: &str,
+    requester: Option<NativeServerPlayer>,
+) -> Vec<String> {
     if game.options.dedicated.is_none() {
         return Vec::new();
     }
@@ -2284,6 +2301,7 @@ pub(super) fn tab_complete(game: &mut Game<'_>, player: u128, line: &str) -> Vec
         game,
         commands: None,
         suggestions: Some(Vec::new()),
+        requester,
     };
     horizon_server_plugin_loader::tab_complete(&root, &mut host, player, line)
 }
@@ -2348,7 +2366,12 @@ pub(super) fn run_scheduled_tasks(_: &mut Game<'_>) {}
 pub(super) fn begin_server_tick() {}
 
 #[cfg(not(feature = "server-plugins"))]
-pub(super) fn tab_complete(_: &mut Game<'_>, _: u128, _: &str) -> Vec<String> {
+pub(super) fn tab_complete(
+    _: &mut Game<'_>,
+    _: u128,
+    _: &str,
+    _: Option<NativeServerPlayer>,
+) -> Vec<String> {
     Vec::new()
 }
 
@@ -2371,6 +2394,7 @@ pub(super) fn menu_clicked(
         game,
         commands: None,
         suggestions: None,
+        requester: None,
     };
     horizon_server_plugin_loader::menu_click(&root, &mut host, player, window, slot, button, mode);
 }
@@ -2405,6 +2429,7 @@ pub(super) fn dispatch_event(
         game,
         commands: None,
         suggestions: None,
+        requester: None,
     };
     horizon_server_plugin_loader::dispatch_event(&root, &mut host, &event)
 }
@@ -2431,6 +2456,7 @@ pub(super) fn menu_closed(game: &mut Game<'_>, player: u128, window: i32) {
         game,
         commands: None,
         suggestions: None,
+        requester: None,
     };
     horizon_server_plugin_loader::dispatch_event(&root, &mut host, &event);
 }

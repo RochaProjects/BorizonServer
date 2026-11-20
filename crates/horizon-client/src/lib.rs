@@ -6,10 +6,10 @@ extern crate self as horizon_client;
 pub use horizon_client_lib::*;
 pub mod entry;
 pub mod game;
-pub mod server_api;
 #[cfg(feature = "client-graphics")]
 mod horizon_look;
 pub mod mod_api;
+pub mod server_api;
 
 #[cfg(test)]
 mod brewing_speed_load_tests;

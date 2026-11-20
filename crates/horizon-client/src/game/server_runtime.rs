@@ -7,8 +7,8 @@ use horizon_client::{
     command::{Dispatcher, vanilla},
     items::ItemStack,
     lan::data::component_nbt,
-    server_api::{ServerCommandInfo, ServerCommandResult},
     server::user_lists::{NameAndId, WhiteEntry},
+    server_api::{ServerCommandInfo, ServerCommandResult},
     text::Text,
 };
 use horizon_protocol::packets::play::{self, Clientbound as C};
@@ -326,10 +326,7 @@ fn vanilla_command_info(d: &Dispatcher, label: &str) -> Option<ServerCommandInfo
 }
 
 /// A guest as server hooks see them, from the hub's record.
-pub(super) fn server_player(
-    host: &LanHost,
-    g: &horizon_client::lan::guest::Guest,
-) -> ServerPlayer {
+pub(super) fn server_player(host: &LanHost, g: &horizon_client::lan::guest::Guest) -> ServerPlayer {
     // Abilities.invulnerable, flying and mayfly, as `ServerPlayer.onUpdateAbilities` sends them.
     let abilities = g.ability_flags();
     // LivingEntity.DATA_LIVING_ENTITY_FLAGS: 1 while using, 2 when it is the off hand's item.
@@ -381,7 +378,10 @@ pub(super) fn server_player(
 
 /// Server operations shared by the plugin host and legacy client hooks.
 // The legacy trait bridge still uses some helpers; the plugin bridge uses others.
-#[allow(dead_code, reason = "server extension bridge also uses these operations")]
+#[allow(
+    dead_code,
+    reason = "server extension bridge also uses these operations"
+)]
 impl Game<'_> {
     /// The players on this server, in the order they joined. Empty on a
     /// client and in a world nobody else can join.

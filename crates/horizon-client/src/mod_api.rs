@@ -45,10 +45,6 @@ pub use crate::game::{
     NativeShake, NativeStructureBlock, NativeStructureTemplate, NativeWorldDraw,
 };
 pub use crate::gamerules::Value as GameRuleValue;
-pub use crate::server_api::{
-    ServerCommand as NativeCommand, ServerCommandInfo as NativeCommandInfo,
-    ServerCommandResult as NativeCommandResult, ServerPlayer as NativeServerPlayer,
-};
 /// What a mod asks of the terrain's picture each frame (`native_world_hold`). API 414.
 pub use crate::gfx::WorldHold;
 pub use crate::gfx::native_render::{
@@ -70,6 +66,10 @@ pub use crate::mobs::{Mob, MobWorld};
 pub use crate::music::{Music, MusicLayer};
 pub use crate::particles::{ParticleOptions, ParticleType};
 pub use crate::recipe_book::RecipeBookCategory;
+pub use crate::server_api::{
+    ServerCommand as NativeCommand, ServerCommandInfo as NativeCommandInfo,
+    ServerCommandResult as NativeCommandResult, ServerPlayer as NativeServerPlayer,
+};
 pub use crate::sound_engine::SoundPlayback;
 /// A named step of the server tick and its wall and CPU milliseconds (`native_server_tick_timed`).
 pub use crate::spans::Span as TickSpan;

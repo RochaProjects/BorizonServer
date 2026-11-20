@@ -336,8 +336,8 @@ mod native_recipes;
 mod native_registry_name;
 mod native_reload_listeners;
 mod native_scene;
-pub(crate) mod server_runtime;
-pub(crate) use server_runtime as native_server;
+#[path = "game/server_runtime.rs"]
+pub(crate) mod native_server;
 mod native_shaders;
 mod native_slot_roles;
 mod native_structures;

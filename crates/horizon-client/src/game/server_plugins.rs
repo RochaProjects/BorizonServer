@@ -12,7 +12,7 @@ use horizon_client::server_api::ServerSidebar;
 #[cfg(feature = "server-plugins")]
 use horizon_client::{items::ItemStack, lan::data::component_nbt, text::Text};
 #[cfg(feature = "server-plugins")]
-use horizon_core::gamerules::Value as GameRuleValue;
+use horizon_client::gamerules::Value as GameRuleValue;
 #[cfg(feature = "server-plugins")]
 use horizon_server_plugin_loader::{Event, Host, ItemDelta, MenuItem, TransactionError};
 #[cfg(feature = "server-plugins")]

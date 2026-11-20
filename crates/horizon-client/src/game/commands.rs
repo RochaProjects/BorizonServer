@@ -2070,15 +2070,13 @@ impl Game<'_> {
     /// `ServerClockManager.getInstance`: commands address clock-keyed state.
     /// Keep the existing Overworld clock tied to the world's canonical day time.
     pub(super) fn command_clock_time(&self, clock: &str) -> i64 {
-        if clock == self.dim.id()
+        let dimension_clock = clock == self.dim.id()
             && self
                 .ui
                 .dimension_rule_overrides
                 .get(clock)
-                .is_some_and(|rules| rules.contains_key("advance_time"))
-        {
-            self.world.day_time
-        } else if clock == "minecraft:overworld" {
+                .is_some_and(|rules| rules.contains_key("advance_time"));
+        if dimension_clock || clock == "minecraft:overworld" {
             self.world.day_time
         } else {
             self.ui.command_clocks.get(clock).map_or(0, |c| c.0)

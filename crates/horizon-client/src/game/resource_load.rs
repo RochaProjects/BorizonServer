@@ -355,7 +355,11 @@ pub(super) fn load_resources(
     // server thread's (horizon_threads::jobs), sized before any world opens.
     horizon_threads::jobs::configure(threads);
     horizon_client::sprites::set_texture_budget(settings.horizon.texture_budget_mib);
-    horizon_client::sprites::set_labpbr_maps(shader_packs::picks_material_pack(settings));
+    // A dedicated server has no renderer, so it must not inspect shader-pack
+    // settings or ask the resource loader to read visual LabPBR maps.
+    horizon_client::sprites::set_labpbr_maps(
+        !headless && shader_packs::picks_material_pack(settings),
+    );
     // Stage A: the menu bundle (atlas and panorama). With a loading screen it is
     // published at once so the title screen can appear while the world bundle
     // loads; the synchronous launch instead carries it in `Loaded`.
@@ -447,8 +451,15 @@ pub(super) fn load_resources(
         world_loading::preload_launch_world(folder, &root, assets.registry, biomes.clone());
     }
     let tables = Arc::new(startup::time("pack.mesh_tables", || {
-        MeshTables::new(&assets, &render, &facts, visibility)
-            .map(|t| t.with_polytone_colormaps(&root, assets.registry))
+        let tables: MeshTables = MeshTables::new(&assets, &render, &facts, visibility)?;
+        // Polytone colormaps only affect the client's rendered block and fluid
+        // tints. The dedicated server has no renderer or legacy client mods,
+        // so don't scan or decode those resource-pack images there.
+        if headless {
+            Ok(tables)
+        } else {
+            Ok(tables.with_polytone_colormaps(&root, assets.registry))
+        }
     })?);
     let pack_step = startup::step("pack.assemble");
     let pack = PackResources::assemble(
@@ -459,6 +470,7 @@ pub(super) fn load_resources(
         item_renderer,
         biomes.clone(),
         Arc::new(light),
+        !headless,
     );
     drop(pack_step);
     log::info!("load pack tables: {:.2}s", started.elapsed().as_secs_f32());
@@ -561,7 +573,7 @@ pub(super) fn load_resources(
     // The world tables load (above) while the handoff's CPU work is done: the
     // world renderer's textures beside the game's own tables. A failure here
     // waits for the tail, so no tail worker outlives its pack-loader generation.
-    let prepared_at = Instant::now();
+    #[cfg(not(feature = "dedicated-server"))]
     let (game_cpu, renderer_cpu) = if menu {
         let (game_cpu, renderer_cpu) = std::thread::scope(|scope| {
             let textures = Step::spawn(scope, parallel, "textures", || {
@@ -591,6 +603,8 @@ pub(super) fn load_resources(
     } else {
         (None, None)
     };
+    #[cfg(feature = "dedicated-server")]
+    let (game_cpu, renderer_cpu) = (None, None);
     Ok(Loaded {
         game_cpu,
         entity_models,

@@ -24,7 +24,10 @@ pub fn main_with(mods: crate::mod_api::Mods) {
     horizon_chat_filter::install();
     #[cfg(feature = "client-graphics")]
     crate::horizon_look::give();
-    // OptiFine's and Polytone's pack formats (platform, docs/layers.md), before any pack loads.
+    // OptiFine's and Polytone's visual pack formats, before any client pack loads.
+    // The dedicated server sends resource-pack links to clients; it does not
+    // render those formats or need their display colors and skies.
+    #[cfg(not(feature = "dedicated-server"))]
     horizon_client::pack_formats::install();
     // horizon-extras (docs/forking.md): without the feature, no Horizon Settings or Mods page.
     if !cfg!(feature = "horizon-extras") {

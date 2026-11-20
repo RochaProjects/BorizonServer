@@ -289,7 +289,7 @@ impl ApplicationHandler for Game<'_> {
         let attributes =
             horizon_client::window::with_icon(Window::default_attributes().with_title("Horizon"));
         // Wayland names the window by its app id, which the horizon.desktop entry matches.
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "client-graphics"))]
         let attributes = winit::platform::wayland::WindowAttributesExtWayland::with_name(
             attributes, "horizon", "horizon",
         );

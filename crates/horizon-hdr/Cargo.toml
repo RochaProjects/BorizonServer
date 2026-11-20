@@ -15,14 +15,19 @@ ash = { version = "0.38", default-features = false, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # The versions winit already uses, with the color-management protocol (staging).
-wayland-backend = { version = "0.3.10", default-features = false, features = ["client_system"] }
-wayland-client = { version = "0.31.10", default-features = false }
-wayland-protocols = { version = "0.32.8", default-features = false, features = ["client", "staging"] }
+wayland-backend = { version = "0.3.10", default-features = false, features = ["client_system"], optional = true }
+wayland-client = { version = "0.31.10", default-features = false, optional = true }
+wayland-protocols = { version = "0.32.8", default-features = false, features = ["client", "staging"], optional = true }
 
 [features]
 default = ["vulkan-backend"]
 # Used only by the windowed renderer to ask wgpu for Vulkan HDR metadata support.
 vulkan-backend = ["wgpu/vulkan", "dep:ash"]
+wayland-color-management = [
+    "dep:wayland-backend",
+    "dep:wayland-client",
+    "dep:wayland-protocols",
+]
 
 [lints]
 workspace = true

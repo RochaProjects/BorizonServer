@@ -790,10 +790,14 @@ impl ItemRenderer {
         } else {
             (library?, None)
         };
-        let permutations = PalettedPermutations::from_atlas(
-            &fs::read_to_string(root.join("assets/minecraft/atlases/items.json"))
-                .unwrap_or_default(),
-        );
+        let permutations = if drawn {
+            PalettedPermutations::from_atlas(
+                &fs::read_to_string(root.join("assets/minecraft/atlases/items.json"))
+                    .unwrap_or_default(),
+            )
+        } else {
+            Vec::new()
+        };
         let parts = if drawn {
             entity_models.map_or_else(
                 || special::load_parts(root),

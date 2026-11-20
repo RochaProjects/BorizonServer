@@ -34,7 +34,7 @@ impl PackFormats for Formats {
     }
 }
 
-/// Installs these formats ([`crate::pack_hooks::install`]); the game does at startup.
+/// Installs these formats ([`crate::pack_hooks::install`]); the desktop client does at startup.
 pub fn install() {
     crate::pack_hooks::install(&Formats);
 }

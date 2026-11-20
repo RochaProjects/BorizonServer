@@ -14521,7 +14521,7 @@ mod sprite_upload_tests {
 /// from the OS (on Windows, DXGI's luminances and the SDR white level).
 #[derive(Default)]
 struct DisplayWatch {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "client-graphics"))]
     wayland: Option<horizon_hdr::wayland::Watch>,
     /// Without Wayland's event, when to read wgpu's values again: the OS sends no event for
     /// a moved window or a changed SDR brightness slider.
@@ -14562,7 +14562,7 @@ impl DisplayWatch {
         surface: Option<&wgpu::Surface>,
         adapter: &wgpu::Adapter,
     ) -> (Self, DisplayReading) {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "client-graphics"))]
         if surface.is_some()
             && let Some((wayland, now)) = horizon_hdr::wayland::Watch::new(window)
         {
@@ -14576,7 +14576,7 @@ impl DisplayWatch {
         let now = DisplayReading::read(surface, adapter);
         log_os_reported(now.luminance);
         let watch = Self {
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "client-graphics"))]
             wayland: None,
             polled: Some(std::time::Instant::now() + DISPLAY_POLL),
         };
@@ -14590,7 +14590,7 @@ impl DisplayWatch {
         time: std::time::Instant,
         read: impl FnOnce() -> DisplayReading,
     ) -> Option<DisplayReading> {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "client-graphics"))]
         if let Some(wayland) = &mut self.wayland {
             return wayland.changed().map(wayland_reading);
         }
@@ -14687,7 +14687,7 @@ fn os_reported(info: &wgpu::DisplayHdrInfo) -> Option<crate::graphics::Reported>
 /// the SDR white of its desktop (which it doesn't report), so Auto can't match its desktop
 /// there. Other compositors are unchecked. The peak is kept within the settings' lowest and
 /// PQ's top, so the metadata never ends below the black level.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "client-graphics"))]
 fn wayland_reading(now: Option<horizon_hdr::wayland::Luminances>) -> DisplayReading {
     now.map_or_else(DisplayReading::default, |l| DisplayReading {
         luminance: Some(reported(l)),
@@ -14700,7 +14700,7 @@ fn wayland_reading(now: Option<horizon_hdr::wayland::Luminances>) -> DisplayRead
             .then_some(l.target_max > l.reference),
     })
 }
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "client-graphics"))]
 fn reported(l: horizon_hdr::wayland::Luminances) -> crate::graphics::Reported {
     let peak = (l.target_max * 203.0 / l.reference.max(1.0)).round() as u32;
     log_display(format!(

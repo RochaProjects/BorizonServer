@@ -257,8 +257,7 @@ pub(super) fn loading_frame(hud: &HudBatch) -> Frame<'_> {
 
 /// The post-load setup once the resources are ready: `Game::new` and the
 /// options, packs, mods, control socket, benchmark and world selection the
-/// old `run` did after loading. `None` means a harness or dedicated run
-/// finished here instead.
+/// old `run` did after loading. `None` means a harness finished here instead.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn start_game<'a>(
     res: &'a Arc<Resources>,
@@ -312,7 +311,7 @@ pub(super) fn start_game<'a>(
     }
     game.apply_settings();
     // Benchmarks measure the game alone.
-    if game.options.benchmark.is_none() {
+    if game.options.benchmark.is_none() && game.options.execution_role.is_client() {
         game.mods.dev = game.options.dev_mods.clone();
         game.start_mods();
     }
@@ -362,10 +361,6 @@ pub(super) fn start_game<'a>(
     }
     if let Ok(spec) = std::env::var("HORIZON_SCULK_FIXTURE") {
         game.run_component_harness(integrated::ComponentHarness::Sculk(spec))?;
-        return Ok(None);
-    }
-    if game.options.execution_role == execution_role::ExecutionRole::DedicatedServer {
-        game.run_dedicated()?;
         return Ok(None);
     }
     match game.options.world.clone() {

@@ -1426,7 +1426,15 @@ struct TrackedExplosion {
 }
 impl ParticleEngine {
     pub fn new(root: &Path, atlas: &HashMap<String, Rect>, translucent: &HashSet<String>) -> Self {
-        let mut engine = Self {
+        let mut engine = Self::empty();
+        engine.reload(root, atlas, translucent);
+        engine
+    }
+
+    /// Runtime state for a headless server. It can still receive simulation
+    /// effects, but does not scan particle JSON or build render sprite tables.
+    pub fn empty() -> Self {
+        Self {
             particles: Vec::new(),
             pending: Vec::new(),
             spawned_in_tick: None,
@@ -1458,9 +1466,7 @@ impl ParticleEngine {
             sounds: Vec::new(),
             made: Default::default(),
             item_sprites: HashMap::new(),
-        };
-        engine.reload(root, atlas, translucent);
-        engine
+        }
     }
     /// `onResourceManagerReload`: sprite rects and sets come from the
     /// reloaded atlas and pack; a live particle keeps drawing its sprite by

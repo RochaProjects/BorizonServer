@@ -156,7 +156,8 @@ pub fn decode_png(bytes: &[u8]) -> Result<Image, String> {
 
 /// Checks every stage of `pack`, and that each option is an `override` of
 /// its type in some stage, or one `[shadow]` sizes its map by. Returns every problem
-/// found, not just the first.
+/// found, not just the first. Builds with `shader-backends` also translate each
+/// stage for SPIR-V, Metal, and HLSL; builds without it perform WGSL validation only.
 pub fn check(pack: &Pack) -> Result<Report, Vec<Problem>> {
     let m = &pack.manifest;
     let stages = m
@@ -619,6 +620,9 @@ fn option_sets(options: &[PackOption]) -> [(&'static str, Vec<(String, f64)>); 3
 
 /// Translates every entry point for Vulkan (SPIR-V), Metal and DirectX 12
 /// (HLSL) with each option set, as wgpu does when it builds the pipelines.
+/// This runs in builds with `shader-backends`; a server build still parses and
+/// validates WGSL but does not compile visual shaders for GPU backends.
+#[cfg(feature = "shader-backends")]
 fn translate(
     module: &naga::Module,
     info: &ModuleInfo,
@@ -708,4 +712,14 @@ fn translate(
         }
     }
     problems
+}
+
+#[cfg(not(feature = "shader-backends"))]
+fn translate(
+    _module: &naga::Module,
+    _info: &ModuleInfo,
+    _options: &[PackOption],
+    _file: &str,
+) -> Vec<Problem> {
+    Vec::new()
 }

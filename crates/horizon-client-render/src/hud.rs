@@ -211,6 +211,7 @@ fn check_fetched_size(width: u64, height: u64) -> Result<()> {
 
 /// A WebP image as RGBA8. Still frames and animations both decode; an
 /// animation gives its first frame, as an animated PNG would.
+#[cfg(feature = "client-graphics")]
 fn decode_webp(data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     let mut decoder =
         image_webp::WebPDecoder::new(std::io::Cursor::new(data)).map_err(|e| e.to_string())?;
@@ -236,7 +237,13 @@ fn decode_webp(data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     Ok((width, height, rgba))
 }
 
+#[cfg(not(feature = "client-graphics"))]
+fn decode_webp(_data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
+    Err("WebP decoding is unavailable in this build".into())
+}
+
 /// A JPEG image as RGBA8. JPEG has no alpha, so every pixel is opaque.
+#[cfg(feature = "client-graphics")]
 fn decode_jpeg(data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     let mut decoder = zune_jpeg::JpegDecoder::new(data);
     // The size comes from the headers, before any pixel buffer is made.
@@ -264,6 +271,11 @@ fn decode_jpeg(data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
         _ => return Err("the JPEG decoded to an unexpected channel count".into()),
     }
     Ok((width, height, rgba))
+}
+
+#[cfg(not(feature = "client-graphics"))]
+fn decode_jpeg(_data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
+    Err("JPEG decoding is unavailable in this build".into())
 }
 
 /// An image fetched from the network (PNG, WebP or JPEG) as RGBA pixels. WebP

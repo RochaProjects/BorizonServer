@@ -549,6 +549,7 @@ fn probe_devices(default_seen: Option<String>, cards_seen: Option<String>) -> De
         devices,
     }
 }
+#[cfg(feature = "audio")]
 fn decode(path: &Path) -> Option<(Vec<f32>, u32, u16)> {
     use symphonia::core::{
         audio::SampleBuffer, codecs::DecoderOptions, formats::FormatOptions, io::MediaSourceStream,
@@ -611,6 +612,14 @@ fn decode(path: &Path) -> Option<(Vec<f32>, u32, u16)> {
         }
     }
     (channels != 0).then_some((samples, rate, channels))
+}
+
+/// A silent build never sets `MixerBackend::live`, so no channel can reach the
+/// decoder. Keeping the same result here avoids pulling Ogg/Vorbis into a
+/// headless server while preserving the call path's behavior.
+#[cfg(not(feature = "audio"))]
+fn decode(_path: &Path) -> Option<(Vec<f32>, u32, u16)> {
+    None
 }
 /// A sound file without its variant number (`mob/creeper/say2.ogg` is `mob/creeper/say`): each
 /// player's game picks its own variant of the same event.

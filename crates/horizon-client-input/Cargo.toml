@@ -8,15 +8,28 @@ description = "The client's input layer: key bindings and their names, mouse, co
 
 [dependencies]
 horizon-client-core = { path = "../horizon-client-core" }
-winit = "0.30.13"
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 png = "0.18"
-arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
+arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"], optional = true }
 
 [dev-dependencies]
 # The window icon test decodes Horizon's icon.
 horizon-theme = { path = "../horizon-theme" }
 
 [features]
+default = ["client-windowing"]
+client-windowing = [
+    "dep:arboard",
+    "winit/x11",
+    "winit/wayland",
+    "winit/wayland-dlopen",
+    "winit/wayland-csd-adwaita",
+]
+# winit has no platform-neutral Linux library configuration: even code that
+# only uses its event/key types must enable one Linux platform implementation.
+# X11 is the smaller single backend for the headless server build; the desktop
+# client enables both X11 and Wayland through `client-windowing`.
+server-event-types = ["winit/x11"]
 controllers = []
 
 [lints]

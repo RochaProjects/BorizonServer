@@ -210,6 +210,11 @@ pub fn item_group_key(id: &str) -> Option<&'static str> {
     })
 }
 impl Creative {
+    /// Empty tab state for a runtime with no creative inventory screen.
+    pub fn empty() -> Self {
+        Self::new(Vec::new(), Vec::new())
+    }
+
     pub const WIDTH: f32 = 195.0;
     pub const HEIGHT: f32 = 136.0;
     pub const TRASH_POSITION: (f32, f32) = (173.0, 112.0);

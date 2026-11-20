@@ -1523,6 +1523,7 @@ dependencies = [
  "horizon-perf",
  "horizon-perf-format",
  "horizon-protocol",
+ "horizon-server-api",
  "horizon-server-files",
  "horizon-server-plugin-api",
  "horizon-server-plugin-loader",
@@ -2061,6 +2062,13 @@ dependencies = [
  "ureq",
  "windows-sys 0.61.2",
  "zip",
+]
+
+[[package]]
+name = "horizon-server-api"
+version = "0.1.0"
+dependencies = [
+ "horizon-client-core",
 ]
 
 [[package]]

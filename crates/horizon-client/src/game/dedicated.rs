@@ -6,7 +6,10 @@
 //! its simulation and the play-state hub that LAN hosting uses, configured
 //! from server.properties, with the operator, whitelist and ban lists and a
 //! console on standard input.
-use super::{Game, Options, lan::LanSettings, world_loading::WorldRequest};
+use super::{
+    Audio, Behaviours, Game, GameCpuResources, Options, Progress, Settings, lan::LanSettings,
+    load_resources, world_loading::WorldRequest,
+};
 use horizon_client::{
     Result,
     lan::{LoginGate, NetConfig, NetLog, OnlineMode, hub::HubConfig},
@@ -41,6 +44,67 @@ mod predicate_graph;
 pub(super) mod report;
 mod status;
 mod transfer;
+
+/// Dedicated-server startup after shared process setup and resource validation.
+/// Keep this path separate from the client's title/loading-screen startup so
+/// it can move behind a server-only crate boundary without changing simulation.
+pub(super) fn run(mut options: Options, vanilla_root: PathBuf, started: Instant) -> Result<()> {
+    // A dedicated process has no client options, shader selection, controller
+    // profile, or local mod list to load. Server properties are applied by the
+    // dedicated runtime after resource preparation.
+    let early_settings = Settings::default();
+    Behaviours::set_cache_dir(std::env::current_dir()?.join(".horizon-cache"));
+    options.resources = vanilla_root.clone();
+    let loaded = load_resources(
+        options.resources.clone(),
+        None,
+        &vanilla_root,
+        &early_settings,
+        started,
+        false,
+        true,
+        &Progress::new(),
+        &mut |_, _| {},
+    )?;
+    let gui = loaded.gui.ok_or("missing server text resources")?;
+    options.resources = loaded.root.clone();
+    let audio = Audio::silent(&options.resources);
+    let resources = loaded.resources;
+    start_dedicated_game(
+        &resources,
+        loaded.pack,
+        gui,
+        options,
+        audio,
+        vanilla_root,
+        loaded.rest_loader,
+        early_settings,
+    )
+}
+
+/// Construct the dedicated simulation without entering client startup or
+/// building client-only CPU model resources.
+#[allow(clippy::too_many_arguments)]
+fn start_dedicated_game<'a>(
+    res: &'a Arc<super::Resources>,
+    pack: super::PackResources,
+    gui: super::UiResources,
+    options: Options,
+    audio: Audio,
+    vanilla_root: PathBuf,
+    rest_loader: Option<super::WorldRestLoader>,
+    mut settings: Settings,
+) -> Result<()> {
+    if let Some(distance) = options.distance_override {
+        settings.render_distance = distance;
+    }
+    let prepared = GameCpuResources::server(&options.resources);
+    let mut game = Game::new(res, pack, gui, options, settings, audio, Some(prepared))?;
+    game.rest_loader = rest_loader;
+    game.ui.vanilla_root = vanilla_root;
+    game.start_agent_control()?;
+    game.run_dedicated()
+}
 
 /// What the tick loop tells `ServerWatchdog`: when the tick in progress was
 /// due (`getNextTickTime`), how long a tick is, and whether the server runs.

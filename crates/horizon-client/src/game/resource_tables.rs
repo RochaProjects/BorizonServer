@@ -161,6 +161,7 @@ impl PackResources {
             item_renderer,
             biomes,
             light,
+            true,
         ))
     }
     /// The workers' context over `biomes`: this pack's own when `biomes` is
@@ -188,51 +189,71 @@ impl PackResources {
         item_renderer: horizon_client::item_render::ItemRenderer,
         biomes: Arc<Biomes>,
         light: Arc<LightTables>,
+        client_visuals: bool,
     ) -> Self {
-        // These pack-local resources do not depend on one another. Decode the
-        // images and language map together so a custom-sky pack cannot put all
-        // of the pack assembly on the critical path behind its own files.
+        // These pack-local resources do not depend on one another. A dedicated
+        // server has no renderer, so don't read client-only pack images and
+        // visual modifiers on that path.
+        // Item names are also used by server-side command and chat output, so
+        // they must be loaded for both runtime targets. Keep their client load
+        // parallel with the independent visual pack reads.
         let (names, clouds, forcefield, custom_sky, environments, polytone_particles) =
-            std::thread::scope(|scope| {
-                let names = named_scope(scope, "pack.names", || Names::load(root));
-                let clouds = named_scope(scope, "pack.clouds", || load_clouds(root));
-                let forcefield = named_scope(scope, "pack.forcefield", || load_forcefield(root));
-                let custom_sky = named_scope(scope, "pack.custom_sky", || {
-                    horizon_client::custom_sky::load(root)
-                });
-                let environments =
-                    named_scope(scope, "pack.environments", || pack_environments(root));
-                let polytone_particles = named_scope(scope, "pack.particles", || {
-                    pack_particles(root, assets.registry)
-                });
+            if client_visuals {
+                std::thread::scope(|scope| {
+                    let names = named_scope(scope, "pack.names", || Names::load(root));
+                    let clouds = named_scope(scope, "pack.clouds", || load_clouds(root));
+                    let forcefield =
+                        named_scope(scope, "pack.forcefield", || load_forcefield(root));
+                    let custom_sky = named_scope(scope, "pack.custom_sky", || {
+                        horizon_client::custom_sky::load(root)
+                    });
+                    let environments =
+                        named_scope(scope, "pack.environments", || pack_environments(root));
+                    let polytone_particles = named_scope(scope, "pack.particles", || {
+                        pack_particles(root, assets.registry)
+                    });
+                    (
+                        names
+                            .join()
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                        clouds
+                            .join()
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                        forcefield
+                            .join()
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                        custom_sky
+                            .join()
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                        environments
+                            .join()
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                        polytone_particles
+                            .join()
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                    )
+                })
+            } else {
                 (
-                    names
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
-                    clouds
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
-                    forcefield
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
-                    custom_sky
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
-                    environments
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
-                    polytone_particles
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                    Names::load(root),
+                    (0, 0, Vec::<bool>::new()),
+                    (0, 0, Vec::<u8>::new()),
+                    horizon_client::custom_sky::empty(),
+                    None,
+                    None,
                 )
-            });
-        let polytone_post = horizon_client::polytone_post::PolytonePost::read(
-            root,
-            horizon_client::packs::polytone_configs(&horizon_client::packs::Source::Dir(
-                root.to_path_buf(),
-            )),
-        )
-        .map(Arc::new);
+            };
+        let polytone_post = if client_visuals {
+            horizon_client::polytone_post::PolytonePost::read(
+                root,
+                horizon_client::packs::polytone_configs(&horizon_client::packs::Source::Dir(
+                    root.to_path_buf(),
+                )),
+            )
+            .map(Arc::new)
+        } else {
+            None
+        };
         Self {
             layer_names: Arc::new(
                 render
@@ -258,7 +279,11 @@ impl PackResources {
             environments,
             polytone_particles,
             polytone_post,
-            polytone_colors: Arc::new(read_colors(root)),
+            polytone_colors: Arc::new(if client_visuals {
+                read_colors(root)
+            } else {
+                horizon_client::pack_palette::PackColors::default()
+            }),
         }
     }
 }

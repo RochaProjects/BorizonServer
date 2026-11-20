@@ -46,6 +46,7 @@ pub(super) struct EntityModels {
 }
 
 impl EntityModels {
+    #[cfg(not(feature = "dedicated-server"))]
     pub(super) fn load(document: Option<&horizon_client::mobs::EntityModelDocument>) -> Self {
         let model = |key| document.and_then(|document| document.model(key));
         Self {
@@ -61,6 +62,46 @@ impl EntityModels {
 }
 
 impl GameCpuResources {
+    /// The dedicated server never draws entity and menu models. Keep only a
+    /// structurally valid empty bundle for the shared `Game` constructor.
+    pub(super) fn server(root: &std::path::Path) -> Self {
+        Self {
+            painting_variants: Default::default(),
+            frame_model: Default::default(),
+            glow_frame_model: Default::default(),
+            map_frame_model: Default::default(),
+            glow_map_frame_model: Default::default(),
+            armor_stand_assets: armor_stands::ArmorStandAssets {
+                main: None,
+                small: None,
+                layers: Default::default(),
+                player: Default::default(),
+                equipment: Default::default(),
+                trim_overrides: Default::default(),
+                trims: Default::default(),
+                root: root.to_path_buf(),
+            },
+            waypoint_styles: Default::default(),
+            boat_models: boats::BoatModels {
+                models: Default::default(),
+                chest_models: Default::default(),
+                water_patch: None,
+            },
+            cart_models: minecarts::CartModels {
+                models: Default::default(),
+            },
+            crystal_model: None,
+            cushion_model: None,
+            dragon_model: None,
+            arrow_model: None,
+            bee_stinger_model: None,
+            trident_model: None,
+            entity_models: EntityModels::default(),
+            creative_screen: horizon_client::creative::Creative::empty(),
+        }
+    }
+
+    #[cfg(not(feature = "dedicated-server"))]
     pub(super) fn load(
         root: &std::path::Path,
         document: Option<&horizon_client::mobs::EntityModelDocument>,
@@ -198,6 +239,7 @@ pub(super) struct Loaded {
 
 /// What the background loader publishes: the menu bundle as soon as it is
 /// ready, then the core bundle with a handle to the rest worker.
+#[cfg(not(feature = "dedicated-server"))]
 pub(super) enum LoaderMsg {
     Ui(UiResources, PathBuf),
     Done(std::result::Result<Loaded, String>),
@@ -244,6 +286,7 @@ impl WorldRestLoader {
     }
 }
 
+#[cfg(not(feature = "dedicated-server"))]
 pub(super) fn write_report(game: &Game<'_>) -> Result<()> {
     if let Some(path) = &game.options.report {
         let report = serde_json::json!({
@@ -262,6 +305,7 @@ pub(super) fn write_report(game: &Game<'_>) -> Result<()> {
 
 /// The ordinary launch: load the resources on a worker while the window shows
 /// the loading screen, then swap in the game on the main thread.
+#[cfg(not(feature = "dedicated-server"))]
 pub(super) fn run_loading(
     options: Options,
     settings: Settings,

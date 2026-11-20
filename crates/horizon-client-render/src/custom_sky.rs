@@ -113,3 +113,8 @@ pub fn load(root: &Path) -> Arc<dyn SkyLayers> {
         .custom_sky(root)
         .unwrap_or_else(|| Arc::new(NoLayers))
 }
+
+/// An empty sky layer set for targets that do not render worlds.
+pub fn empty() -> Arc<dyn SkyLayers> {
+    Arc::new(NoLayers)
+}

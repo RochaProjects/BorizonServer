@@ -15,7 +15,7 @@ path = "../horizon-client/src/client_lib.rs"
 [dependencies]
 horizon-assets = { path = "../horizon-assets" }
 horizon-client-core = { path = "../horizon-client-core" }
-horizon-client-input = { path = "../horizon-client-input" }
+horizon-client-input = { path = "../horizon-client-input", default-features = false }
 horizon-client-render = { path = "../horizon-client-render", default-features = false }
 horizon-command = { path = "../horizon-command" }
 horizon-items = { path = "../horizon-items" }
@@ -43,14 +43,14 @@ horizon-anticheat = { path = "../horizon-anticheat" }
 # Shader packs: reading them and turning their GLSL into naga modules.
 horizon-shaders = { path = "../horizon-shaders" }
 # Horizon's own shader packs: the format, the stages and the check (docs/shaders.md).
-horizon-shader-api = { path = "../horizon-shader-api" }
+horizon-shader-api = { path = "../horizon-shader-api", default-features = false }
 # The narrator (GameNarrator): text-to-speech of chat, system messages and screens.
 horizon-narrator = { path = "../horizon-narrator" }
 # Horizon mods: sandboxed WebAssembly components, off unless installed and turned on (docs/mods.md).
 # Their runtime is the `mods` feature.
 horizon-mods = { path = "../horizon-mods", default-features = false }
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "naga-ir"] }
-winit = "0.30.13"
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 pollster = "0.4"
 bytemuck = { version = "1.24", features = ["derive"] }
 glam = "0.30"
@@ -60,9 +60,9 @@ sha2 = "0.10.9"
 sha1 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["raw_value"] }
-# hlsl-out: the gfx.rs tests translate every shader as wgpu's DirectX 12 backend does. A normal feature,
-# not a dev-dependency's, so builds, tests and examples share one build of naga, wgpu and this crate.
-naga = { version = "30.0.1", features = ["wgsl-in", "hlsl-out"] }
+# Shared WGSL input is needed by the engine. GPU output backends are enabled by
+# client-graphics for the client and by this crate's dev-dependency for tests.
+naga = { version = "30.0.1", features = ["wgsl-in"] }
 miniz_oxide = "0.8"
 ab_glyph = "0.2.32"
 log = "0.4"
@@ -118,7 +118,10 @@ audio = ["horizon-client-render/audio"]
 controllers = ["dep:gilrs", "horizon-client-input/controllers"]
 client-graphics = [
     "horizon-client-render/client-graphics",
+    "horizon-client-input/client-windowing",
+    "horizon-shader-api/shader-backends",
 ]
+server-event-types = ["horizon-client-input/server-event-types"]
 # `horizon-ctl mcp` is a separate control binary; the dedicated game engine does not link it.
 mcp = ["dep:horizon-mcp"]
 # Legacy client mod registry/index. Dedicated server builds omit it.

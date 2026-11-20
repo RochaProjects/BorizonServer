@@ -1,6 +1,6 @@
 //! Shared server command and player data used by the dedicated server and its extension bridges.
 //! The legacy client trait API re-exports these types for source compatibility.
-use crate::text::Text;
+use horizon_client_core::text::Text;
 
 /// One player's sidebar sent by the server runtime.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -9,7 +9,7 @@ pub struct ServerSidebar {
     pub lines: Vec<(Text, Option<Text>)>,
 }
 /// A player on the server, as held by the server.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub struct ServerPlayer {
     pub uuid: u128,
@@ -151,7 +151,7 @@ pub struct ServerCommandResult {
 }
 
 /// A command of the server: vanilla's or one a server extension registered.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ServerCommandInfo {
     /// Its own name, an alias resolved (`teleport` for `tp`).

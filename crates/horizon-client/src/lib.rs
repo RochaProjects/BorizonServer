@@ -9,7 +9,7 @@ pub mod game;
 #[cfg(feature = "client-graphics")]
 mod horizon_look;
 pub mod mod_api;
-pub mod server_api;
+pub use horizon_server_api as server_api;
 
 #[cfg(test)]
 mod brewing_speed_load_tests;

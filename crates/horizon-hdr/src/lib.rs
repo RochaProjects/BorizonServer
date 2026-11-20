@@ -3,7 +3,7 @@
 //! without it a compositor may clip or tone-map everything above 1.0 (80 nits)
 //! of an scRGB swapchain.
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "wayland-color-management"))]
 pub mod wayland;
 
 /// Opens a Vulkan device with `VK_EXT_hdr_metadata` too, when the GPU offers

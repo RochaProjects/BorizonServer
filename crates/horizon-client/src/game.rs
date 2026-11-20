@@ -240,6 +240,7 @@ mod level_particles;
 mod levels;
 mod lightning;
 mod llamas;
+#[cfg(not(feature = "dedicated-server"))]
 mod loading_screen;
 mod loading_window;
 mod locator_bar;
@@ -357,6 +358,7 @@ mod natural_spawning;
 mod nautili;
 mod net_harness;
 mod nether_portal;
+#[cfg(not(feature = "dedicated-server"))]
 mod no_resources;
 mod occlusion_culling;
 mod ominous_item_spawner;
@@ -421,6 +423,7 @@ mod repro;
 mod resource_load;
 mod resource_loader;
 mod resource_tables;
+mod resource_validation;
 mod respawn_anchor;
 mod saves_control;
 mod saving;
@@ -454,6 +457,7 @@ mod spectator;
 mod spill;
 mod splash_water;
 mod split;
+#[cfg(not(feature = "dedicated-server"))]
 mod startup_menu;
 mod station_control;
 mod stations;
@@ -580,12 +584,10 @@ use key_codes::{
     glfw_button, glfw_modifiers, keyboard_button,
 };
 use launch_options::Options;
-use loading_screen::{
-    App, Loading, leave_fullscreen_after, missing_resources, run_event_loop, unclean_start_recovery,
-};
-use loading_window::{
-    build_renderer, loading_frame, loading_renderer, prepare_renderer_textures, start_game,
-};
+#[cfg(not(feature = "dedicated-server"))]
+use loading_screen::{App, Loading, leave_fullscreen_after, run_event_loop};
+use loading_window::start_game;
+use loading_window::{build_renderer, loading_frame, loading_renderer, prepare_renderer_textures};
 pub use machines::native_fluids::NativeFluidTank;
 pub use maps::{NativeMapDecoration, NativeMapInfo};
 pub use native_block_entity_draw::BlockEntityDraw;
@@ -611,10 +613,12 @@ pub use native_world_draw::NativeWorldDraw;
 pub use native_world_edit::{NativeBlockEdit, NativeBlockNbt, NativeBlockRun, NativeHeightmap};
 pub use native_world_read::NativeBlockReadError;
 use resource_load::{Progress, launch_world, load_resources, named_scope, synchronous_startup};
-use resource_loader::{
-    EntityModels, GameCpuResources, Loaded, LoaderMsg, PendingWorldEntry, WorldRestLoader,
-    run_loading, write_report,
-};
+use resource_loader::{EntityModels, GameCpuResources, Loaded, PendingWorldEntry, WorldRestLoader};
+#[cfg(not(feature = "dedicated-server"))]
+use resource_loader::{LoaderMsg, run_loading, write_report};
+use resource_validation::missing_resources;
+#[cfg(not(feature = "dedicated-server"))]
+use resource_validation::unclean_start_recovery;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -11386,6 +11390,7 @@ impl<'a> Game<'a> {
         prepared: Option<GameCpuResources>,
     ) -> Result<Self> {
         let root = options.resources.clone();
+        let dedicated = options.execution_role == execution_role::ExecutionRole::DedicatedServer;
         let registry = pack.assets.registry;
         // Until a world is opened the streamer is idle.
         let mut streaming = Streaming::new(
@@ -11401,9 +11406,13 @@ impl<'a> Game<'a> {
                 .join(".horizon-title"),
             horizon_client::save::LevelShape::OVERWORLD,
         ));
-        let prepared = prepared
-            .map(Ok)
-            .unwrap_or_else(|| GameCpuResources::load(&root, None))?;
+        let prepared = match prepared {
+            Some(prepared) => prepared,
+            #[cfg(not(feature = "dedicated-server"))]
+            None => GameCpuResources::load(&root, None)?,
+            #[cfg(feature = "dedicated-server")]
+            None => return Err("dedicated Game construction requires server resources".into()),
+        };
         let world = World::new(res.facts().air, 0);
         let tutorial = tutorial::Tutorial::new(tutorial::Step::from_option(
             settings.file.int("tutorialStep"),
@@ -11415,11 +11424,15 @@ impl<'a> Game<'a> {
         let slow_frame_ms = options
             .spikes
             .unwrap_or(horizon_client::client_perf::SLOW_FRAME_MS);
-        let particles = horizon_client::particles::ParticleEngine::new(
-            &root,
-            &gui.atlas.sprites,
-            &gui.atlas.translucent,
-        );
+        let particles = if dedicated {
+            horizon_client::particles::ParticleEngine::empty()
+        } else {
+            horizon_client::particles::ParticleEngine::new(
+                &root,
+                &gui.atlas.sprites,
+                &gui.atlas.translucent,
+            )
+        };
         let mut game = Game {
             world_biomes: None,
             world_biomes_base: None,
@@ -11875,9 +11888,13 @@ impl<'a> Game<'a> {
             social: Default::default(),
             debug_keys: Default::default(),
             debug_charts: Default::default(),
-            debug_entries: horizon_client::debug_entries::DebugEntries::load(
-                &std::env::current_dir().unwrap_or_default(),
-            ),
+            debug_entries: if dedicated {
+                Default::default()
+            } else {
+                horizon_client::debug_entries::DebugEntries::load(
+                    &std::env::current_dir().unwrap_or_default(),
+                )
+            },
             debug_options: None,
             memory_meter: Default::default(),
             debug_paint: Default::default(),
@@ -12090,7 +12107,14 @@ fn load_world_rest(
         } else {
             Default::default()
         };
-        Ok((animate, horizon_client::fog::FogTables::load(root, biomes)))
+        // Fog rules affect only the client's rendered view. A dedicated server
+        // keeps the empty table and avoids reopening every biome file.
+        let fog = if draws {
+            horizon_client::fog::FogTables::load(root, biomes)
+        } else {
+            Default::default()
+        };
+        Ok((animate, fog))
     };
     let load_mobs = || -> Result<_> {
         let _step = startup::step("rest.mobs");
@@ -12120,19 +12144,25 @@ fn load_world_rest(
     let load_transformers = || -> Result<_> {
         let _step = startup::step("rest.transformers_models");
         let transformers = horizon_client::block_transform::Transformers::load(root, registry)?;
-        let player_type = match entity_models {
-            Some(document) => perspective::player_type_with_document(root, document),
-            None => perspective::player_type(root),
+        let models = if draws {
+            let player_type = match entity_models {
+                Some(document) => perspective::player_type_with_document(root, document),
+                None => perspective::player_type(root),
+            };
+            (
+                player_type,
+                player_arms(root, "minecraft:player#main", entity_models),
+                player_arms(root, "minecraft:player_slim#main", entity_models),
+                match entity_models {
+                    Some(document) => document.model("minecraft:spin_attack#main"),
+                    None => horizon_client::mobs::load_model(root, "minecraft:spin_attack#main"),
+                },
+            )
+        } else {
+            // These models are consumed by perspective and entity rendering;
+            // server movement and combat use their simulation state instead.
+            (None, [None, None], [None, None], None)
         };
-        let models = (
-            player_type,
-            player_arms(root, "minecraft:player#main", entity_models),
-            player_arms(root, "minecraft:player_slim#main", entity_models),
-            match entity_models {
-                Some(document) => document.model("minecraft:spin_attack#main"),
-                None => horizon_client::mobs::load_model(root, "minecraft:spin_attack#main"),
-            },
-        );
         Ok((transformers, models))
     };
     // The errors cross threads as text.
@@ -12167,14 +12197,22 @@ fn load_world_rest(
                 startup::time("rest.providers", || Providers::load(root))
             });
             let music = named_scope(scope, "music", || {
-                startup::time("rest.music", || {
-                    horizon_client::music::MusicTables::load(root)
-                })
+                if draws {
+                    startup::time("rest.music", || {
+                        horizon_client::music::MusicTables::load(root)
+                    })
+                } else {
+                    Default::default()
+                }
             });
             let ambient = named_scope(scope, "ambient", || {
-                startup::time("rest.ambient", || {
-                    horizon_client::ambience::AmbientTables::load(root)
-                })
+                if draws {
+                    startup::time("rest.ambient", || {
+                        horizon_client::ambience::AmbientTables::load(root)
+                    })
+                } else {
+                    Default::default()
+                }
             });
             let nether_environment = named_scope(scope, "nether_environment", || {
                 startup::time("rest.nether_environment", || {
@@ -12209,12 +12247,20 @@ fn load_world_rest(
             text(load_mobs()),
             text(load_transformers()),
             Providers::load(root),
-            startup::time("rest.music", || {
-                horizon_client::music::MusicTables::load(root)
-            }),
-            startup::time("rest.ambient", || {
-                horizon_client::ambience::AmbientTables::load(root)
-            }),
+            if draws {
+                startup::time("rest.music", || {
+                    horizon_client::music::MusicTables::load(root)
+                })
+            } else {
+                Default::default()
+            },
+            if draws {
+                startup::time("rest.ambient", || {
+                    horizon_client::ambience::AmbientTables::load(root)
+                })
+            } else {
+                Default::default()
+            },
             startup::time("rest.nether_environment", || {
                 text(Environment::load_dimension(root, "the_nether"))
             }),
@@ -12287,17 +12333,20 @@ pub fn run_with() -> Result<()> {
     {
         return Ok(());
     }
-    // The packets the server sends its players reach the mods that ask (native_packets.rs).
-    let _ = horizon_client::lan::conn::SERVER_PACKET.set(Game::native_server_packet);
-    let _ = horizon_client::lan::conn::ENTITY_DATA_TO.set(Game::native_entity_data_to);
-    let _ = horizon_client::health::HURT_SERVER.set(native_hooks::hurt_server);
-    let _ = horizon_client::health::DAMAGE_PRE.set(native_hooks::damage_pre);
-    let _ = horizon_client::health::DAMAGE_POST.set(native_hooks::damage_post);
-    let _ = horizon_client::block_contact::HOOK.set(native_hooks::block_contact);
-    let _ = horizon_client::health::KNOCKBACK.set(native_hooks::knockback);
-    let _ = horizon_client::lan::hub::PLAYER_MOVE.set(Game::native_player_move);
-    let _ = horizon_client::lan::hub::PLAYER_TELEPORT.set(Game::native_player_teleport);
-    let _ = horizon_client::block_contact::TRAMPLE.set(Game::native_trample);
+    // The dedicated target dispatches through the public `.so` host. Keep the
+    // legacy in-process hook chain installed only for the client runtime.
+    if options.execution_role.is_client() {
+        let _ = horizon_client::lan::conn::SERVER_PACKET.set(Game::native_server_packet);
+        let _ = horizon_client::lan::conn::ENTITY_DATA_TO.set(Game::native_entity_data_to);
+        let _ = horizon_client::health::HURT_SERVER.set(native_hooks::hurt_server);
+        let _ = horizon_client::health::DAMAGE_PRE.set(native_hooks::damage_pre);
+        let _ = horizon_client::health::DAMAGE_POST.set(native_hooks::damage_post);
+        let _ = horizon_client::block_contact::HOOK.set(native_hooks::block_contact);
+        let _ = horizon_client::health::KNOCKBACK.set(native_hooks::knockback);
+        let _ = horizon_client::lan::hub::PLAYER_MOVE.set(Game::native_player_move);
+        let _ = horizon_client::lan::hub::PLAYER_TELEPORT.set(Game::native_player_teleport);
+        let _ = horizon_client::block_contact::TRAMPLE.set(Game::native_trample);
+    }
     // Before any worker starts: on Linux they go behind the server thread
     // and the render thread.
     horizon_threads::put_helpers_behind();
@@ -12337,9 +12386,7 @@ pub fn run_with() -> Result<()> {
         &std::path::absolute(&vanilla_root).unwrap_or_else(|_| vanilla_root.clone()),
     );
     if let Some(error) = missing_resources(&vanilla_root, horizon_hooks::engine::get_the_game()) {
-        // The game build started by hand (the release's zip), not by the
-        // launcher: a window says where to get it. Scripts and servers get
-        // the error.
+        #[cfg(not(feature = "dedicated-server"))]
         if !options.offscreen && !synchronous_startup(&options) {
             log::error!("Horizon: {error}");
             let settings = Settings::load(&Game::options_path());
@@ -12347,100 +12394,113 @@ pub fn run_with() -> Result<()> {
         }
         return Err(error.into());
     }
-    // Someone is playing: the anonymous ping behind the launcher's "N playing now", and the
-    // official server in their list (servers.dat in the game folder, the working directory). Not
-    // for a server, a benchmark, a run that quits by itself, a harness's fixture or a run that
-    // horizon-ctl drives: those start in a source checkout and wrote the list there.
-    if !options.offscreen && !synchronous_startup(&options) {
-        let version = horizon_client::telemetry::version();
-        let game_dir = horizon_client::logging::player_dir();
-        horizon_hooks::engine::started(&horizon_hooks::Started::new(&version, &game_dir));
-    }
-    mods::register_components(&vanilla_root)?;
-    mods::register_standalone_models();
-    mods::register_layer_definitions();
-    let mut early_settings = Settings::load(&Game::options_path());
-    // The player's Polytone pack options (#11486), before any pack is read.
-    horizon_client::packs::set_polytone_choices(horizon_client::packs::load_polytone_choices(
-        &horizon_client::packs::polytone_choices_file(),
-    ));
-    // Minecraft.<init>: read the last start's flag, then mark this one as not
-    // finished until onGameLoadFinished. A dedicated server has no options.txt.
-    if options.execution_role.is_client() {
-        if unclean_start_recovery(&mut early_settings) {
-            log::warn!(
-                "Detected unexpected shutdown during last game startup: resetting fullscreen mode"
-            );
+    #[cfg(feature = "dedicated-server")]
+    {
+        if options.execution_role != execution_role::ExecutionRole::DedicatedServer {
+            return Err("the dedicated-server build requires --dedicated".into());
         }
-        early_settings.file.set(
-            "startedCleanly",
-            horizon_client::options_file::V::Bool(false),
-        );
-        early_settings.save(&Game::options_path());
+        return dedicated::run(options, vanilla_root, started);
     }
-    // Minecraft's constructor opens the narrator; a server has none.
-    if options.execution_role.is_client() {
-        narrator::start(&early_settings);
-    }
-    // A game window's hooks (Discord's presence): never for a server.
-    activity::client_started(&options);
-    // Snapshots of derived tables live in the game folder, never beside the
-    // shared resources.
-    Behaviours::set_cache_dir(std::env::current_dir()?.join(".horizon-cache"));
-    if !synchronous_startup(&options) {
-        return run_loading(options, early_settings, vanilla_root, None, started);
-    }
-    let (root, pack_error) =
-        startup_menu::startup_resource_root(&vanilla_root, &early_settings, &options.dev_mods);
-    options.resources = root;
-    if let Some(error) = &pack_error {
-        log::warn!("Horizon: resource packs not applied: {error}");
-    }
-    let loaded = load_resources(
-        options.resources.clone(),
-        launch_world(&options),
-        &vanilla_root,
-        &early_settings,
-        started,
-        false,
-        options.dedicated.is_some(),
-        &Progress::new(),
-        &mut |_, _| {},
-    )?;
-    let gui = loaded.gui.ok_or("missing menu bundle")?;
-    options.resources = loaded.root.clone();
-    let audio = if !options.execution_role.is_client() || options.headless {
-        Audio::silent(&options.resources)
-    } else {
-        Audio::with_device(&options.resources, &early_settings.sound_device)
-    };
-    let resources = loaded.resources;
-    let game = start_game(
-        &resources,
-        loaded.pack,
-        gui,
-        options,
-        loaded.pack_error.or(pack_error),
-        audio,
-        vanilla_root,
-        started,
-        loaded.rest_loader,
-        None,
-        None,
-        loaded.entity_models,
-    )?;
-    if let Some(mut game) = game {
-        // Minecraft.onGameLoadFinished: a start that made it this far is clean.
-        if game.options.execution_role.is_client() {
-            game.settings.file.set(
+    #[cfg(not(feature = "dedicated-server"))]
+    {
+        if options.execution_role == execution_role::ExecutionRole::DedicatedServer {
+            return dedicated::run(options, vanilla_root, started);
+        }
+        // Someone is playing: the anonymous ping behind the launcher's "N playing now", and the
+        // official server in their list (servers.dat in the game folder, the working directory). Not
+        // for a server, a benchmark, a run that quits by itself, a harness's fixture or a run that
+        // horizon-ctl drives: those start in a source checkout and wrote the list there.
+        if !options.offscreen && !synchronous_startup(&options) {
+            let version = horizon_client::telemetry::version();
+            let game_dir = horizon_client::logging::player_dir();
+            horizon_hooks::engine::started(&horizon_hooks::Started::new(&version, &game_dir));
+        }
+        mods::register_components(&vanilla_root)?;
+        mods::register_standalone_models();
+        mods::register_layer_definitions();
+        let mut early_settings = Settings::load(&Game::options_path());
+        // The player's Polytone pack options (#11486), before any pack is read.
+        horizon_client::packs::set_polytone_choices(horizon_client::packs::load_polytone_choices(
+            &horizon_client::packs::polytone_choices_file(),
+        ));
+        // Minecraft.<init>: read the last start's flag, then mark this one as not
+        // finished until onGameLoadFinished. A dedicated server has no options.txt.
+        if options.execution_role.is_client() {
+            if unclean_start_recovery(&mut early_settings) {
+                log::warn!(
+                    "Detected unexpected shutdown during last game startup: resetting fullscreen mode"
+                );
+            }
+            early_settings.file.set(
                 "startedCleanly",
-                horizon_client::options_file::V::Bool(true),
+                horizon_client::options_file::V::Bool(false),
             );
-            game.settings.save(&Game::options_path());
+            early_settings.save(&Game::options_path());
         }
-        run_event_loop(game)?;
+        // Minecraft's constructor opens the narrator; a server has none.
+        if options.execution_role.is_client() {
+            narrator::start(&early_settings);
+        }
+        // A game window's hooks (Discord's presence): never for a server.
+        activity::client_started(&options);
+        // Snapshots of derived tables live in the game folder, never beside the
+        // shared resources.
+        Behaviours::set_cache_dir(std::env::current_dir()?.join(".horizon-cache"));
+        if !synchronous_startup(&options) {
+            return run_loading(options, early_settings, vanilla_root, None, started);
+        }
+        let (root, pack_error) =
+            startup_menu::startup_resource_root(&vanilla_root, &early_settings, &options.dev_mods);
+        options.resources = root;
+        if let Some(error) = &pack_error {
+            log::warn!("Horizon: resource packs not applied: {error}");
+        }
+        let loaded = load_resources(
+            options.resources.clone(),
+            launch_world(&options),
+            &vanilla_root,
+            &early_settings,
+            started,
+            false,
+            false,
+            &Progress::new(),
+            &mut |_, _| {},
+        )?;
+        let gui = loaded.gui.ok_or("missing menu bundle")?;
+        options.resources = loaded.root.clone();
+        let audio = if !options.execution_role.is_client() || options.headless {
+            Audio::silent(&options.resources)
+        } else {
+            Audio::with_device(&options.resources, &early_settings.sound_device)
+        };
+        let resources = loaded.resources;
+        let game = start_game(
+            &resources,
+            loaded.pack,
+            gui,
+            options,
+            loaded.pack_error.or(pack_error),
+            audio,
+            vanilla_root,
+            started,
+            loaded.rest_loader,
+            None,
+            None,
+            loaded.entity_models,
+        )?;
+        if let Some(mut game) = game {
+            // Minecraft.onGameLoadFinished: a start that made it this far is clean.
+            if game.options.execution_role.is_client() {
+                game.settings.file.set(
+                    "startedCleanly",
+                    horizon_client::options_file::V::Bool(true),
+                );
+                game.settings.save(&Game::options_path());
+            }
+            run_event_loop(game)?;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// The right and left arms of a player model layer (`PlayerModel.rightArm`
@@ -12553,12 +12613,14 @@ fn reset_world_progress(adv: &mut advancements::AdvState, stats: &mut stats::Sta
 }
 
 #[cfg(test)]
+#[cfg(not(feature = "dedicated-server"))]
 mod startup_cpu_tests;
 
 #[cfg(test)]
 mod runtime_reset_tests;
 
 #[cfg(test)]
+#[cfg(not(feature = "dedicated-server"))]
 mod entity_model_loading_tests;
 
 /// `LocalPlayer.moveTowardsClosestSpace` at the body's four corners (aiStep, unless a spectator or a

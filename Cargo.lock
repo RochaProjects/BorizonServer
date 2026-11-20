@@ -1556,6 +1556,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-client-backends"
+version = "0.1.0"
+dependencies = [
+ "wgpu",
+]
+
+[[package]]
 name = "horizon-client-core"
 version = "0.1.0"
 dependencies = [
@@ -1650,6 +1657,7 @@ dependencies = [
  "glam",
  "half",
  "horizon-assets",
+ "horizon-client-backends",
  "horizon-client-core",
  "horizon-client-input",
  "horizon-command",

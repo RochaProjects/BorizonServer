@@ -50,7 +50,6 @@ horizon-narrator = { path = "../horizon-narrator" }
 # Their runtime is the `mods` feature.
 horizon-mods = { path = "../horizon-mods", default-features = false }
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "naga-ir"] }
-wgpu-vulkan = { package = "wgpu", version = "30.0.1", default-features = false, features = ["vulkan"], optional = true }
 winit = "0.30.13"
 pollster = "0.4"
 bytemuck = { version = "1.24", features = ["derive"] }
@@ -98,12 +97,10 @@ dunce = "1.0.5"
 # DirectX 12, where Vulkan has no adapter or device, or by choice (`graphicsApi`, graphics.rs).
 # Shaders compile with FXC (d3dcompiler_47.dll, part of Windows), or on integrated GPUs with DXC
 # (dxcompiler.dll beside the game, gfx/dx12_compiler.rs).
-wgpu-dx12 = { package = "wgpu", version = "30.0.1", default-features = false, features = ["dx12"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Splitscreen: a window filling a monitor goes over its menu bar (game/split/windows.rs
 # `above_menu_bar`); all already in the tree through winit and wgpu.
-wgpu-metal = { package = "wgpu", version = "30.0.1", default-features = false, features = ["metal"], optional = true }
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSWindow", "NSScreen"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSString"] }
@@ -111,7 +108,6 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 # OpenGL (WGL on Windows, EGL on Linux), the last fallback, for GPUs with no Vulkan or
 # DirectX 12 driver (`graphicsApi`, graphics.rs).
-wgpu-gles = { package = "wgpu", version = "30.0.1", default-features = false, features = ["gles"], optional = true }
 
 [features]
 default = ["audio", "controllers", "client-graphics", "mcp", "legacy-mod-index"]
@@ -121,10 +117,6 @@ audio = ["horizon-client-render/audio"]
 # Controllers: gilrs, and the DualSense's own output. Without it only `horizon-ctl pad`'s virtual pad.
 controllers = ["dep:gilrs", "horizon-client-input/controllers"]
 client-graphics = [
-    "dep:wgpu-vulkan",
-    "dep:wgpu-metal",
-    "dep:wgpu-dx12",
-    "dep:wgpu-gles",
     "horizon-client-render/client-graphics",
 ]
 # `horizon-ctl mcp` is a separate control binary; the dedicated game engine does not link it.

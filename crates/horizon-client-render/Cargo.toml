@@ -9,6 +9,7 @@ description = "The client's world data, rendering and screens: chunks, meshing, 
 [dependencies]
 # The settings stores of the crates above the engine (docs/layers.md, "Platform registries").
 horizon-hooks = { path = "../horizon-hooks" }
+horizon-client-backends = { path = "../horizon-client-backends", optional = true }
 # The GUI atlas's pixels, kept compressed once uploaded (hud.rs `pack_pixels`).
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
 horizon-assets = { path = "../horizon-assets" }
@@ -58,30 +59,17 @@ symphonia = { version = "0.5", default-features = false, features = ["ogg", "vor
 unicode-bidi = "0.3.18"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "naga-ir"] }
-wgpu-vulkan = { package = "wgpu", version = "30.0.1", default-features = false, features = ["vulkan"], optional = true }
 winit = "0.30.13"
 zip = { version = "9.1.3", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = ["std", "time"] }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-wgpu-metal = { package = "wgpu", version = "30.0.1", default-features = false, features = ["metal"], optional = true }
-
-[target.'cfg(windows)'.dependencies]
-wgpu-dx12 = { package = "wgpu", version = "30.0.1", default-features = false, features = ["dx12"], optional = true }
-
-[target.'cfg(not(target_os = "macos"))'.dependencies]
-wgpu-gles = { package = "wgpu", version = "30.0.1", default-features = false, features = ["gles"], optional = true }
-
 [features]
 default = ["client-graphics"]
 # Optional platform backends are used by the client renderer, not a headless server.
 client-graphics = [
-    "dep:wgpu-vulkan",
-    "dep:wgpu-metal",
-    "dep:wgpu-dx12",
-    "dep:wgpu-gles",
+    "dep:horizon-client-backends",
     "horizon-hdr/vulkan-backend",
 ]
 # Sound output: horizon-client's `audio` feature.

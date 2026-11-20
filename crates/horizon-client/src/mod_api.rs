@@ -66,6 +66,12 @@ pub use crate::mobs::{Mob, MobWorld};
 pub use crate::music::{Music, MusicLayer};
 pub use crate::particles::{ParticleOptions, ParticleType};
 pub use crate::recipe_book::RecipeBookCategory;
+// Type aliases keep the legacy trait-hook generator's export scan working;
+// the canonical records live in the generic server API module.
+pub type ServerPlayer = crate::server_api::ServerPlayer;
+pub type ServerCommand = crate::server_api::ServerCommand;
+pub type ServerCommandResult = crate::server_api::ServerCommandResult;
+pub type ServerCommandInfo = crate::server_api::ServerCommandInfo;
 pub use crate::server_api::{
     ServerCommand as NativeCommand, ServerCommandInfo as NativeCommandInfo,
     ServerCommandResult as NativeCommandResult, ServerPlayer as NativeServerPlayer,

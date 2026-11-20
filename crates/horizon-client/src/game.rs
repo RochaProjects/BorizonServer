@@ -261,6 +261,10 @@ mod mob_index;
 mod mob_looting;
 mod mob_sounds;
 mod mod_api_host;
+#[cfg(feature = "legacy-mod-index")]
+mod mod_browser;
+#[cfg(not(feature = "legacy-mod-index"))]
+#[path = "game/mod_browser_stub.rs"]
 mod mod_browser;
 mod mods;
 mod mount_menu;
@@ -332,7 +336,8 @@ mod native_recipes;
 mod native_registry_name;
 mod native_reload_listeners;
 mod native_scene;
-mod native_server;
+pub(crate) mod server_runtime;
+pub(crate) use server_runtime as native_server;
 mod native_shaders;
 mod native_slot_roles;
 mod native_structures;
@@ -2909,7 +2914,7 @@ struct Game<'a> {
     lan: Option<lan::LanHost>,
     /// Per-connection objectives already created for server plugin sidebars.
     /// Keeping the objective alive avoids a visible blink on every refresh.
-    native_sidebars: HashMap<u128, (u32, native_server::NativeSidebar)>,
+    native_sidebars: HashMap<u128, (u32, horizon_client::server_api::ServerSidebar)>,
     /// Single player's server thread, which `remote` is connected to.
     integrated: Option<integrated::Integrated>,
     /// The shapes of the open world's levels, from its dimension types.

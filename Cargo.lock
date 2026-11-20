@@ -1480,14 +1480,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "horizon-bots"
-version = "0.1.0"
-dependencies = [
- "horizon-protocol",
- "serde_json",
-]
-
-[[package]]
 name = "horizon-chat-filter"
 version = "0.1.0"
 dependencies = [
@@ -1522,7 +1514,6 @@ dependencies = [
  "horizon-cosmetics",
  "horizon-dualsense",
  "horizon-friends",
- "horizon-hdr",
  "horizon-hooks",
  "horizon-items",
  "horizon-mod-api-gen",
@@ -1606,7 +1597,6 @@ dependencies = [
  "horizon-client-render",
  "horizon-command",
  "horizon-core",
- "horizon-hdr",
  "horizon-hooks",
  "horizon-items",
  "horizon-mcp",

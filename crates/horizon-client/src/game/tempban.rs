@@ -4,9 +4,9 @@
 //! they treat any ban, and it survives a restart. Operators of level 3 (`/ban`'s level) run it as a player; the
 //! console takes the same words without the slash. `/tempbanlist` lists the bans that end by themselves, with
 //! the time left. Vanilla has no such commands: they reach operators' command trees (completions included)
-//! as a native mod's commands do (`moderation_commands`), and the game runs them itself.
+//! as server extension commands do (`moderation_commands`), and the game runs them itself.
 use super::{Game, chat_filter::Reply, dedicated, lan::LanHost};
-use horizon_client::{mod_api::NativeCommand, text::Text};
+use horizon_client::{server_api::ServerCommand, text::Text};
 use horizon_protocol::packets::play::{self, Clientbound as C};
 use horizon_protocol::text::translatable;
 use horizon_server_files::duration::{duration_text, now_millis, parse_duration};
@@ -21,7 +21,7 @@ pub(super) const TEMPBAN_COMMANDS: [&str; 2] = ["tempban", "tempbanlist"];
 /// Horizon's moderation commands in operators' command trees (`command_tree`'s usages, for operators of
 /// `/ban`'s level): the mute commands when the server filters chat (`chat_filter`), `/tempban` and
 /// `/tempbanlist` on a dedicated server (`dedicated`), where the game runs them.
-pub(super) fn moderation_commands(chat_filter: bool, dedicated: bool) -> Vec<NativeCommand> {
+pub(super) fn moderation_commands(chat_filter: bool, dedicated: bool) -> Vec<ServerCommand> {
     let mut usages = Vec::new();
     if chat_filter {
         usages.extend(super::chat_filter::MUTE_USAGES);
@@ -34,7 +34,7 @@ pub(super) fn moderation_commands(chat_filter: bool, dedicated: bool) -> Vec<Nat
     }
     usages
         .into_iter()
-        .map(|usage| NativeCommand::op(usage, TEMPBAN_LEVEL))
+        .map(|usage| ServerCommand::op(usage, TEMPBAN_LEVEL))
         .collect()
 }
 

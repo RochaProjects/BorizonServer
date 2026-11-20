@@ -45,6 +45,10 @@ pub use crate::game::{
     NativeShake, NativeStructureBlock, NativeStructureTemplate, NativeWorldDraw,
 };
 pub use crate::gamerules::Value as GameRuleValue;
+pub use crate::server_api::{
+    ServerCommand as NativeCommand, ServerCommandInfo as NativeCommandInfo,
+    ServerCommandResult as NativeCommandResult, ServerPlayer as NativeServerPlayer,
+};
 /// What a mod asks of the terrain's picture each frame (`native_world_hold`). API 414.
 pub use crate::gfx::WorldHold;
 pub use crate::gfx::native_render::{
@@ -661,76 +665,6 @@ pub struct NativeFishingMedium {
     pub lure_ticks: Option<(i32, i32)>,
 }
 
-/// A player on the server, as a server hook sees them.
-#[derive(Clone, Debug, PartialEq)]
-#[non_exhaustive]
-pub struct NativeServerPlayer {
-    pub uuid: u128,
-    pub name: String,
-    /// The operator level, 0 to 4 (`ops.json`; single player's owner with
-    /// cheats on is 4).
-    pub permission: u8,
-    /// `minecraft:overworld`, `minecraft:the_nether`, `minecraft:the_end`.
-    pub dimension: String,
-    pub position: [f64; 3],
-    /// 0 survival, 1 creative, 2 adventure, 3 spectator.
-    pub game_mode: i32,
-    /// Health points, 20 at full; 0 once dead. API 21.
-    pub health: f32,
-    /// Where they look, in degrees (`yRot`, `xRot`), as their last move told
-    /// the server. API 49.
-    pub yaw: f32,
-    pub pitch: f32,
-    /// The network entity id the player has this session, the one hooks that only know entity ids
-    /// (`living_incoming_damage`, `living_knockback`) give for the player; 0 when not known.
-    /// API 398.
-    pub entity_id: i32,
-    /// The IP address the player connects from (behind a Velocity proxy: the address the proxy forwards);
-    /// empty when not known. API 407.
-    pub address: String,
-    /// The connection's round-trip time in milliseconds, as the keep-alive measured it and the
-    /// player list shows it (`ServerCommonPacketListenerImpl.latency`). The fields below are API
-    /// @API:server_player_state@; 0, false or None where the server does not hold them.
-    pub latency: i32,
-    /// The protocol version the client connected with (the server's own: others are refused).
-    pub protocol: i32,
-    /// The experience level and the progress to the next one, 0 to 1.
-    pub xp_level: i32,
-    pub xp_progress: f32,
-    /// On the ground, as the player's last accepted move said.
-    pub on_ground: bool,
-    /// The player's abilities as the client is told them (`Abilities.flying`, `mayfly`,
-    /// `invulnerable`, `walkingSpeed`, `flyingSpeed`): speeds 0.1 and 0.05 by default.
-    pub flying: bool,
-    pub may_fly: bool,
-    pub invulnerable: bool,
-    pub walk_speed: f32,
-    pub fly_speed: f32,
-    /// Holding sneak (`Player.isShiftKeyDown`).
-    pub sneaking: bool,
-    /// The eyes' height above the feet in the current pose (`Entity.getEyeHeight`): 1.62
-    /// standing, 1.27 crouching, 0.4 swimming or gliding, 0.2 asleep.
-    pub eye_height: f32,
-    /// The selected hotbar slot, 0 to 8.
-    pub selected_slot: u8,
-    /// The name a server mod shows for the player (`native_set_nickname`), if one does.
-    pub nickname: Option<String>,
-    /// The level a player needs to see this one, when a server mod hid them
-    /// (`native_hide_player`).
-    pub hidden: Option<u8>,
-    /// A fake player: a mod's bot with no client (`native_set_player_fake`), so a mod need not
-    /// build anything for it that only a client could show. API @API:server_player_fake@.
-    pub fake: bool,
-    /// Whether the player is using an item (`LivingEntity.isUsingItem`), and blocking with a
-    /// shield (using one). API @API:server_player_state@.
-    pub using_item: bool,
-    pub blocking: bool,
-    /// Sprinting (`Player.isSprinting`) and gliding with an elytra (`isFallFlying`).
-    /// API @API:server_player_state@.
-    pub sprinting: bool,
-    pub gliding: bool,
-}
-
 /// What a player's client told the server about itself, and what the server sent it
 /// (`native_player_client`). API @API:player_client@.
 #[derive(Clone, Debug, PartialEq)]
@@ -750,104 +684,6 @@ pub struct NativeClientInfo {
     pub sent_chunks: usize,
     /// The bytes received from and sent to it on the wire, where the connection counts them.
     pub wire_bytes: Option<(u64, u64)>,
-}
-
-/// A command a native mod adds, as one usage: words, then arguments
-/// `<name:kind>`, optional ones last in brackets `[name:kind]`:
-/// `pay <player:player> <amount:integer>`, `balance [player:player]`,
-/// `eco give <player:player> <amount:integer>`. Kinds: `word`, `text` (the
-/// rest of the line, last), `integer`, `number`, `boolean`, `player`,
-/// `item`, `block_pos`; and the kinds whose completions the player's client
-/// asks the server for (`native_tab_complete_v2`): `word?`, `text?` and
-/// `player_name` (a word, any name accepted, that the server completes with
-/// the online players' names). Usages of one command share their words; the
-/// server merges them into one tree.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct NativeCommand {
-    pub usage: String,
-    /// The operator level a player needs to see and run it (0: everyone).
-    pub level: u8,
-    /// The permission node that decides instead, when set
-    /// ([`NativeCommand::permission`]). API @API:command_permission@.
-    pub permission: Option<String>,
-    /// Whether the usage replaces vanilla's command of its name
-    /// ([`NativeCommand::replace_vanilla`]).
-    pub replace_vanilla: bool,
-}
-
-impl NativeCommand {
-    /// A usage every player may run.
-    pub fn new(usage: &str) -> Self {
-        Self {
-            usage: usage.to_owned(),
-            level: 0,
-            permission: None,
-            replace_vanilla: false,
-        }
-    }
-    /// The same, for operators of `level` and above.
-    pub fn op(usage: &str, level: u8) -> Self {
-        Self {
-            usage: usage.to_owned(),
-            level: level.min(4),
-            permission: None,
-            replace_vanilla: false,
-        }
-    }
-    /// The same, for the players who have the permission node `node`
-    /// (Bukkit's `plugin.yml` `permission:`): the server asks
-    /// `native_has_permission(player, node, level)` before it shows or runs
-    /// the usage, so a permissions mod grants or refuses it whatever the
-    /// player's level, and without one the level decides as before. Each
-    /// usage has its own node: a command's root is shown when any of its
-    /// usages is allowed, and a line runs as the usage its words match.
-    /// API @API:command_permission@.
-    pub fn permission(mut self, node: &str) -> Self {
-        self.permission = Some(node.to_owned());
-        self
-    }
-    /// The same, replacing vanilla's command of this name (Bukkit's plugin
-    /// command over a vanilla one, as Tab's `/bossbar`): vanilla's tree of
-    /// the name is left out of the players' trees, and their lines of it go
-    /// to the mods, which then answer every usage of it. Without it, a usage
-    /// of a vanilla name is left out.
-    pub fn replace_vanilla(mut self, on: bool) -> Self {
-        self.replace_vanilla = on;
-        self
-    }
-}
-
-/// What a command a mod ran did (`native_run_command_captured`): whether it
-/// ran without failing, its result and the lines it answered with, in order.
-#[derive(Clone, Debug, Default, PartialEq)]
-#[non_exhaustive]
-pub struct NativeCommandResult {
-    pub ran: bool,
-    /// Vanilla's `CommandResultCallback` value: the sum of the successful
-    /// results (one for a plain command, one per fork of `execute as @a run`),
-    /// 0 when it failed (`execute if entity` of nobody). A mod's command gives
-    /// 1 when a mod ran it.
-    pub result: i32,
-    pub output: Vec<Text>,
-}
-
-/// A command of the server (`native_command_info`): vanilla's or one a mod
-/// registered.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct NativeCommandInfo {
-    /// Its own name, an alias resolved (`teleport` for `tp`).
-    pub name: String,
-    /// The other names that run it (`tp` for `teleport`).
-    pub aliases: Vec<String>,
-    /// Its usages: vanilla's one line, as `/help` gives it, or each usage a
-    /// mod registered.
-    pub usages: Vec<String>,
-    /// The operator level a player needs to run it (0: everyone).
-    pub level: u8,
-    /// Whether vanilla has it; false for a mod's.
-    pub vanilla: bool,
 }
 
 /// Which `Game` observes the phase; a mirror `Game` never fires.

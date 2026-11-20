@@ -509,6 +509,7 @@ fn live_switch_of(
 /// built with (`built`: its [`BUILD_INFO`], empty for a release or Nightly) and that has no row
 /// yet. The page said "No mods" before, and players copied the files into `horizon-mods` (#4770).
 /// Its toggle is the `mod.<id>` line the launcher's next build follows.
+#[cfg(feature = "legacy-mod-index")]
 fn not_built(dir: &std::path::Path, built: &str, rows: &[Installed]) -> Vec<Installed> {
     let info: serde_json::Value = serde_json::from_str(built).unwrap_or_default();
     let in_build = |id: &str| {
@@ -540,6 +541,11 @@ fn not_built(dir: &std::path::Path, built: &str, rows: &[Installed]) -> Vec<Inst
         }
     }
     out
+}
+
+#[cfg(not(feature = "legacy-mod-index"))]
+fn not_built(_dir: &std::path::Path, _built: &str, _rows: &[Installed]) -> Vec<Installed> {
+    Vec::new()
 }
 
 /// A WebAssembly code mod's row on the Mods page.
@@ -1152,6 +1158,7 @@ mod tests {
         assert_eq!(native_mods_detail(r#"{"mods":[]}"#), None);
     }
 
+    #[cfg(feature = "legacy-mod-index")]
     #[test]
     fn native_mods_installed_but_not_built_get_a_row_saying_so() {
         let dir = std::env::temp_dir().join(format!("horizon-not-built-{}", std::process::id()));

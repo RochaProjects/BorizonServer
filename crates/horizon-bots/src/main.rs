@@ -843,6 +843,29 @@ fn join(o: &Options, name: &str) -> Result<Connection, String> {
     }
     loop {
         let (id, body) = c.recv().map_err(err)?;
+        if id == cb::RESOURCE_PACK_PUSH {
+            let configuration::Clientbound::ResourcePackPush(pack) =
+                configuration::Clientbound::decode(id, &body).map_err(err)?
+            else {
+                continue;
+            };
+            // Synthetic clients do not download assets, but they must finish the
+            // configuration task and become visible players. Mirror vanilla's
+            // status sequence so the server releases the login reservation.
+            for action in [3, 4, 0] {
+                c.send(
+                    &configuration::Serverbound::ResourcePack(
+                        configuration::ResourcePackResponse {
+                            id: pack.id,
+                            action,
+                        },
+                    )
+                    .encode(),
+                )
+                .map_err(err)?;
+            }
+            continue;
+        }
         let reply = match id {
             cb::SELECT_KNOWN_PACKS
             | cb::KEEP_ALIVE

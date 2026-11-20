@@ -1,0 +1,83 @@
+# This publishes the Borizon server runtime bundle. It does not build or publish an AuraEssentials .so.
+name: Borizon server release
+
+on:
+  push:
+    # The current host loader still requests this legacy tag and asset naming.
+    tags: ["aura-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Legacy-compatible server release tag already pushed (for example aura-v0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: borizon-server-release
+  cancel-in-progress: false
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Pin the checked out fork commit
+        run: echo "HORIZON_REVISION=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+
+      - name: Restore Rust build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-rust-1.99-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-rust-1.99-${{ hashFiles('Cargo.lock') }}-
+            ${{ runner.os }}-server-plugin-rust-1.99-${{ hashFiles('Cargo.lock') }}-
+            ${{ runner.os }}-rust-1.99-
+          save-always: true
+
+      - name: Build server engine, server supervisor, and resource preparer
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p horizon-client --no-default-features --features server-plugins,dedicated-server --bin horizon-client
+          cargo build --locked --release -p horizon-server -p horizon-prepare
+          mkdir -p dist/borizon-server
+          cp target/release/horizon-server dist/borizon-server/
+          cp target/release/horizon-prepare dist/borizon-server/
+          cp target/release/horizon-client dist/borizon-server/horizon-engine
+          cp research-lock.json LICENSE dist/borizon-server/
+          chmod +x dist/borizon-server/horizon-server dist/borizon-server/horizon-prepare dist/borizon-server/horizon-engine
+          # Keep the manifest/asset filenames expected by already-deployed loader.jar versions.
+          printf '{"engine":"vanilla-horizon","plugin_abi":3,"horizon":"%s","minecraft":"26.3"}\n' "$HORIZON_REVISION" > dist/borizon-server/auraessentials-release.json
+          tar -czf dist/aura-essentials-server-linux-x86_64.tar.gz -C dist borizon-server
+          sha256sum dist/aura-essentials-server-linux-x86_64.tar.gz > dist/aura-essentials-server-linux-x86_64.tar.gz.sha256
+
+      - name: Publish GitHub Release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-${GITHUB_REF_NAME}}"
+          [[ "$tag" =~ ^aura-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Borizon Server ${tag#aura-v}" \
+            --notes "Runtime servidor Borizon para Minecraft 26.3. Linux x86_64; inclui horizon-server, horizon-engine e horizon-prepare com host de plugins C ABI v3. Este pacote não compila nem contém plugins .so; eles são distribuídos separadamente." \
+            dist/aura-essentials-server-linux-x86_64.tar.gz \
+            dist/aura-essentials-server-linux-x86_64.tar.gz.sha256

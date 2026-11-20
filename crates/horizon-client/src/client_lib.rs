@@ -96,6 +96,7 @@ pub mod menu;
 pub mod merchant;
 pub mod mobs;
 pub mod mod_content;
+#[cfg(feature = "legacy-mod-index")]
 pub mod mod_registry;
 pub mod motion;
 pub mod multiplayer;

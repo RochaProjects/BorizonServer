@@ -16,14 +16,14 @@ path = "../horizon-client/src/client_lib.rs"
 horizon-assets = { path = "../horizon-assets" }
 horizon-client-core = { path = "../horizon-client-core" }
 horizon-client-input = { path = "../horizon-client-input" }
-horizon-client-render = { path = "../horizon-client-render" }
+horizon-client-render = { path = "../horizon-client-render", default-features = false }
 horizon-command = { path = "../horizon-command" }
 horizon-items = { path = "../horizon-items" }
 horizon-core = { path = "../horizon-core" }
 # Extension points for the crates above the engine (docs/layers.md, "How a Horizon crate plugs in").
 horizon-hooks = { path = "../horizon-hooks" }
 # `horizon-ctl mcp`: the Model Context Protocol, shared with the launcher and the server.
-horizon-mcp = { path = "../horizon-mcp" }
+horizon-mcp = { path = "../horizon-mcp", optional = true }
 # The server thread ahead of the workers (MinecraftServer.spin's Thread.setPriority).
 horizon-optifine = { path = "../horizon-optifine" }
 horizon-threads = { path = "../horizon-threads" }
@@ -32,7 +32,6 @@ horizon-perf-format = { path = "../horizon-perf-format" }
 # One pool of helper threads for the server tick's parallel phases (`parallel.rs`): threads made
 # once, not for every phase of every tick.
 rayon = "1.10"
-horizon-hdr = { path = "../horizon-hdr" }
 horizon-world = { path = "../horizon-world" }
 horizon-protocol = { path = "../horizon-protocol" }
 # server.properties, eula.txt and the user lists, shared with horizon-server.
@@ -49,8 +48,9 @@ horizon-shader-api = { path = "../horizon-shader-api" }
 horizon-narrator = { path = "../horizon-narrator" }
 # Horizon mods: sandboxed WebAssembly components, off unless installed and turned on (docs/mods.md).
 # Their runtime is the `mods` feature.
-horizon-mods = { path = "../horizon-mods", default-features = false, features = ["index"] }
-wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "metal", "wgsl", "naga-ir"] }
+horizon-mods = { path = "../horizon-mods", default-features = false }
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "naga-ir"] }
+wgpu-vulkan = { package = "wgpu", version = "30.0.1", default-features = false, features = ["vulkan"], optional = true }
 winit = "0.30.13"
 pollster = "0.4"
 bytemuck = { version = "1.24", features = ["derive"] }
@@ -98,11 +98,12 @@ dunce = "1.0.5"
 # DirectX 12, where Vulkan has no adapter or device, or by choice (`graphicsApi`, graphics.rs).
 # Shaders compile with FXC (d3dcompiler_47.dll, part of Windows), or on integrated GPUs with DXC
 # (dxcompiler.dll beside the game, gfx/dx12_compiler.rs).
-wgpu = { version = "30.0.1", default-features = false, features = ["dx12"] }
+wgpu-dx12 = { package = "wgpu", version = "30.0.1", default-features = false, features = ["dx12"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Splitscreen: a window filling a monitor goes over its menu bar (game/split/windows.rs
 # `above_menu_bar`); all already in the tree through winit and wgpu.
+wgpu-metal = { package = "wgpu", version = "30.0.1", default-features = false, features = ["metal"], optional = true }
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSWindow", "NSScreen"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSString"] }
@@ -110,15 +111,26 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 # OpenGL (WGL on Windows, EGL on Linux), the last fallback, for GPUs with no Vulkan or
 # DirectX 12 driver (`graphicsApi`, graphics.rs).
-wgpu = { version = "30.0.1", default-features = false, features = ["gles"] }
+wgpu-gles = { package = "wgpu", version = "30.0.1", default-features = false, features = ["gles"], optional = true }
 
 [features]
-default = ["audio", "controllers"]
+default = ["audio", "controllers", "client-graphics", "mcp", "legacy-mod-index"]
 # Sound output. Without it (and `controllers`) the program links neither libasound nor libudev on
 # Linux: the server build (`--no-default-features`, released as horizon-engine; docs/server.md).
 audio = ["horizon-client-render/audio"]
 # Controllers: gilrs, and the DualSense's own output. Without it only `horizon-ctl pad`'s virtual pad.
 controllers = ["dep:gilrs", "horizon-client-input/controllers"]
+client-graphics = [
+    "dep:wgpu-vulkan",
+    "dep:wgpu-metal",
+    "dep:wgpu-dx12",
+    "dep:wgpu-gles",
+    "horizon-client-render/client-graphics",
+]
+# `horizon-ctl mcp` is a separate control binary; the dedicated game engine does not link it.
+mcp = ["dep:horizon-mcp"]
+# Legacy client mod registry/index. Dedicated server builds omit it.
+legacy-mod-index = ["horizon-mods/index"]
 # Records the call sites of mob random draws (`mob_ai_probe` traces).
 rng-trace = ["horizon-core/rng-trace"]
 # Compatibility with earlier experiment commands: main already uses mimalloc.
@@ -142,6 +154,7 @@ naga = { version = "30.0.1", features = ["wgsl-in", "hlsl-out", "msl-out", "spv-
 [[bin]]
 name = "horizon-ctl"
 path = "../horizon-client/src/bin/horizon-ctl/main.rs"
+required-features = ["mcp"]
 
 [[example]]
 name = "chunk_load_bench"

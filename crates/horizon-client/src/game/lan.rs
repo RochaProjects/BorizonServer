@@ -266,8 +266,8 @@ pub(super) struct LanHost {
     /// (game/native_server.rs).
     pub native_commands: Option<HashMap<String, u8>>,
     /// The usages behind them, as the mods registered them (each with its own
-    /// permission node, `NativeCommand::permission`).
-    pub native_usages: Vec<horizon_client::mod_api::NativeCommand>,
+    /// permission node, `ServerCommand::permission`).
+    pub native_usages: Vec<horizon_client::server_api::ServerCommand>,
     /// The players a native mod leaves out of the sleep count when they
     /// aren't in bed (`native_sleep_ignored`).
     pub sleep_ignored: std::collections::HashSet<u128>,

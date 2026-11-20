@@ -2,17 +2,19 @@
 //! is linked here, while plugin logic stays in independently built libraries.
 
 #[cfg(feature = "server-plugins")]
-use super::native_server::NativeSidebar;
-#[cfg(feature = "server-plugins")]
 use super::native_world_edit::NativeHeightmap;
 use super::{
     Game,
-    native_server::{NativeCommand, NativeServerPlayer},
+    native_server::{ServerCommand, ServerPlayer},
 };
 #[cfg(feature = "server-plugins")]
 use horizon_client::{
-    items::ItemStack, lan::data::component_nbt, mod_api::GameRuleValue, text::Text,
+    items::ItemStack, lan::data::component_nbt, text::Text,
 };
+#[cfg(feature = "server-plugins")]
+use horizon_core::gamerules::Value as GameRuleValue;
+#[cfg(feature = "server-plugins")]
+use horizon_client::server_api::ServerSidebar;
 #[cfg(feature = "server-plugins")]
 use horizon_server_plugin_loader::{Event, Host, ItemDelta, MenuItem, TransactionError};
 #[cfg(feature = "server-plugins")]
@@ -64,12 +66,12 @@ static SERVER_PLUGIN_TICK: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "server-plugins")]
 struct GameHost<'g, 'a, 'c> {
     game: &'g mut Game<'a>,
-    commands: Option<&'c mut Vec<NativeCommand>>,
+    commands: Option<&'c mut Vec<ServerCommand>>,
     suggestions: Option<Vec<String>>,
     /// The guest whose completion request is being handled. During this path
     /// `Game::lan` is temporarily taken by the LAN tick, so player.get cannot
     /// discover this player through the game's global guest list.
-    requester: Option<NativeServerPlayer>,
+    requester: Option<ServerPlayer>,
 }
 
 #[cfg(feature = "server-plugins")]
@@ -788,7 +790,7 @@ impl Host for GameHost<'_, '_, '_> {
 
     fn register_command(&mut self, usage: &str) {
         if let Some(commands) = self.commands.as_deref_mut() {
-            commands.push(NativeCommand::new(usage));
+            commands.push(ServerCommand::new(usage));
         }
     }
 
@@ -1035,7 +1037,7 @@ impl Host for GameHost<'_, '_, '_> {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0)
                     .min(4) as u8;
-                let mut command = NativeCommand::op(usage, level);
+                let mut command = ServerCommand::op(usage, level);
                 if let Some(permission) = data.get("permission").and_then(|v| v.as_str()) {
                     if permission.is_empty() || permission.len() > 128 {
                         return fail("invalid_permission");
@@ -1552,7 +1554,7 @@ impl Host for GameHost<'_, '_, '_> {
                 } else {
                     horizon_client::packs::component(title)
                 };
-                let mut sidebar = NativeSidebar {
+                let mut sidebar = ServerSidebar {
                     title,
                     lines: Vec::with_capacity(lines.len()),
                 };
@@ -2260,14 +2262,14 @@ fn root() -> Option<std::path::PathBuf> {
 }
 
 #[cfg(feature = "server-plugins")]
-pub(super) fn register_commands(game: &mut Game<'_>, commands: &mut Vec<NativeCommand>) {
+pub(super) fn register_commands(game: &mut Game<'_>, commands: &mut Vec<ServerCommand>) {
     if game.options.dedicated.is_none() {
         return;
     }
     let Some(root) = root() else {
         return;
     };
-    commands.push(NativeCommand::new("plugins"));
+    commands.push(ServerCommand::new("plugins"));
     let mut host = GameHost {
         game,
         commands: Some(commands),
@@ -2292,7 +2294,7 @@ pub(super) fn permission_value(
 #[cfg(feature = "server-plugins")]
 pub(super) fn perform_command(
     game: &mut Game<'_>,
-    player: &NativeServerPlayer,
+    player: &ServerPlayer,
     command: &str,
     ran: &mut bool,
 ) {
@@ -2338,7 +2340,7 @@ pub(super) fn tab_complete(
     game: &mut Game<'_>,
     player: u128,
     line: &str,
-    requester: Option<NativeServerPlayer>,
+    requester: Option<ServerPlayer>,
 ) -> Vec<String> {
     if game.options.dedicated.is_none() {
         return Vec::new();
@@ -2419,7 +2421,7 @@ pub(super) fn tab_complete(
     _: &mut Game<'_>,
     _: u128,
     _: &str,
-    _: Option<NativeServerPlayer>,
+    _: Option<ServerPlayer>,
 ) -> Vec<String> {
     Vec::new()
 }
@@ -2691,7 +2693,7 @@ pub(super) fn resource_pack_status(
 }
 
 #[cfg(not(feature = "server-plugins"))]
-pub(super) fn register_commands(_: &mut Game<'_>, _: &mut Vec<NativeCommand>) {}
+pub(super) fn register_commands(_: &mut Game<'_>, _: &mut Vec<ServerCommand>) {}
 
 #[cfg(not(feature = "server-plugins"))]
 pub(super) fn permission_value(_: &Game<'_>, _: u128, _: &str, _: u8) -> Option<bool> {
@@ -2699,7 +2701,7 @@ pub(super) fn permission_value(_: &Game<'_>, _: u128, _: &str, _: u8) -> Option<
 }
 
 #[cfg(not(feature = "server-plugins"))]
-pub(super) fn perform_command(_: &mut Game<'_>, _: &NativeServerPlayer, _: &str, _: &mut bool) {}
+pub(super) fn perform_command(_: &mut Game<'_>, _: &ServerPlayer, _: &str, _: &mut bool) {}
 
 #[cfg(not(feature = "server-plugins"))]
 pub(super) fn menu_clicked(_: &mut Game<'_>, _: u128, _: i32, _: i32, _: i32, _: i32) {}

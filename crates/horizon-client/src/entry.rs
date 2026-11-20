@@ -9,12 +9,20 @@ pub fn main() {
 /// Start the game with trait mods in dispatch order.
 pub fn main_with(mods: crate::mod_api::Mods) {
     // First: a trait injection into anything below (logging, the crash handler) calls its mod.
+    #[cfg(not(feature = "dedicated-server"))]
     if crate::mod_api::MODS.set(mods).is_err() {
         log::warn!("Trait mods already installed; ignoring the second list");
+    }
+    // The dedicated server uses the separate, versioned `.so` server-plugin API. The old
+    // in-process Rust trait-mod runtime is intentionally not installed in that target.
+    #[cfg(feature = "dedicated-server")]
+    if !mods.is_empty() {
+        log::warn!("Ignoring Rust trait mods in the dedicated server; use server plugins instead");
     }
     horizon_threads::configure_allocator();
     // The platform's features the dedicated server loads from server.toml, through the engine's hooks.
     horizon_chat_filter::install();
+    #[cfg(feature = "client-graphics")]
     crate::horizon_look::give();
     // OptiFine's and Polytone's pack formats (platform, docs/layers.md), before any pack loads.
     horizon_client::pack_formats::install();
@@ -64,6 +72,7 @@ pub fn main_with(mods: crate::mod_api::Mods) {
         (logging::game_home(), "client", "Render thread")
     };
     // Before the log opens, so a mod's injection hears its first lines.
+    #[cfg(not(feature = "dedicated-server"))]
     logging::set_line_hook(crate::native_client_hooks::native_log_line);
     if !help {
         logging::init(
@@ -74,6 +83,73 @@ pub fn main_with(mods: crate::mod_api::Mods) {
         log::info!("Horizon {}", crash::version());
         crash::install(home.clone(), side);
     }
+    #[cfg(not(feature = "dedicated-server"))]
+    install_legacy_trait_mod_hooks();
+    raise_open_file_limit();
+    if let Err(error) = game::run_with() {
+        // A bad command line is the caller's mistake, not a crash: no report.
+        let usage = error.is::<game::UsageError>();
+        log::error!("Horizon: {error}");
+        logging::flush();
+        // The report's path is the last line on stderr (crash::SAVED_LINE).
+        if !help && !usage {
+            crash::report_error(&home, side, &*error);
+        }
+        // Started from Explorer, the console window closes with the game:
+        // keep the message on screen until it is read.
+        #[cfg(windows)]
+        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            eprintln!("Press Enter to close.");
+            let _ = std::io::stdin().read_line(&mut String::new());
+        }
+        std::process::exit(if usage {
+            game::exit_code::USAGE
+        } else {
+            game::exit_code::ERROR
+        });
+    }
+    horizon_hooks::engine::shutdown();
+    logging::flush();
+}
+
+/// The JVM raises its open-file limit to the hard limit as it starts
+/// (`-XX:+MaxFDLimit`, on by default), so a vanilla server may hold as many
+/// sockets and region files as the host allows, not the soft default (often
+/// 1024 in a container). The same here; macOS caps it at `OPEN_MAX`, as the
+/// JVM does there.
+fn raise_open_file_limit() {
+    #[cfg(unix)]
+    {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+        let limit = getrlimit(Resource::Nofile);
+        let hard = if cfg!(target_os = "macos") {
+            Some(limit.maximum.map_or(10_240, |h| h.min(10_240)))
+        } else {
+            limit.maximum
+        };
+        let raised = match (limit.current, hard) {
+            (Some(soft), Some(hard)) => hard > soft,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if raised {
+            let to = Rlimit {
+                current: hard,
+                maximum: limit.maximum,
+            };
+            match setrlimit(Resource::Nofile, to) {
+                Ok(()) => log::info!(
+                    "Open file limit raised from {:?} to {hard:?}",
+                    limit.current
+                ),
+                Err(e) => log::warn!("Open file limit stays at {:?}: {e}", limit.current),
+            }
+        }
+    }
+}
+#[cfg(not(feature = "dedicated-server"))]
+fn install_legacy_trait_mod_hooks() {
+    // The client build installs the legacy trait-mod hooks. Dedicated servers use `.so` plugins.
     let renderers = crate::mod_api::mods()
         .iter()
         .filter_map(|m| m.render())
@@ -297,66 +373,5 @@ pub fn main_with(mods: crate::mod_api::Mods) {
     .is_err()
     {
         log::warn!("Native sound hook already installed; keeping the first callback");
-    }
-    raise_open_file_limit();
-    if let Err(error) = game::run_with() {
-        // A bad command line is the caller's mistake, not a crash: no report.
-        let usage = error.is::<game::UsageError>();
-        log::error!("Horizon: {error}");
-        logging::flush();
-        // The report's path is the last line on stderr (crash::SAVED_LINE).
-        if !help && !usage {
-            crash::report_error(&home, side, &*error);
-        }
-        // Started from Explorer, the console window closes with the game:
-        // keep the message on screen until it is read.
-        #[cfg(windows)]
-        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-            eprintln!("Press Enter to close.");
-            let _ = std::io::stdin().read_line(&mut String::new());
-        }
-        std::process::exit(if usage {
-            game::exit_code::USAGE
-        } else {
-            game::exit_code::ERROR
-        });
-    }
-    horizon_hooks::engine::shutdown();
-    logging::flush();
-}
-
-/// The JVM raises its open-file limit to the hard limit as it starts
-/// (`-XX:+MaxFDLimit`, on by default), so a vanilla server may hold as many
-/// sockets and region files as the host allows, not the soft default (often
-/// 1024 in a container). The same here; macOS caps it at `OPEN_MAX`, as the
-/// JVM does there.
-fn raise_open_file_limit() {
-    #[cfg(unix)]
-    {
-        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
-        let limit = getrlimit(Resource::Nofile);
-        let hard = if cfg!(target_os = "macos") {
-            Some(limit.maximum.map_or(10_240, |h| h.min(10_240)))
-        } else {
-            limit.maximum
-        };
-        let raised = match (limit.current, hard) {
-            (Some(soft), Some(hard)) => hard > soft,
-            (Some(_), None) => true,
-            (None, _) => false,
-        };
-        if raised {
-            let to = Rlimit {
-                current: hard,
-                maximum: limit.maximum,
-            };
-            match setrlimit(Resource::Nofile, to) {
-                Ok(()) => log::info!(
-                    "Open file limit raised from {:?} to {hard:?}",
-                    limit.current
-                ),
-                Err(e) => log::warn!("Open file limit stays at {:?}: {e}", limit.current),
-            }
-        }
     }
 }

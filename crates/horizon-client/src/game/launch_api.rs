@@ -143,8 +143,19 @@ fn content() -> serde_json::Value {
         "resourcepack": { "format": horizon_core::version::RESOURCE_PACK_FORMAT },
         "datapack": { "format": horizon_core::version::DATA_PACK_FORMAT },
         "modpack": { "format": horizon_mods::modpack::FORMAT },
-        "index": { "schema": horizon_mods::index::SCHEMA },
+        "index": { "schema": mod_index_schema() },
     })
+}
+
+fn mod_index_schema() -> u32 {
+    #[cfg(feature = "legacy-mod-index")]
+    {
+        horizon_mods::index::SCHEMA
+    }
+    #[cfg(not(feature = "legacy-mod-index"))]
+    {
+        0
+    }
 }
 
 /// `--launch-api`'s reply for a build of this `horizon` version.

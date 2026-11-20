@@ -8,9 +8,11 @@ static ALLOCATOR: horizon_threads::GameAllocator = horizon_threads::GAME_ALLOCAT
 /// The mod API level this game serves, kept in the program for the launcher
 /// to read without running it (`horizon_mods::api_level::MARK`). `main`
 /// reads it, so the linker keeps it.
+#[cfg(not(feature = "dedicated-server"))]
 static MOD_API_LEVEL: [u8; 27] = horizon_mods::api_level::MARK;
 
 fn main() {
+    #[cfg(not(feature = "dedicated-server"))]
     std::hint::black_box(&MOD_API_LEVEL);
     horizon_client::entry::main();
 }

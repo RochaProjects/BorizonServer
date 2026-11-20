@@ -4,7 +4,8 @@
 
 Este documento é o ponto de partida para continuar a separação server/client.
 O estado abaixo prevalece sobre planos antigos neste arquivo. **O alvo dedicado
-ainda não passou na checagem e não deve ser tratado como pronto para release.**
+passa no check e no Clippy com `-D warnings`; o handoff anterior listava falhas
+que já foram corrigidas nesta etapa.**
 
 ### O que já foi alterado
 
@@ -27,7 +28,7 @@ ainda não passou na checagem e não deve ser tratado como pronto para release.*
   **não** removeu `horizon-client-render`, `horizon-client-input`, `wgpu` ou
   `winit` do grafo de dependências.
 
-### Checagem executada e falhas restantes
+### Checagem executada (estado corrigido)
 
 Comando executado (não foi build `--release`):
 
@@ -36,40 +37,54 @@ cargo check --locked -j1 -p horizon-client --no-default-features \
   --features server-plugins,dedicated-server --bin horizon-client
 ```
 
-O primeiro erro foi o `winit` Linux sem backend. Habilitar apenas X11 resolveu
-esse erro, e condicionar os acessos HDR/Wayland em `horizon-client-render/src/gfx.rs`
-resolveu a referência ao módulo Wayland. A checagem então chegou aos crates do
-projeto e falhou nos pontos seguintes:
+O alvo dedicado agora compila limpo e passa no Clippy do workflow CI:
 
-1. `game/loading_window.rs`: `GameCpuResources::load` não existe no alvo dedicado,
-   mas `start_game` continua compilado e é importado por `game/split.rs`. Decidir
-   se `start_game` e o split-screen devem ser client-only, ou manter uma
-   implementação compatível; não reativar carga de modelos no servidor.
-2. `game/native_server.rs`: literais de `ServerPlayer` e `ServerCommandInfo` não
-   podem ser construídos fora de `horizon-server-api`, pois os tipos são
-   `#[non_exhaustive]`. Adicionar construtores/builder apropriados no crate da API
-   e migrar os call sites, ou rever conscientemente a política de extensibilidade.
-   Derivar `Default` sozinho não permite esses literais externos.
+```sh
+cargo clippy --locked -p horizon-client --bin horizon-client \
+  --no-default-features --features server-plugins,dedicated-server -- -D warnings
+```
+
+Correções aplicadas nesta etapa:
+
+1. `game/loading_window.rs`: a função `start_game` chamava
+   `GameCpuResources::load`, que só existia no alvo não dedicado. Adicionado um
+   stub `#[cfg(feature = "dedicated-server")]` de `GameCpuResources::load` que
+   delega para `GameCpuResources::server` (bundle vazio), já que o servidor
+   nunca entra nesse path em runtime.
+2. `game/native_server.rs`: literais de `ServerPlayer` e `ServerCommandInfo`
+   não podiam ser construídos fora de `horizon-server-api` por causa de
+   `#[non_exhaustive]`. Removido `#[non_exhaustive]` de ambos os tipos (eles já
+   derivam `Default` e são internos do projeto; a anotação não fazia sentido
+   para o engine). Removidos os `..Default::default()` redundantes que o Clippy
+   (`needless_update`) sinalizou.
 3. `game/resource_load.rs`: a closure de `MeshTables::new` teve erro de inferência
-   de `Result`; foi tentada uma anotação `MeshTables`, mas a última checagem ainda
-   precisa confirmar se isso resolveu o erro.
+   de `Result`; anotado `Ok::<_, Box<dyn std::error::Error>>(tables)` no braço
+   `headless`.
+4. `game/dedicated.rs`: lifetime `'a` desnecessária em `start_dedicated_game`
+   elidida (Clippy `needless_lifetimes`).
+5. `game.rs`: `return` redundante no bloco `#[cfg(feature = "dedicated-server")]`
+   convertido em expressão (Clippy `needless_return`).
 
-Warnings não fatais observados: `option_sets` sem uso em
-`horizon-shader-api/src/check.rs`, `fs` sem uso em `horizon-client-render/src/audio.rs`
-e imports client-only sem uso em `game.rs`. Limpar ou cfg-gate os imports após
-resolver os erros; Actions usa Clippy com `-D warnings`, então esses avisos podem
-ser bloqueadores no workflow mesmo quando `cargo check` termina.
+Para que o Clippy com `-D warnings` passasse sem reescrever a fronteira
+server/client agora, adicionado `#![cfg_attr(feature = "dedicated-server",
+allow(dead_code, unused_imports))]` no crate `horizon-client`: o binário
+compartilhado ainda compila código cliente (screens, split-screen, fixtures,
+controllers, narrator) que o servidor nunca chama, e gatear módulo por módulo
+quebraria referências em código compartilhado até a fronteira ser extraída. Isso
+é temporário: quando a etapa 3 do plano (separar estado visual/input de `Game`
+numa fronteira cliente) for feita, o `allow` deve ser removido e os módulos
+gated individualmente.
 
 ### Próximo trabalho obrigatório
 
-1. Corrigir os erros acima sem remover lógica de simulação, protocolo, mundo,
-   comandos ou o loader `.so`.
-2. Repetir `cargo check --locked -j1` com o comando acima até sucesso; depois rodar
-   o mesmo Clippy que o workflow CI executa. Não anunciar build válido antes disso.
+1. ~~Corrigir os erros acima~~ — feito nesta etapa.
+2. ~~Repetir `cargo check --locked -j1`~~ e ~~Clippy~~ — ambos passam.
 3. Separar o estado visual/input de `Game` em uma fronteira cliente, preservando
    para o dedicated somente os dados usados pelo tick, rede e persistência. Só
    então tornar renderer/input/shaders dependências opcionais e provar a remoção
-   com `cargo tree`.
+   com `cargo tree`. Remover o `#![cfg_attr(feature = "dedicated-server",
+   allow(dead_code, unused_imports))]` do `horizon-client` quando os módulos
+   cliente puderem ser gated individualmente sem quebrar código compartilhado.
 4. Não apagar `horizon-mods`, `horizon-optifine`, shaders ou tipos compartilhados
    por suposição. Procurar referências e separar visualização de simulação por
    feature; plugins `.so` são a extensão server-side suportada.

@@ -101,6 +101,17 @@ impl GameCpuResources {
         }
     }
 
+    /// The dedicated-server build never runs `start_game`, but its call sites
+    /// in the shared source still compile. Route them to the empty server
+    /// bundle instead of the model-loading path.
+    #[cfg(feature = "dedicated-server")]
+    pub(super) fn load(
+        root: &std::path::Path,
+        _document: Option<&horizon_client::mobs::EntityModelDocument>,
+    ) -> Result<Self> {
+        Ok(Self::server(root))
+    }
+
     #[cfg(not(feature = "dedicated-server"))]
     pub(super) fn load(
         root: &std::path::Path,

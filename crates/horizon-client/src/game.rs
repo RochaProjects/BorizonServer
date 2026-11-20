@@ -12399,7 +12399,7 @@ pub fn run_with() -> Result<()> {
         if options.execution_role != execution_role::ExecutionRole::DedicatedServer {
             return Err("the dedicated-server build requires --dedicated".into());
         }
-        return dedicated::run(options, vanilla_root, started);
+        dedicated::run(options, vanilla_root, started)
     }
     #[cfg(not(feature = "dedicated-server"))]
     {

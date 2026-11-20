@@ -322,7 +322,6 @@ fn vanilla_command_info(d: &Dispatcher, label: &str) -> Option<ServerCommandInfo
             .collect(),
         level: d.nodes[node].permission,
         vanilla: true,
-        ..Default::default()
     })
 }
 
@@ -374,7 +373,6 @@ pub(super) fn server_player(host: &LanHost, g: &horizon_client::lan::guest::Gues
         blocking,
         sprinting: g.sprinting,
         gliding: g.fall_flying,
-        ..Default::default()
     }
 }
 
@@ -992,7 +990,6 @@ impl Game<'_> {
                 && self.held().is_some_and(|s| &*s.item == "minecraft:shield"),
             sprinting: p.sprinting,
             gliding: p.fall_flying,
-            ..Default::default()
         })
     }
     /// The permission level of a player who is on the server or joining it:
@@ -1122,7 +1119,6 @@ impl Game<'_> {
                     .collect(),
                 level,
                 vanilla: false,
-                ..Default::default()
             });
         }
         let d = vanilla::game_dispatcher_with_features(&self.level.enabled_features);

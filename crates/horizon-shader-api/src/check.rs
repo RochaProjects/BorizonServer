@@ -589,6 +589,7 @@ fn cost(module: &naga::Module) -> (usize, usize) {
 
 /// The option values a pack is translated with: its defaults, then every
 /// option at its minimum, then at its maximum.
+#[cfg(feature = "shader-backends")]
 fn option_sets(options: &[PackOption]) -> [(&'static str, Vec<(String, f64)>); 3] {
     let at = |pick: fn(&OptionKind) -> f64| {
         options

@@ -456,7 +456,7 @@ pub(super) fn load_resources(
         // tints. The dedicated server has no renderer or legacy client mods,
         // so don't scan or decode those resource-pack images there.
         if headless {
-            Ok(tables)
+            Ok::<_, Box<dyn std::error::Error>>(tables)
         } else {
             Ok(tables.with_polytone_colormaps(&root, assets.registry))
         }

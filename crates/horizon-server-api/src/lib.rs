@@ -10,7 +10,6 @@ pub struct ServerSidebar {
 }
 /// A player on the server, as held by the server.
 #[derive(Clone, Debug, Default, PartialEq)]
-#[non_exhaustive]
 pub struct ServerPlayer {
     pub uuid: u128,
     pub name: String,
@@ -152,7 +151,6 @@ pub struct ServerCommandResult {
 
 /// A command of the server: vanilla's or one a server extension registered.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct ServerCommandInfo {
     /// Its own name, an alias resolved (`teleport` for `tp`).
     pub name: String,

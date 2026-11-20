@@ -85,8 +85,8 @@ pub(super) fn run(mut options: Options, vanilla_root: PathBuf, started: Instant)
 /// Construct the dedicated simulation without entering client startup or
 /// building client-only CPU model resources.
 #[allow(clippy::too_many_arguments)]
-fn start_dedicated_game<'a>(
-    res: &'a Arc<super::Resources>,
+fn start_dedicated_game(
+    res: &Arc<super::Resources>,
     pack: super::PackResources,
     gui: super::UiResources,
     options: Options,

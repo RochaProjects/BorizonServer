@@ -14,6 +14,7 @@ horizon-client-backends = { path = "../horizon-client-backends", optional = true
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
 horizon-assets = { path = "../horizon-assets" }
 horizon-client-core = { path = "../horizon-client-core" }
+horizon-sim-data = { path = "../horizon-sim-data" }
 horizon-client-input = { path = "../horizon-client-input", default-features = false }
 horizon-command = { path = "../horizon-command" }
 horizon-core = { path = "../horizon-core" }

@@ -904,26 +904,7 @@ pub fn text_vertices(
 
 /// Block-entity fields the level ticks, at one position (vanilla's own field
 /// values; extraction to render state happens here as in each renderer).
-#[derive(Clone, Debug, Default)]
-pub struct BlockAnim {
-    /// `ShulkerBoxBlockEntity` progress and progressOld.
-    pub shulker: (f32, f32),
-    /// `BellBlockEntity.ticks` and the click direction while `shaking`.
-    pub bell_ticks: i32,
-    pub bell_shake: Option<&'static str>,
-    /// `ConduitBlockEntity` tickCount, isActive, isHunting and activeRotation.
-    pub conduit: (i32, bool, bool, f32),
-    /// `SkullBlockEntity` isAnimating and animationTickCount.
-    pub skull: (bool, i32),
-    /// `DecoratedPotBlockEntity` decorations as item ids: back, left, right, front.
-    pub sherds: [Option<String>; 4],
-    /// `DecoratedPotRenderState` wobble style (positive) and progress.
-    pub wobble: Option<(bool, f32)>,
-    /// `EnchantingTableBlockEntity` book fields.
-    pub book: EnchantingBook,
-    /// `TheEndGatewayBlockEntity` age and teleportCooldown.
-    pub gateway: (i64, i32),
-}
+pub use horizon_sim_data::block_entity_data::BlockAnim;
 
 /// One `submitText` call (`AbstractSignRenderer.submitSignText`).
 #[derive(Clone, Debug, PartialEq)]

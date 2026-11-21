@@ -17,6 +17,7 @@ horizon-assets = { path = "../horizon-assets" }
 horizon-client-core = { path = "../horizon-client-core" }
 horizon-client-input = { path = "../horizon-client-input", default-features = false }
 horizon-client-render = { path = "../horizon-client-render", default-features = false }
+horizon-sim-data = { path = "../horizon-sim-data" }
 horizon-command = { path = "../horizon-command" }
 horizon-items = { path = "../horizon-items" }
 horizon-core = { path = "../horizon-core" }

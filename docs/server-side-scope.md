@@ -1,11 +1,95 @@
 # Server-side build scope
 
-## Handoff: status real em 2026-11-20
+## Handoff: status real em 2026-11-20 (atualizado)
 
 Este documento é o ponto de partida para continuar a separação server/client.
 O estado abaixo prevalece sobre planos antigos neste arquivo. **O alvo dedicado
-passa no check e no Clippy com `-D warnings`; o handoff anterior listava falhas
-que já foram corrigidas nesta etapa.**
+passa no check e no Clippy com `-D warnings`. O build de release do CI leva
+~10 min 37 s — tudo em `horizon-client-lib`. O objetivo desta etapa é cortar
+esse tempo na metade removendo crates client-only do grafo do servidor.**
+
+### Análise do log do CI (aura-v0.1.16)
+
+O build tem dois blocos sequenciais:
+
+| Bloco | Tempo | Crates principais |
+|---|---|---|
+| `horizon-client` + `horizon-client-lib` + `horizon-client-render` + wgpu + winit + naga | ~10 min 37 s | **todo o cliente** |
+| `horizon-server` + `horizon-prepare` + TLS/crypto | ~2 min 10 s | apenas servidor |
+
+O grafo do build dedicado tem 219 crates únicos. Categorização:
+
+**Necessário no servidor (não tocar):**
+- `horizon-core`, `horizon-world`, `horizon-protocol`, `horizon-items`, `horizon-command` — simulação vanilla
+- `horizon-client-core`, `horizon-server-files`, `horizon-server-api` — tipos compartilhados
+- `horizon-threads` — pool de workers (traz `framehop`/`gimli` para stack dumps — necessário)
+- `horizon-perf-format` — servidor grava captures `.hzperf`; `prost` vem daqui (necessário)
+- `horizon-anticheat`, `horizon-chat-filter`, `horizon-hooks` — funcionalidade de servidor
+- `horizon-server-plugin-api`, `horizon-server-plugin-loader` — sistema de plugins
+- `mio`, `rayon`, `serde`, `serde_json`, `flate2`, `zip`, `sha1`, `sha2`, `ureq`, `ring`, `rustls` — rede, I/O, TLS (necessário)
+- `naga` (wgsl-in) — `horizon-shaders` usa para ler shaders; o servidor valida packs de recursos. **Removível** com esforço.
+- `prost`/`prost-derive` — de `horizon-perf-format`. Necessário.
+
+**Client-only preso no grafo por `horizon-client-render` (raiz do problema):**
+- `wgpu`, `wgpu-core`, `wgpu-hal`, `wgpu-naga-bridge`, `wgpu-core-deps-windows-linux-android`, `renderdoc-sys` — GPU
+- `winit`, `x11-dl`, `x11rb`, `x11rb-protocol`, `calloop`, `polling`, `xkbcommon-dl`, `xkeysym`, `dlib`, `cursor-icon`, `smol_str`, `dpi`, `raw-window-handle` — janela/entrada
+- `tracing`, `tracing-core`, `profiling` — usados por wgpu
+- `ab_glyph`, `ab_glyph_rasterizer`, `owned_ttf_parser`, `ttf-parser` — fonte/texto para HUD
+- `glam` — vetores/matrizes 3D para renderer (usado em gameplay também — verificar)
+- `icu_*` (12 crates), `tinystr`, `litemap`, `zerotrie`, `potential_utf`, `writeable`, `zerovec*`, `yoke*`, `zerofrom*` — normalização Unicode para o renderer de fonte
+- `codespan-reporting` — diagnósticos do naga
+- `half` — float16 para texturas
+- `lz4_flex` — compressão de atlas/texturas
+
+**Estratégia de remoção (esta sessão — execução real):**
+
+A tentativa de tornar `horizon-client-render` opcional no Cargo resultou em 6644 erros
+porque o crate tem ~70k linhas onde `wgpu`, `winit`, `glam` aparecem em módulos de
+simulação misturados com rendering. Tornar as deps opcionais no Cargo sem gate no source
+não compila.
+
+A separação real requer partir `horizon-client-render` em dois crates:
+
+**`horizon-sim-data` (novo crate — sem GPU):**
+- `streaming`, `chunk`, `collisions`, `effects`, `containers`, `brewing`, `biome`,
+  `assets`, `mesher`, `datapack`, `lod`, `world`, `particles`, `block_entity_render`,
+  `camera`, `skins`, `spans`, `crash`, `logging`, `auth`, `fast_hash`, `json_folder`,
+  `java_text`, `random_source`, `sound_events`, `audio` (structs/tipos sem cpal)
+- Deps: `horizon-core`, `horizon-world`, `horizon-protocol`, `horizon-items`,
+  `horizon-threads`, `glam`, `serde`, `serde_json`, `flate2`, `sha1`, `sha2`, `ureq`,
+  `chrono`, `bytemuck`, `smallvec`, `png` — **sem wgpu, winit, ab_glyph, icu, lz4_flex, half, naga-glsl, pollster**
+
+**`horizon-client-render` (refatorado — com GPU):**
+- `gfx`, `hud`, `hud_kit`, `hud_overlays`, `hud_layout`, `mesher::Renderer/Vertex/MeshTables`,
+  `particles::ParticleEngine`, `skins::Downloader/Resolver/SkinSlots`, `ui`, `widgets`,
+  `font`, `models`, `block_sprites`, `shader_options`, `shader_pack_list`, todos os
+  módulos de UI/tela, OptiFine, Polytone, shader API
+- Deps: mantém wgpu, winit, ab_glyph, glam, icu, naga, lz4_flex, half, pollster, etc.
+
+**Impacto esperado:** remover do grafo servidor:
+`wgpu`, `wgpu-core`, `wgpu-hal`, `wgpu-naga-bridge`, `wgpu-core-deps*`, `renderdoc-sys`,
+`winit`, `x11-dl`, `x11rb*`, `calloop`, `polling`, `xkbcommon-dl`, `xkeysym`, `dlib`,
+`cursor-icon`, `smol_str`, `dpi`, `raw-window-handle`, `tracing*`, `profiling`,
+`ab_glyph*`, `ttf-parser`, `owned_ttf_parser`, `icu_*` (12), `tinystr`, `litemap`,
+`zerotrie`, `potential_utf`, `writeable`, `zerovec*`, `yoke*`, `zerofrom*`,
+`codespan-reporting`, `half`, `lz4_flex`, `horizon-optifine`, `horizon-polytone`,
+`horizon-shaders`, `horizon-shader-api`, `horizon-hdr`, `horizon-narrator`
+= **~80 crates removidos, build estimado ~4–5 min (de 10 min)**
+
+**Execução desta separação (ordem metodológica):**
+
+1. Criar `crates/horizon-sim-data/` com `Cargo.toml` e `src/lib.rs`
+2. Mover módulo por módulo de `horizon-client-render/src/` para `horizon-sim-data/src/`,
+   começando pelos sem deps de render (`spans`, `crash`, `logging`, `fast_hash`, `json_folder`)
+3. Para cada módulo, verificar imports — remover os de `gfx::`, `hud::`, `wgpu::`, `winit::`
+   substituindo pelos tipos simulação-safe
+4. Atualizar `horizon-client-render/src/lib.rs` para reexportar de `horizon-sim-data`
+5. Atualizar `horizon-client-lib/Cargo.toml` para depender de `horizon-sim-data` (incondicional)
+   e `horizon-client-render` (opcional, atrás de `client-graphics`)
+6. Gate o `pub use horizon_client_render::` em `client_lib.rs`
+7. Corrigir o `Game` struct — gate campos render-only com `#[cfg(not(feature = "dedicated-server"))]`
+8. `cargo check` a cada módulo movido; não tentar mover tudo de uma vez
+9. Clippy + push quando o check passar
 
 ### O que já foi alterado
 
@@ -75,20 +159,123 @@ quebraria referências em código compartilhado até a fronteira ser extraída. 
 numa fronteira cliente) for feita, o `allow` deve ser removido e os módulos
 gated individualmente.
 
+### Estado atual (2026-11-21) — onde a sessão parou
+
+**O que foi feito:**
+
+- `crates/horizon-sim-data/` criado e compilando limpo. Contém todos os módulos de
+  simulação extraídos de `horizon-client-render` sem nenhuma dep de GPU:
+  `assets`, `auth`, `ban_notice`, `block_edit`, `block_entities`, `block_entity_anim`,
+  `block_entity_data`, `brewing`, `chunk`, `chunk_map`, `collisions`, `command_block`,
+  `containers`, `crash`, `custom_sky`, `effects`, `fast_hash`, `hud_layout`,
+  `java_text`, `jigsaw_block`, `light`, `logging`, `pack_hooks`, `pack_palette`,
+  `poi_sections`, `providers`, `random_source`, `sculk`, `section_mask`, `signs`,
+  `skins`, `spans`, `structure_block`, `tab_list`, `test_block`, `test_instance_block`,
+  `vault`, `world`, `block_edit`.
+- `horizon-client-render/src/lib.rs` atualizado: `pub mod X` → `pub use horizon_sim_data::X`
+  para todos os módulos migrados. O render compila limpo com `--features client-graphics`.
+- `horizon-client-render/src/block_entity_render.rs`: `BlockAnim` agora é
+  `pub use horizon_sim_data::block_entity_data::BlockAnim`.
+- `horizon-client-render/src/hud_layout.rs`: wrapper que faz `pub use horizon_sim_data::hud_layout::*`
+  e `pub use crate::hud_layout_ext::{width, paint, abgr}`.
+- `horizon-client-render/src/hud_layout_ext.rs` (novo): `width`, `paint`, `abgr` que
+  precisam de `crate::hud` e `crate::font`.
+- `horizon-client-lib/Cargo.toml`: `horizon-sim-data` adicionado como dep incondicional.
+- `horizon-client/src/client_lib.rs`: `block_entity_data` e `json_folder` reexportados
+  do sim-data; `vault` reexportado do sim-data.
+
+**Estado do build:**
+
+- `cargo check -p horizon-sim-data` → **passa** (6 warnings de imports não usados).
+- `cargo check -p horizon-client-render --features client-graphics` → **passa**.
+- `cargo check -p horizon-client --no-default-features --features server-plugins,dedicated-server`
+  → **1 erro**: `no method named layout found for TabList`.
+
+**O único erro restante:**
+
+`crates/horizon-client/src/game/scoreboard.rs:968` chama `self.tab_list.layout(&inputs, &self.gui.atlas.font)`.
+
+`TabList::layout` precisa de `Font` (crate render). `TabList` está no sim-data mas `layout`
+não foi movido porque depende de ~400 linhas de helpers (`build_layout`, `render_header_footer`,
+`hearts`, `Entry`, `sprite`, `font.width_text`, `font.split_lines`) que por sua vez dependem
+de `Font`, `hud_layout::paint` e outros tipos do render.
+
+**Como resolver (próxima sessão):**
+
+Opção A (mais limpa):
+1. Definir `pub trait TabFont { fn epoch(&self) -> u64; fn width_text(&self, t: &Text) -> f32; fn split_lines(...); ... }` no sim-data.
+2. Implementar `TabFont for Font` no render (`crates/horizon-client-render/src/tab_list_font_impl.rs`).
+3. Mover `layout`, `build_layout`, `render_header_footer`, `hearts`, `render_hearts`, `Entry`,
+   `sprite`, `LayoutCache` do render `tab_list.rs` para o sim-data `tab_list.rs`,
+   substituindo `font: &Font` por `font: &dyn TabFont`.
+4. Fazer o render's `tab_list.rs` ser `pub use horizon_sim_data::tab_list::*`.
+5. Atualizar o `scoreboard.rs` do client para usar `use crate::tab_list::TabFont` em scope.
+
+Opção B (mais rápida):
+1. Converter `TabList::layout` em função livre em `scoreboard.rs`:
+   `fn draw_tab_layout(tab: &mut TabList, inputs: &TabInputs, font: &Font) -> Vec<GuiDraw>`
+   implementada no render (onde `Font` está disponível) e gateada com
+   `#[cfg(not(feature = "dedicated-server"))]` em `scoreboard.rs`.
+
+**Arquivos modificados nesta sessão (não commited ainda):**
+```
+Cargo.lock, Cargo.toml
+crates/horizon-client-lib/Cargo.toml
+crates/horizon-client-render/Cargo.toml
+crates/horizon-client-render/src/block_entity_render.rs
+crates/horizon-client-render/src/hud_layout.rs         (wrapper)
+crates/horizon-client-render/src/hud_layout_ext.rs     (novo)
+crates/horizon-client-render/src/lib.rs
+crates/horizon-client/src/client_lib.rs
+crates/horizon-sim-data/                               (novo crate)
+docs/server-side-scope.md
+```
+
 ### Próximo trabalho obrigatório
 
 1. ~~Corrigir os erros acima~~ — feito nesta etapa.
 2. ~~Repetir `cargo check --locked -j1`~~ e ~~Clippy~~ — ambos passam.
-3. Separar o estado visual/input de `Game` em uma fronteira cliente, preservando
+3. ~~Criar `crates/horizon-sim-data/`~~ — feito. O crate compila limpo com os
+   módulos: `assets`, `auth`, `ban_notice`, `block_entities`, `block_entity_anim`,
+   `block_entity_data`, `brewing`, `chunk`, `chunk_map`, `collisions`,
+   `command_block`, `containers`, `crash`, `custom_sky`, `effects`, `fast_hash`,
+   `java_text`, `jigsaw_block`, `light`, `logging`, `pack_hooks`, `pack_palette`,
+   `poi_sections`, `providers`, `random_source`, `sculk`, `section_mask`, `signs`,
+   `skins`, `spans`, `structure_block`, `tab_list`, `test_block`,
+   `test_instance_block`, `world`. Reexporta: `lang`, `scoreboard`, `blocks`,
+   `enchant`, `items`, `json_folder`, `text`. Sem dependências de GPU, janela,
+   fonte ou shader.
+4. **Impedimento atual:** `horizon-client-render` não pode reexportar tipos de
+   `horizon-sim-data` porque tem `impl` nesses tipos (`impl World` em
+   `block_edit.rs`, `impl Vault`/`impl VaultConfig` em `vault.rs`) — Rust não
+   permite `impl` em tipos de outro crate sem trait. Tentar fazer o `client_lib.rs`
+   reexportar `chunk`, `world` etc. do sim-data causou 41 erros de tipo incompatível
+   porque `game.rs` e seus ~93 sub-módulos implementam traits do render sobre os
+   tipos do render. Os dois crates têm cópias dos mesmos tipos e não são
+   intercambiáveis.
+   O estado atual: `horizon-client-lib` depende de `horizon-sim-data` (incondicional)
+   e de `horizon-client-render` (incondicional). O `client_lib.rs` reexporta tudo
+   do render (fonte canônica dos tipos) e adiciona `block_entity_data` e
+   `json_folder` do sim-data como novos reexports. O servidor ainda compila o
+   render inteiro — o impacto de build ainda não foi alcançado.
+5. **Próximo passo real:** A separação real requer uma de duas estratégias:
+   a. Mover os métodos render-específicos para traits definidas em `horizon-sim-data`
+      que o render implementa (`trait WorldRenderExt`, `trait VaultRenderExt`) —
+      mais limpo, permite reexportar tipos do sim-data no render.
+   b. Gatear os ~93 arquivos de `game.rs` que referenciam módulos de render com
+      `#[cfg(feature = "client-graphics")]`, convertendo o `horizon-client-render`
+      num dep opcional de verdade. Cada arquivo que usa `hud`, `mesher`, `streaming`,
+      `font`, etc. precisa ser gated ou ter os imports removidos do path dedicado.
+5. Separar o estado visual/input de `Game` em uma fronteira cliente, preservando
    para o dedicated somente os dados usados pelo tick, rede e persistência. Só
    então tornar renderer/input/shaders dependências opcionais e provar a remoção
    com `cargo tree`. Remover o `#![cfg_attr(feature = "dedicated-server",
    allow(dead_code, unused_imports))]` do `horizon-client` quando os módulos
    cliente puderem ser gated individualmente sem quebrar código compartilhado.
-4. Não apagar `horizon-mods`, `horizon-optifine`, shaders ou tipos compartilhados
+6. Não apagar `horizon-mods`, `horizon-optifine`, shaders ou tipos compartilhados
    por suposição. Procurar referências e separar visualização de simulação por
    feature; plugins `.so` são a extensão server-side suportada.
-5. Não rodar build release local nem paralelizar compilações. Usar jobs limitados;
+7. Não rodar build release local nem paralelizar compilações. Usar jobs limitados;
    preservar arquivos não relacionados e não publicar release até o check e CI
    passarem.
 

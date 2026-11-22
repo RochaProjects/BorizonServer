@@ -10,6 +10,14 @@ pub mod bed_geometry;
 pub mod block_contact;
 pub mod parallel;
 pub mod powder_snow;
+// Simulation data: block_entity_data is new (not in render), reexport directly.
+pub use horizon_sim_data::block_entity_data;
+// json_folder comes from horizon_world via sim-data.
+pub use horizon_sim_data::json_folder;
+
+// All other modules still come from render (which has the canonical types used
+// throughout game.rs and its sub-modules). Once game.rs is split at the
+// server/client boundary, these will migrate to sim-data one by one.
 pub use horizon_client_render::{
     assets, atlas_sources, audio, auth, autotune, ban_notice, bidi, biome, block_edit,
     block_entities, block_entity_anim, block_entity_render, block_sprites, block_states, bluemap,
@@ -18,17 +26,17 @@ pub use horizon_client_render::{
     containers, controller_ui, crash, custom_sky, datapack, dynamic_light, dynamic_resolution,
     effects, environment, extras, fast_hash, fluid_render, fog, font, gfx, graphics,
     graphics_style, graphics_ui, hdr_calibration, hud, hud_kit, hud_layout, hud_overlays,
-    inventory_effects, java_text, jigsaw_block, json_folder, level_loading, light, lod, logging,
-    mark_sprite, menu_blur, menu_style, mesher, minimap, mipmap, mod_browser, mod_list,
-    model_library, models, multiline_edit, native_emissive, options_file, options_fixes,
-    options_ui, overlay, pack_browser, pack_formats, pack_hooks, pack_palette, pack_screen, packs,
-    pad_cursor, pad_glyph, par, particles, poi_sections, polytone_creative_tabs, polytone_post,
-    post_chain, potent_sulfur, preedit, providers, pvp, pvp_hud, random_source, screen_draw,
-    screen_effects, sculk, section_mask, server_terrain, settings, shader_options,
-    shader_pack_list, signs, skins, social, sound_engine, sound_events, sound_preview, spans,
-    split_layout, split_map, split_profiles, sprites, streaming, structure_block, tab_list,
-    terrain_model, test_block, test_instance_block, testgen, title_edition, trims, ui, vault,
-    weather, widgets, world, worldborder, zip,
+    inventory_effects, java_text, jigsaw_block, level_loading, light, lod, logging, mark_sprite,
+    menu_blur, menu_style, mesher, minimap, mipmap, mod_browser, mod_list, model_library, models,
+    multiline_edit, native_emissive, options_file, options_fixes, options_ui, overlay,
+    pack_browser, pack_formats, pack_hooks, pack_palette, pack_screen, packs, pad_cursor,
+    pad_glyph, par, particles, poi_sections, polytone_creative_tabs, polytone_post, post_chain,
+    potent_sulfur, preedit, providers, pvp, pvp_hud, random_source, screen_draw, screen_effects,
+    sculk, section_mask, server_terrain, settings, shader_options, shader_pack_list, signs, skins,
+    social, sound_engine, sound_events, sound_preview, spans, split_layout, split_map,
+    split_profiles, sprites, streaming, structure_block, tab_list, terrain_model, test_block,
+    test_instance_block, testgen, title_edition, trims, ui, vault, weather, widgets, world,
+    worldborder, zip,
 };
 pub mod attack_strength;
 pub mod attribute_updates;
@@ -120,6 +128,10 @@ pub mod pregen;
 pub mod projectiles;
 pub mod raid;
 pub mod random_tick_sections;
+#[cfg(not(feature = "dedicated-server"))]
+pub mod realms;
+#[cfg(feature = "dedicated-server")]
+#[path = "realms_dedicated.rs"]
 pub mod realms;
 pub mod recipe_book;
 pub mod recipe_book_screen;

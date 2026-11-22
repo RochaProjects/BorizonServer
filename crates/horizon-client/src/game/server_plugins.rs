@@ -62,6 +62,17 @@ static NEXT_SCHEDULED_PLUGIN_TASK: AtomicU64 = AtomicU64::new(1);
 static SERVER_PLUGIN_TICK: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "server-plugins")]
+fn cancel_scheduled_task(
+    tasks: &mut Vec<ScheduledPluginTask>,
+    id: u64,
+    owner: Option<&str>,
+) -> bool {
+    let before = tasks.len();
+    tasks.retain(|task| task.id != id || owner.is_some_and(|owner| task.plugin != owner));
+    tasks.len() != before
+}
+
+#[cfg(feature = "server-plugins")]
 struct GameHost<'g, 'a, 'c> {
     game: &'g mut Game<'a>,
     commands: Option<&'c mut Vec<ServerCommand>>,
@@ -1020,11 +1031,19 @@ impl Host for GameHost<'_, '_, '_> {
                 }) else {
                     return fail("invalid_task_id");
                 };
+                let owner = match data.get("plugin") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(value) => {
+                        match value.as_str().filter(|owner| valid_plugin_namespace(owner)) {
+                            Some(owner) => Some(owner),
+                            None => return fail("invalid_plugin_id"),
+                        }
+                    }
+                };
                 let tasks = SCHEDULED_PLUGIN_TASKS.get_or_init(|| Mutex::new(Vec::new()));
                 let mut tasks = tasks.lock().unwrap_or_else(|error| error.into_inner());
-                let before = tasks.len();
-                tasks.retain(|task| task.id != id);
-                serde_json::json!({"ok": true, "cancelled": tasks.len() != before})
+                let cancelled = cancel_scheduled_task(&mut tasks, id, owner);
+                serde_json::json!({"ok": true, "cancelled": cancelled})
             }
             op::COMMAND_REGISTER => {
                 let Some(usage) = data.get("usage").and_then(|v| v.as_str()) else {
@@ -2072,6 +2091,11 @@ impl Host for GameHost<'_, '_, '_> {
 }
 
 #[cfg(feature = "server-plugins")]
+fn storage_get_response(value: Option<&serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({"ok": true, "found": value.is_some(), "value": value})
+}
+
+#[cfg(feature = "server-plugins")]
 fn plugin_storage(operation: &str, data: &serde_json::Value) -> serde_json::Value {
     use horizon_server_plugin_api::operation as op;
     use std::{fs, path::PathBuf};
@@ -2126,7 +2150,8 @@ fn plugin_storage(operation: &str, data: &serde_json::Value) -> serde_json::Valu
     };
     match operation {
         op::PLUGIN_STORAGE_GET => {
-            serde_json::json!({"ok": true, "value": values.get(key.expect("validated key"))})
+            let value = values.get(key.expect("validated key"));
+            storage_get_response(value)
         }
         op::PLUGIN_STORAGE_LIST => {
             let prefix = key.unwrap_or("");
@@ -2745,3 +2770,48 @@ pub(super) fn player_death(_: &mut Game<'_>, _: u32, _: &str, _: u32) -> bool {
 
 #[cfg(not(feature = "server-plugins"))]
 pub(super) fn resource_pack_status(_: &mut Game<'_>, _: u128, _: &str, _: u128, _: i32) {}
+
+#[cfg(all(test, feature = "server-plugins"))]
+mod scheduler_tests {
+    use super::*;
+
+    fn task(id: u64, plugin: &str) -> ScheduledPluginTask {
+        ScheduledPluginTask {
+            id,
+            plugin: plugin.to_owned(),
+            due_tick: 0,
+            period_ticks: None,
+            data: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn cancel_task_scopes_to_owner_and_preserves_legacy_unscoped_behavior() {
+        let mut tasks = vec![task(1, "alpha"), task(2, "beta")];
+
+        assert!(!cancel_scheduled_task(&mut tasks, 1, Some("beta")));
+        assert_eq!(tasks.len(), 2);
+        assert!(cancel_scheduled_task(&mut tasks, 1, Some("alpha")));
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| task.plugin.as_str())
+                .collect::<Vec<_>>(),
+            ["beta"]
+        );
+        assert!(cancel_scheduled_task(&mut tasks, 2, None));
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn storage_get_distinguishes_missing_from_json_null() {
+        let missing = storage_get_response(None);
+        assert_eq!(missing["found"], false);
+        assert!(missing["value"].is_null());
+
+        let explicit_null = serde_json::Value::Null;
+        let found_null = storage_get_response(Some(&explicit_null));
+        assert_eq!(found_null["found"], true);
+        assert!(found_null["value"].is_null());
+    }
+}

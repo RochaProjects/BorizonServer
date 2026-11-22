@@ -574,6 +574,8 @@ pub(super) fn load_resources(
     // world renderer's textures beside the game's own tables. A failure here
     // waits for the tail, so no tail worker outlives its pack-loader generation.
     #[cfg(not(feature = "dedicated-server"))]
+    let prepared_at = Instant::now();
+    #[cfg(not(feature = "dedicated-server"))]
     let (game_cpu, renderer_cpu) = if menu {
         let (game_cpu, renderer_cpu) = std::thread::scope(|scope| {
             let textures = Step::spawn(scope, parallel, "textures", || {

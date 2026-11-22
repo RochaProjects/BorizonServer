@@ -120,6 +120,10 @@ pub mod pregen;
 pub mod projectiles;
 pub mod raid;
 pub mod random_tick_sections;
+#[cfg(not(feature = "dedicated-server"))]
+pub mod realms;
+#[cfg(feature = "dedicated-server")]
+#[path = "realms_dedicated.rs"]
 pub mod realms;
 pub mod recipe_book;
 pub mod recipe_book_screen;

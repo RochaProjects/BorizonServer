@@ -1617,6 +1617,7 @@ dependencies = [
  "horizon-server-files",
  "horizon-shader-api",
  "horizon-shaders",
+ "horizon-sim-data",
  "horizon-telemetry",
  "horizon-theme",
  "horizon-threads",
@@ -2122,6 +2123,14 @@ dependencies = [
  "naga",
  "png",
  "zip",
+]
+
+[[package]]
+name = "horizon-sim-data"
+version = "0.1.0"
+dependencies = [
+ "horizon-core",
+ "horizon-world",
 ]
 
 [[package]]

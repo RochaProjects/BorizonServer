@@ -134,7 +134,11 @@ client-graphics = [
 ]
 # Excludes Horizon-only client cosmetics/emotes from the dedicated server target. Use with
 # --no-default-features; shared gameplay, client crates and vanilla simulation remain available.
-dedicated-server = ["horizon-client-lib/server-event-types", "horizon-client-input/server-event-types"]
+dedicated-server = [
+    "horizon-client-lib/dedicated-server",
+    "horizon-client-lib/server-event-types",
+    "horizon-client-input/server-event-types",
+]
 # The former client mod registry/index. Keep it for client builds; the server's
 # `.so` plugin host does not use this registry or its wasm/signature validators.
 legacy-mod-index = ["horizon-mods/index", "horizon-client-lib/legacy-mod-index"]

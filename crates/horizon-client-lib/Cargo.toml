@@ -19,6 +19,7 @@ horizon-client-input = { path = "../horizon-client-input", default-features = fa
 horizon-client-render = { path = "../horizon-client-render", default-features = false }
 horizon-command = { path = "../horizon-command" }
 horizon-items = { path = "../horizon-items" }
+horizon-sim-data = { path = "../horizon-sim-data" }
 horizon-core = { path = "../horizon-core" }
 # Extension points for the crates above the engine (docs/layers.md, "How a Horizon crate plugs in").
 horizon-hooks = { path = "../horizon-hooks" }
@@ -122,6 +123,8 @@ client-graphics = [
     "horizon-shader-api/shader-backends",
 ]
 server-event-types = ["horizon-client-input/server-event-types"]
+# Selects the inert Realms compatibility surface instead of the client UI/service module.
+dedicated-server = []
 # `horizon-ctl mcp` is a separate control binary; the dedicated game engine does not link it.
 mcp = ["dep:horizon-mcp"]
 # Legacy client mod registry/index. Dedicated server builds omit it.

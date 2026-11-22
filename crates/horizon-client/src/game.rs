@@ -51,6 +51,10 @@ fn pack_files(world_tables: &Option<WorldTables>) -> horizon_world::loot::PackOv
 
 mod activity;
 mod advancements;
+#[cfg(not(feature = "dedicated-server"))]
+mod advancements_screen;
+#[cfg(feature = "dedicated-server")]
+#[path = "game/advancements_screen_dedicated.rs"]
 mod advancements_screen;
 mod agent;
 mod agent_settings;
@@ -120,6 +124,8 @@ mod cosmetics;
 mod creaking;
 mod creative_hotbar;
 mod creative_screen;
+#[cfg(not(feature = "dedicated-server"))]
+mod creative_screen_render;
 mod creatures;
 mod crossbow;
 pub(crate) mod cushions;
@@ -462,6 +468,10 @@ mod startup_menu;
 mod station_control;
 mod stations;
 mod stats;
+#[cfg(not(feature = "dedicated-server"))]
+mod stats_screen;
+#[cfg(feature = "dedicated-server")]
+#[path = "game/stats_screen_dedicated.rs"]
 mod stats_screen;
 mod storage;
 mod structure_blocks;
@@ -6297,12 +6307,15 @@ impl Game<'_> {
                 self.draw_mod_browser(&mut batch);
                 self.draw_pad_menu_guide(&mut batch, from);
             }
+            #[cfg(not(feature = "dedicated-server"))]
             Screen::Creative => {
                 let from = batch.vertices.len();
                 self.draw_creative(&mut batch);
                 self.draw_mod_browser(&mut batch);
                 self.draw_pad_menu_guide(&mut batch, from);
             }
+            #[cfg(feature = "dedicated-server")]
+            Screen::Creative => {}
             Screen::Chat => self.draw_chat_screen(&mut batch),
             Screen::Playing | Screen::Options | Screen::Win => {}
         }

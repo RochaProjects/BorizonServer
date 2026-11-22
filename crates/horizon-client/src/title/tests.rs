@@ -2798,6 +2798,7 @@ fn native_field_visitor_excludes_preparing_and_game_rule_editors() {
 
 /// `RealmsCreateWorldFlow.createWorld`: the reset screen's Generate New World tile opens
 /// Create New World; its Create uploads instead of making a local world.
+#[cfg(not(feature = "dedicated-server"))]
 #[test]
 fn a_realms_new_world_uploads_instead_of_creating_locally() {
     let mut f = Fixture::new();
@@ -2832,6 +2833,7 @@ fn a_realms_new_world_uploads_instead_of_creating_locally() {
 
 /// `CreateWorldScreen.openFresh`'s cancel for the tile: the screen the reset screen was
 /// opened from (the configuration screen), not the world list.
+#[cfg(not(feature = "dedicated-server"))]
 #[test]
 fn cancelling_a_realms_new_world_returns_to_the_realm() {
     let mut f = Fixture::new();

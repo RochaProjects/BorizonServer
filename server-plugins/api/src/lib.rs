@@ -13,13 +13,19 @@ pub type ByteSlice = *const u8;
 pub mod event {
     pub const PLAYER_JOIN: u32 = 1;
     pub const PLAYER_QUIT: u32 = 2;
+    /// Emitted after permission checks and before destruction; callback may veto.
     pub const BLOCK_BREAK: u32 = 3;
     pub const MENU_CLOSED: u32 = 4;
+    /// Emitted after the player has changed dimensions; notification-only.
     pub const PLAYER_CHANGED_DIMENSION: u32 = 5;
+    /// Player death attempt; callback may keep the player alive at 1 health.
     pub const PLAYER_DEATH: u32 = 6;
+    /// Notification after the block has been placed; not cancellable here.
     pub const BLOCK_PLACE: u32 = 7;
+    /// Emitted after chat broadcast (`data.phase = "after_broadcast"`); not cancellable.
     pub const CHAT: u32 = 8;
     pub const RESOURCE_PACK_STATUS: u32 = 9;
+    /// Observational teleport hook; the host dispatches it after the teleport decision.
     pub const PLAYER_TELEPORT: u32 = 10;
     pub const PLAYER_MOVE: u32 = 11;
     pub const SERVER_TASK: u32 = 12;
@@ -34,33 +40,54 @@ pub mod operation {
     /// Appends one Brigadier completion while the loader is querying plugins.
     pub const COMMAND_SUGGESTION_ADD: &str = "command.suggestions.add";
     pub const CHAT_SEND: &str = "chat.send";
+    /// Opens a virtual chest menu for the callback player; menu clicks use the existing callback.
     pub const MENU_OPEN: &str = "menu.open";
     pub const PLAYER_GET: &str = "player.get";
+    /// Finds one online player by hexadecimal UUID or case-insensitive name.
+    /// Returns the match in the `players` array.
     pub const PLAYER_LOOKUP: &str = "player.lookup";
+    /// Returns point-in-time snapshots of online players in host iteration order.
     pub const PLAYER_ONLINE_LIST: &str = "player.online.list";
     /// Reads one vanilla statistic for an online player (for example custom:minecraft.player_kills).
     pub const PLAYER_STAT_GET: &str = "player.stat.get";
     /// Reads all saved vanilla statistics for an online player.
+    /// The JSON value is the vanilla stats file shape and is subject to the 64 KiB ABI response limit.
     pub const PLAYER_STATS_GET: &str = "player.stats.get";
     /// Opens an interactive view of another player's live/file inventory.
+    /// Clicks can mutate the target inventory using vanilla transfer rules.
     /// Optional `rows` and `layout` select a menu grid; each layout entry is
-    /// an inventory slot index or null for an empty plugin-owned slot.
+    /// an inventory slot index or null for an empty plugin-owned slot. Call outside a player's turn.
     pub const INVENTORY_VIEW_OPEN: &str = "inventory.view.open";
+    /// Teleports the callback player. `data` carries dimension, position and optional angles;
+    /// `ok` reports whether the host performed or queued the teleport.
     pub const PLAYER_TELEPORT: &str = "player.teleport";
+    /// Sets the callback player's vanilla game mode (0 survival, 1 creative, 2 adventure,
+    /// 3 spectator); `ok` is true only when the host reports a change.
     pub const PLAYER_GAME_MODE_SET: &str = "player.game_mode.set";
     /// Sets generic styled names shown in chat and the player list. Each field accepts a
-    /// legacy-formatted string or a JSON text component; null clears that override.
+    /// legacy-formatted string or a JSON text component; null/omitted chat or tab clears that
+    /// override. Results include per-field booleans because application can be partial.
     pub const PLAYER_DISPLAY_SET: &str = "player.display.set";
+    /// Offers one resource pack to the callback player; the host permits URLs up to 32,767
+    /// characters and SHA-1 strings up to 40 bytes.
     pub const RESOURCE_PACK_SEND: &str = "resource_pack.send";
+    /// Offers between one and eight packs; earlier packs may already be sent if one fails.
     pub const RESOURCE_PACK_SEND_BATCH: &str = "resource_pack.send_batch";
+    /// Removes the named pack, or all server packs when `id` is omitted.
     pub const RESOURCE_PACK_REMOVE: &str = "resource_pack.remove";
+    /// Lists dimension IDs in the save and IDs currently loaded in memory.
     pub const WORLD_DIMENSIONS_LIST: &str = "world.dimensions.list";
     /// Opens an existing dimension and optionally keeps a chunk ticket for it.
     pub const WORLD_DIMENSION_LOAD: &str = "world.dimension.load";
+    /// Reads a vanilla bool/int gamerule from a loaded dimension.
     pub const WORLD_GAMERULE_GET: &str = "world.gamerule.get";
+    /// Sets a type-compatible vanilla bool/int gamerule in an already loaded dimension.
     pub const WORLD_GAMERULE_SET: &str = "world.gamerule.set";
+    /// Reads a custom dimension's effective bool/int gamerule without loading it.
     pub const WORLD_CUSTOM_GAMERULE_GET: &str = "world.custom_gamerule.get";
+    /// Persists a type-compatible bool/int override for an existing custom dimension.
     pub const WORLD_CUSTOM_GAMERULE_SET: &str = "world.custom_gamerule.set";
+    /// Clears one persisted custom-dimension gamerule override.
     pub const WORLD_CUSTOM_GAMERULE_CLEAR: &str = "world.custom_gamerule.clear";
     pub const WORLD_DIMENSION_UNLOAD: &str = "world.dimension.unload";
     pub const WORLD_DIMENSION_CREATE: &str = "world.dimension.create";
@@ -68,6 +95,8 @@ pub mod operation {
     pub const WORLD_DIMENSION_IMPORT: &str = "world.dimension.import";
     /// Deletes one unloaded custom dimension and its generator metadata, without a backup.
     pub const WORLD_DIMENSION_DELETE: &str = "world.dimension.delete";
+    /// Searches a bounded set of already-loaded columns around an online player.
+    /// Does not load chunks; successful and not-found responses report `loaded_chunks` scope.
     pub const WORLD_LOCATION_FIND_SAFE: &str = "world.location.find_safe";
     /// Creates a short-lived reset plan. Its response reports whether online players require force mode.
     pub const WORLD_PLAYER_DATA_RESET_PREPARE: &str = "world.player_data.reset.prepare";
@@ -86,7 +115,9 @@ pub mod operation {
     pub const SCHEDULER_SCHEDULE: &str = "scheduler.schedule";
     /// Cancels a task that has not run yet.
     pub const SCHEDULER_CANCEL: &str = "scheduler.cancel";
+    /// Sets the callback player's sidebar; the host accepts at most 15 rows.
     pub const SCOREBOARD_SIDEBAR_SET: &str = "scoreboard.sidebar.set";
+    /// Clears the callback player's sidebar.
     pub const SCOREBOARD_SIDEBAR_CLEAR: &str = "scoreboard.sidebar.clear";
     pub const PLUGIN_STORAGE_GET: &str = "plugin.storage.get";
     pub const PLUGIN_STORAGE_SET: &str = "plugin.storage.set";
@@ -97,14 +128,17 @@ pub mod operation {
     /// `minecraft:interaction`, optional `interaction_width`,
     /// `interaction_height`, and `interaction_response` configure its vanilla
     /// clickable hitbox; this is not tied to any plugin or NPC implementation.
+    /// Spawns a namespaced vanilla entity with selected flags/name and a caller-selected UUID.
+    /// `minecraft:interaction` additionally accepts bounded hitbox dimensions and response behavior.
     pub const ENTITY_SPAWN: &str = "entity.spawn";
     pub const ENTITY_MOVE: &str = "entity.move";
     pub const ENTITY_REMOVE: &str = "entity.remove";
-    /// Removes an entity of any supported type by its stable UUID.
+    /// Removes an entity of any supported non-player type by its stable UUID.
     pub const ENTITY_REMOVE_UUID: &str = "entity.remove_uuid";
     /// Creates/replaces a persistent text_display addressed by a stable UUID.
+    /// Replacing removes the previous display before spawning the new entity; this is not atomic.
     pub const ENTITY_DISPLAY_UPSERT: &str = "entity.display.upsert";
-    /// Removes a text_display by the same stable UUID used by upsert.
+    /// Removes a text_display by the same stable UUID used by upsert; returns whether it was removed.
     pub const ENTITY_DISPLAY_DELETE: &str = "entity.display.delete";
     /// Creates/replaces a vanilla item_display using an item model from a Java resource pack.
     /// `item_model` is a namespaced key such as `aura:npc/namespace_entity/cube_0`.
@@ -136,9 +170,9 @@ pub struct ServerEventV2 {
     pub dimension_len: usize,
     /// Meaningful only for `event::MENU_CLOSED`.
     pub window_id: i32,
-    /// Meaningful only for `event::BLOCK_BREAK`; zero for join/quit.
+    /// Block position on break/place; floored player position on death; zero for join/quit.
     pub position: [i32; 3],
-    /// The block-state registry id on `BLOCK_BREAK`; zero otherwise.
+    /// The block-state registry id on `BLOCK_BREAK` and `BLOCK_PLACE`; zero otherwise.
     pub data_id: u32,
 }
 
@@ -188,6 +222,9 @@ pub struct HostApiV2 {
             usize,
         ) -> i32,
     >,
+    /// Reads a player's signed 64-bit balance in currency-defined integer units.
+    /// Returns `result::OK` and writes the balance, `0` for invalid arguments/currency,
+    /// or `result::STORAGE_ERROR` when balance storage cannot provide a value.
     pub get_balance: Option<
         unsafe extern "C-unwind" fn(*mut c_void, u64, u64, ByteSlice, usize, *mut i64) -> i32,
     >,

@@ -55,6 +55,7 @@ members = [
     "crates/horizon-release-sign",
     "crates/horizon-mod-deps",
     "server-plugins/api",
+    "server-plugins/sdk",
     "server-plugins/loader",
     "xtask",
 ]

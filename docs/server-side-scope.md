@@ -3,8 +3,8 @@
 ## Status da integração com o PR #2 (2026-11-22)
 
 Foi feita a integração local do PR #2 (`1a554f14`) com o commit WIP local
-`4b6a91ec`, numa branch de trabalho baseada no PR. O objetivo é preservar os
-dois conjuntos de mudanças antes de atualizar a branch do PR.
+`4b6a91ec`, e o resultado foi enviado à branch do PR como `98f26f42`. A `main`
+local aponta para esse mesmo commit; o WIP continua preservado como pai do merge.
 
 - O PR #2 separa alguns dados/regras compartilhados (`raid`, `ticket_levels` e
   `world_spawn`) e adiciona caminhos dedicados sem inicialização de partes do
@@ -19,8 +19,9 @@ dois conjuntos de mudanças antes de atualizar a branch do PR.
   como `cargo clippy` para o mesmo alvo com `-D warnings`.
 - A verificação do cliente com áudio padrão não completou neste ambiente porque
   falta a biblioteca de sistema ALSA (`alsa.pc`). Uma primeira tentativa sem a
-  feature `horizon-extras` também não representa o conjunto normal do cliente.
-  Está em andamento uma verificação gráfica sem áudio e com `horizon-extras`.
+  feature `horizon-extras` não representa o conjunto normal do cliente. A
+  verificação gráfica sem áudio, com `horizon-extras`, passou em 2m05s.
+- `cargo fmt --all -- --check` e `git diff --check` passaram.
 - A integração **não prova ainda** que o objetivo de reduzir o grafo do servidor
   foi atingido: `horizon-client-render`, `horizon-client-input`, `wgpu`, `winit`
   e `naga` continuam no alvo dedicado. A extração de módulos, por si só, não os
@@ -28,9 +29,8 @@ dois conjuntos de mudanças antes de atualizar a branch do PR.
 
 Conclusão técnica provisória: PR #2 e o WIP são compatíveis no alvo dedicado e
 podem coexistir, mas o WIP acrescenta uma migração grande sem demonstrar ainda a
-redução de dependências que motivou o trabalho. A decisão de publicar a
-integração deve considerar esse custo/benefício e o resultado final da checagem
-do cliente.
+redução de dependências que motivou o trabalho. O PR atualizado continua aberto;
+o Actions para `98f26f42` está em andamento.
 
 ## Handoff: status real em 2026-11-20 (atualizado)
 

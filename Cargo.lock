@@ -1675,6 +1675,7 @@ dependencies = [
  "horizon-protocol",
  "horizon-shader-api",
  "horizon-shaders",
+ "horizon-sim-data",
  "horizon-system",
  "horizon-theme",
  "horizon-threads",
@@ -2129,8 +2130,32 @@ dependencies = [
 name = "horizon-sim-data"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "bytemuck",
+ "chrono",
+ "flate2",
+ "glam",
+ "horizon-assets",
+ "horizon-client-core",
+ "horizon-command",
  "horizon-core",
+ "horizon-hooks",
+ "horizon-items",
+ "horizon-perf-format",
+ "horizon-protocol",
+ "horizon-system",
+ "horizon-threads",
  "horizon-world",
+ "log",
+ "png",
+ "rustix 1.1.5",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "smallvec",
+ "ureq",
+ "zip",
 ]
 
 [[package]]

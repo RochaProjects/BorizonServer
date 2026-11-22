@@ -2,14 +2,19 @@
 name: Borizon server release
 
 on:
-  push:
-    # The current host loader still requests this legacy tag and asset naming.
-    tags: ["aura-v*"]
+  # This is a rolling development release. Dispatch it from the tested branch/ref;
+  # it refreshes the same release and moves its tag after the assets are uploaded.
   workflow_dispatch:
     inputs:
-      tag:
-        description: Legacy-compatible server release tag already pushed (for example aura-v0.1.0)
+      source_ref:
+        description: Tested branch, tag, or commit to package
         required: true
+        default: main
+        type: string
+      tag:
+        description: The single moving Borizon server tag
+        required: true
+        default: aura-v0.1.16
         type: string
 
 permissions:
@@ -27,7 +32,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.source_ref }}
 
       - name: Pin the checked out fork commit
         run: echo "HORIZON_REVISION=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
@@ -54,6 +59,9 @@ jobs:
       - name: Build server engine, server supervisor, and resource preparer
         run: |
           set -euo pipefail
+          # Keep all three files in the release bundle. Cargo's fingerprints and
+          # restored target cache rebuild only crates/binaries affected by source,
+          # dependency, toolchain, or feature changes.
           cargo build --locked --release -p horizon-client --no-default-features --features server-plugins,dedicated-server --bin horizon-client
           cargo build --locked --release -p horizon-server -p horizon-prepare
           mkdir -p dist/borizon-server
@@ -73,11 +81,31 @@ jobs:
           INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          tag="${INPUT_TAG:-${GITHUB_REF_NAME}}"
+          tag="${INPUT_TAG}"
           [[ "$tag" =~ ^aura-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          gh release create "$tag" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Borizon Server ${tag#aura-v}" \
-            --notes "Runtime servidor Borizon para Minecraft 26.3. Linux x86_64; inclui horizon-server, horizon-engine e horizon-prepare com host de plugins C ABI v3. Este pacote não compila nem contém plugins .so; eles são distribuídos separadamente." \
-            dist/aura-essentials-server-linux-x86_64.tar.gz \
-            dist/aura-essentials-server-linux-x86_64.tar.gz.sha256
+          notes="Build de desenvolvimento do Borizon Server para Minecraft 26.3. Commit: ${HORIZON_REVISION}. Linux x86_64; inclui horizon-server, horizon-engine e horizon-prepare com host de plugins C ABI v3. O pacote não contém plugins .so. Esta release é atualizada no mesmo tag para testes da host."
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber \
+              dist/aura-essentials-server-linux-x86_64.tar.gz \
+              dist/aura-essentials-server-linux-x86_64.tar.gz.sha256
+            gh release edit "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Borizon Server dev · ${HORIZON_REVISION:0:12}" \
+              --notes "$notes" \
+              --latest
+          else
+            gh release create "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$HORIZON_REVISION" \
+              --title "Borizon Server dev · ${HORIZON_REVISION:0:12}" \
+              --notes "$notes" \
+              --latest \
+              dist/aura-essentials-server-linux-x86_64.tar.gz \
+              dist/aura-essentials-server-linux-x86_64.tar.gz.sha256
+          fi
+
+          # Keep the release tag pointed at the exact source used for this bundle.
+          git tag --force "$tag" "$HORIZON_REVISION"
+          git push --force origin "refs/tags/$tag"

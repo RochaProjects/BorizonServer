@@ -103,8 +103,8 @@ pub struct ServerProperties {
     pub warnings: Vec<String>,
 }
 
-pub const DIFFICULTIES: [&str; 4] = ["peaceful", "easy", "normal", "hard"];
-pub const GAME_MODES: [&str; 4] = ["survival", "creative", "adventure", "spectator"];
+pub const DIFFICULTIES: [&str; 4] = horizon_world::food::Difficulty::NAMES;
+pub const GAME_MODES: [&str; 4] = horizon_core::game_mode::GameMode::NAMES;
 
 /// Sources of the values vanilla draws at random.
 pub trait Entropy {

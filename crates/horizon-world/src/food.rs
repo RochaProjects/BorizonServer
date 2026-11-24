@@ -6,6 +6,9 @@ pub enum Difficulty {
     Normal,
     Hard,
 }
+impl Difficulty {
+    pub const NAMES: [&str; 4] = ["peaceful", "easy", "normal", "hard"];
+}
 #[derive(Clone, Copy, Debug)]
 pub struct FoodData {
     pub food: i32,
@@ -132,4 +135,14 @@ pub trait FoodWorld {
         food: &mut FoodData,
         amount: f32,
     ) -> Result<(), Self::Error>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Difficulty;
+
+    #[test]
+    fn difficulty_names_follow_gameplay_order() {
+        assert_eq!(Difficulty::NAMES, ["peaceful", "easy", "normal", "hard"]);
+    }
 }

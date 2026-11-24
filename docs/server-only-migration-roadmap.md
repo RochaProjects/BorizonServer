@@ -2,30 +2,27 @@
 
 ## Objetivo
 
-Transformar este fork em um projeto exclusivamente server-side, começando por
-um engine Horizon vanilla dedicado. A branch de migração parte da `main`; não é
-um rewrite e não exige preservar o client, o launcher ou compatibilidade com
-eles. A lógica vanilla que o servidor realmente usa deve ser movida/adaptada,
-sem extras do fork.
+Transformar esta branch em um projeto exclusivamente server-side para o Horizon
+vanilla. A `main` é a fonte de referência do código existente: vamos inspecionar,
+selecionar, copiar/mover e adaptar o que o servidor realmente precisa, por etapas.
+Não vamos reimplementar do zero nem preservar client, launcher ou compatibilidade
+com eles. A árvore final desta branch conterá somente o servidor vanilla e as
+ferramentas server necessárias, sem dependências de client.
 
 O primeiro resultado contém somente o engine dedicado vanilla e as ferramentas
 indispensáveis para preparar, iniciar e administrar esse servidor. Renderer,
 janela, input, menus do client, launcher, APIs de mods e extras de gameplay não
 fazem parte desse marco.
 
-O SDK/loader `.so` é uma etapa posterior, separada. Sua implementação atual
-fica preservada na `main`/histórico, mas não deve ser migrada, compilada nem
-integrada ao primeiro engine vanilla. A API antiga de trait mods não será
-migrada. Depois que o servidor vanilla estiver isolado e validado, a reintegração
-da API pública `.so` será uma etapa independente **obrigatória para concluir o
-objetivo do Borizon**, não parte do primeiro marco vanilla.
+Mods, APIs de mods, plugins, SDKs e loaders (incluindo `.so`) estão fora do
+escopo desta branch e não serão trazidos nem integrados. Permanecem na `main` e
+no histórico. O objetivo aqui é exclusivamente o servidor Horizon vanilla.
 
-“Server-only” descreve o produto e o grafo final. Durante a migração, a branch
-pode temporariamente conter os dois lados como material de origem para extração;
-nenhuma etapa compila o client. A `main` e o release já existentes servem como
-baseline executável. O primeiro build do engine na branch ocorre depois que o
-novo pacote server-owned estiver separado e não depender do pacote
-`horizon-client` nem de renderer/input.
+“Server-only” descreve o produto e o grafo final. A branch começa como trabalho
+server-only; a `main` será consultada como origem do código a selecionar e adaptar,
+sem incorporar componentes client à árvore final. Nenhuma etapa compila o client.
+O primeiro build desta branch ocorrerá quando existir um pacote server-owned que
+não dependa de `horizon-client`, renderer, input ou outras dependências client.
 
 ## Painel de andamento da branch `BorizonV26.3`
 
@@ -38,21 +35,22 @@ como conclusão. A `main` permanece intacta; esta migração parte dela e só al
 os arquivos exigidos pelas etapas abaixo. Não copiar/mover diretórios inteiros
 por conveniência: migrar somente código necessário e já identificado.
 
-Marcar com `[x]` exatamente um estado por fase: `Feito`, `Em andamento` ou
-`Pendente` (use `Bloqueada` no registro de pendências quando houver impedimento).
-Marcar `[x]` também em cada ação e critério de aceite somente quando houver
-implementação e evidência. Caixas vazias são trabalho ainda não concluído.
+No painel, selecionar um único estado por fase (`Feito`, `Em andamento` ou
+`Pendente`; registrar `Bloqueada` no log quando houver impedimento). Nunca marcar
+uma ação ou critério de aceite como feito sem implementação e evidência verificável.
+No início, todas as ações e critérios ficam desmarcados; não inferir conclusão por
+existir branch, documentação ou checkout de referência.
 
 | Fase | Feito | Em andamento | Pendente | Feito / evidência | Falta / próximo critério verificável |
 |---|---|---|---|---|---|
-| Branch e baseline | [ ] | [x] | [ ] | Branch local `BorizonV26.3` criada de `origin/main` em `f2e5556cbc` (2026-11-24); este painel adicionado ao roadmap. `main` não alterada. Nenhuma implementação anterior foi migrada para esta branch. | Capturar/referenciar baseline reproduzível do grafo, tempo/RAM dos Actions e smoke de instalação limpa; verificar o requisito de empacotamento do preparer. |
+| Branch e baseline | [ ] | [ ] | [x] | Migração e baseline de build ainda não iniciados. Cópia local de referência da `main` em `/home/ubuntu/BorizonServer-main`, commit `f2e5556cbc`; branch de trabalho `BorizonV26.3` mantida separada. | Registrar a origem da branch; capturar baseline reproduzível de grafo, Actions e instalação limpa; conferir o contrato de empacotamento do preparer. |
 | Inventário do uso server real | [ ] | [ ] | [x] | — | Registrar imports/símbolos e evidências por pacote, separando build/test/runtime; completar auditoria dos módulos mistos. |
 | Engine server-owned | [ ] | [ ] | [x] | — | Criar e compilar pacote próprio sem `horizon-client`/renderer/input; provar startup com recursos preparados, mundo e conexões. |
 | Migração dos módulos mistos | [ ] | [ ] | [x] | — | Migrar estado e operações reais de tick, rede e save; remover dependências client sem stubs; executar testes server. |
 | Remoção de extras/mods do marco vanilla | [ ] | [ ] | [x] | — | Excluir referências antigas só após confirmar datapacks vanilla, worldgen e recursos; validar que nenhum comportamento vanilla foi perdido. |
 | Redução do workspace/CI/release | [ ] | [ ] | [x] | — | Remover pacotes client do grafo e workflows; automatizar ausência de renderer/input/GPU e testar o pacote publicado em diretório limpo. |
 | Limpeza do produto server-only | [ ] | [ ] | [x] | — | Limpar arquivos exclusivamente client identificados, atualizar README/docs, validar critérios finais e preparar integração separada. |
-| Reintegração obrigatória — SDK/loader `.so` | [ ] | [ ] | [x] | — | Reintegrar API, SDK e loader em mudança independente, sem dependências client; validar ABI, carregamento real de `.so`, ciclo de vida/hooks e testes de plugins. O produto Borizon não estará completo enquanto esta etapa não passar. |
+| Mods e plugins | [ ] | [ ] | [x] | — Fora do escopo: não copiar, compilar ou integrar API de mods, plugin API, SDK ou loader `.so`. | Manter esses componentes na `main`/histórico; garantir que não apareçam na árvore nem no grafo do servidor vanilla. |
 
 ### Registro de trabalho descoberto durante a migração
 
@@ -64,6 +62,12 @@ não houver itens adicionais.
 | Fase | Tarefa descoberta / motivo | Arquivos afetados | Validação e resultado | Feito | Em andamento | Pendente |
 |---|---|---|---|---|---|---|
 | — | — | — | — | [ ] | [ ] | [ ] |
+
+## Diário de execução
+
+| Data | Atividade/evidência | Estado | Próximo passo |
+|---|---|---|---|
+| 2026-11-24 | Clonada a `main` separadamente em `/home/ubuntu/BorizonServer-main`, commit `f2e5556cbc`; checkout de trabalho segue em `BorizonV26.3`. Nenhuma alteração de código server foi migrada ou validada ainda. | Em andamento (preparação) | Conferir a origem da branch, inventariar o código real da `main` e medir o baseline permitido sem compilar o client. |
 
 ## Ponto de partida verificado
 
@@ -218,25 +222,25 @@ ficam fora deste projeto server vanilla.
 
 ## Decisões de escopo já tomadas
 
-- [x] **Produto inicial:** servidor Horizon vanilla 26.3, sem as extensões do fork.
-- [x] **Sem build client:** nenhum `cargo build/check/test -p horizon-client`, build
+- **Produto inicial:** servidor Horizon vanilla 26.3, sem as extensões do fork.
+- **Sem build client:** nenhum `cargo build/check/test -p horizon-client`, build
    da janela ou teste de renderer. O baseline usa o release/Actions existente;
    o primeiro build novo usa o pacote server-owned depois da extração.
-- [x] **Lógica existente:** mover o código dedicado e simulação usada. Não
+- **Lógica existente:** mover o código dedicado e simulação usada. Não
    reimplementar mecânicas vanilla por causa de nomes/pastas antigos.
-- [x] **Mods:** remover a antiga API/runtime de trait mods; não migrar modpacks,
+- **Mods:** remover a antiga API/runtime de trait mods; não migrar modpacks,
    registro Horizon ou loader de mods. Manter datapacks vanilla somente onde a
    lógica do jogo exigir.
-- [x] **Plugin API `.so`:** fora desta migração vanilla. Não integrar API, SDK ou
+- **Plugin API `.so`:** fora desta migração vanilla. Não integrar API, SDK ou
    loader agora; preservar a versão atual em `main`/histórico para uma etapa
    posterior independente.
-- [x] **Extras de gameplay:** anticheat e chat filter não entram no engine vanilla
+- **Extras de gameplay:** anticheat e chat filter não entram no engine vanilla
    inicial. Reavaliar depois como plugins separados, sem acoplá-los ao core.
-- [x] **Crates:** podem continuar separados quando forem componentes necessários do
+- **Crates:** podem continuar separados quando forem componentes necessários do
    servidor. Nenhum crate será mantido para preservar compatibilidade client.
    Consolidar crates somente quando reduzir dependência/custo ou simplificar uma
    fronteira real.
-- [x] **Release:** primeiro provar instalação/preparação limpa com o pacote
+- **Release:** primeiro provar instalação/preparação limpa com o pacote
    publicado; o release anterior não empacotou tudo que `horizon-prepare`
    precisou no teste local.
 
@@ -270,7 +274,7 @@ ficam fora deste projeto server vanilla.
 
 ### Branch e baseline
 
-- [x] Criar `BorizonV26.3` a partir da `main` limpa e registrar o commit de origem (`f2e5556cbc`).
+- [ ] Registrar e verificar a relação de origem entre `BorizonV26.3` e a `main`; a cópia local de referência está em `/home/ubuntu/BorizonServer-main` (commit `f2e5556cbc`).
 - [ ] Guardar no roadmap a saída do grafo server atual, o tempo/RAM do build do
     workflow e o log de uma instalação limpa do release. Usar dados dos Actions e
     do release já existente; não rebuildar `horizon-client` para criar baseline.
@@ -379,19 +383,11 @@ ficam fora deste projeto server vanilla.
     upstream necessários, CLI/preparer e documentação server. SDK/loader ainda não
     foi reintegrado.
 
-### Reintegrar plugins — etapa posterior obrigatória
+### Fora do escopo: mods e plugins
 
-**Obrigatória para concluir o objetivo do projeto Borizon.** A branch pode
-entregar primeiro o marco vanilla sem plugins, mas isso é uma fase intermediária,
-não o produto final descrito pelas instruções do projeto.
-
-Somente após o marco vanilla concluído:
-
-- [ ] Trazer `server-plugins/api`, `sdk` e `loader` em mudança independente, sem AuraEssentials embutido.
-- [ ] Medir o grafo antes e depois e provar que a integração não reintroduz crates de client.
-- [ ] Validar ABI, carregamento real de `.so`, ciclo de vida/hooks e testes de plugins.
-
-- [ ] **Aceite desta etapa:** SDK/API/loader compilam e passam as validações acima; o objetivo completo do Borizon só fica concluído após esse aceite.
+Não migrar nem integrar `server-plugins/api`, `sdk`, `loader`, API antiga de trait
+mods ou qualquer sistema de plugins. Esses componentes permanecem na `main` e no
+histórico e não são critério de conclusão desta branch.
 
 ## Regras de execução
 
@@ -428,7 +424,7 @@ Somente após o marco vanilla concluído:
   checagem é automatizada para evitar regressão.
 - [ ] README, docs e workflows descrevem exclusivamente o projeto server-side.
 
-O carregamento de plugins `.so` é critério da etapa posterior, não deste marco.
+Plugins, SDKs e loaders `.so` não fazem parte do escopo nem dos critérios de conclusão desta branch.
 
 ## Referências locais
 

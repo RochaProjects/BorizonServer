@@ -13,6 +13,7 @@ To play, use [the launcher](../launcher/README.md); the project site is [playhor
 - [Native client](native-client.md): options, controls, the dedicated server, `horizon-ctl` scripting, packaging, architecture.
 - [Controllers](controllers.md): playing with PlayStation, Xbox and Nintendo Switch Pro controllers, Steam Deck built-in controls, analog movement, and the input layer.
 - [Host a server](hosting.md): install `horizon-server`, prepare the game files, first run, `server.toml`, the commands, the web panel, backups, services and Docker; what works today and what doesn't yet.
+- [Server-only migration roadmap](server-only-migration-roadmap.md): the plan to turn this fork into a server-only project by extracting the existing dedicated engine and removing client-only code without rewriting the game logic.
 - [A server's levels](server-levels.md): how the dedicated server and single player's server thread tick, save and travel between dimensions.
 - [Velocity forwarding](velocity-forwarding.md): the player-information exchange behind a Velocity proxy and how it was checked.
 - [The anticheat](anticheat.md): the dedicated server's own checks, off unless `server.toml`'s `[anticheat]` turns them on: violation levels, setback, alerts, kicks, the log, and how to write a check.

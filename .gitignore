@@ -1,0 +1,9 @@
+/target/
+/.local/
+/logs/
+/run/
+/saves/
+/backups/
+/minecraft/
+/assets/
+/exporters/

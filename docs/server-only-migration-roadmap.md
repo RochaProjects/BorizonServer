@@ -43,10 +43,10 @@ existir branch, documentação ou checkout de referência.
 
 | Fase | Feito | Em andamento | Pendente | Feito / evidência | Falta / próximo critério verificável |
 |---|---|---|---|---|---|
-| Branch e baseline | [ ] | [ ] | [x] | Migração e baseline de build ainda não iniciados. Cópia local de referência da `main` em `/home/ubuntu/BorizonServer-main`, commit `f2e5556cbc`; branch de trabalho `BorizonV26.3` mantida separada. | Registrar a origem da branch; capturar baseline reproduzível de grafo, Actions e instalação limpa; conferir o contrato de empacotamento do preparer. |
-| Inventário do uso server real | [ ] | [ ] | [x] | — | Registrar imports/símbolos e evidências por pacote, separando build/test/runtime; completar auditoria dos módulos mistos. |
-| Engine server-owned | [ ] | [ ] | [x] | — | Criar e compilar pacote próprio sem `horizon-client`/renderer/input; provar startup com recursos preparados, mundo e conexões. |
-| Migração dos módulos mistos | [ ] | [ ] | [x] | — | Migrar estado e operações reais de tick, rede e save; remover dependências client sem stubs; executar testes server. |
+| Branch e baseline | [ ] | [x] | [ ] | Cópia de referência da `main` em `/home/ubuntu/BorizonServer-main` (`f2e5556cbc`). Capturado `cargo metadata --no-deps` (57 pacotes na origem) e árvore estática do dedicado sem a feature opcional `.so` (947 linhas); ainda contém client/GPU e resíduos antigos de mods (`horizon-mods`, `horizon-mod-api-gen`). | Verificar relação histórica da branch; registrar tempo/RAM dos Actions e smoke de instalação limpa; confirmar o contrato de empacotamento do preparer. |
+| Inventário do uso server real | [ ] | [x] | [ ] | Auditoria estática: `horizon-core`, `horizon-world`, `horizon-protocol` e `horizon-server-files` formam a base portada; `horizon-command`, `horizon-items`, `horizon-sim-data` e `horizon-client-core` foram mapeados, mas exigem extração de módulos comuns e remoção de fronteiras client. Capturado `cargo tree --locked --edges normal -p horizon-server` (404 linhas: sem `horizon-client`, GPU, janela ou plugin); `horizon-prepare` (44 linhas, sem deps Cargo de workspace). | Mapear símbolo/import e separar runtime do engine, serviços da CLI, Java/exporters e assets; completar inventário dos módulos mistos. |
+| Engine server-owned | [ ] | [ ] | [x] | Ainda não há binário/engine migrado nesta branch. | Extrair a entrada dedicada e runtime de jogo para pacote próprio sem `Game` visual nem `horizon-client`; iniciar mundo e aceitar conexões. |
+| Migração dos módulos mistos | [ ] | [x] | [ ] | Portados da `main`: `horizon-core`, `horizon-world`, `horizon-protocol` e `horizon-server-files`, com cortes server-only. De `horizon-sim-data` foram migrados a `horizon-world` os módulos isolados `ticket_levels` (11 testes passaram; 1 benchmark ignorado) e `world_spawn` (4 testes passaram). `cargo fmt --all -- --check` e `cargo test --workspace --locked` passaram: 1.275 testes, 0 falhas e 11 ignorados no host ARM64. `cargo tree --workspace --locked` (181 linhas) não contém pacotes client/mod/plugin/render/GPU. | Ainda falta remover API de geração nativa de mods e rotinas de far-terrain client de `horizon-world`, e extrair runtime dedicado/estado/tick/rede/save de `Game`; não há engine executável nesta branch. |
 | Remoção de extras/mods do marco vanilla | [ ] | [ ] | [x] | — | Excluir referências antigas só após confirmar datapacks vanilla, worldgen e recursos; validar que nenhum comportamento vanilla foi perdido. |
 | Redução do workspace/CI/release | [ ] | [ ] | [x] | — | Remover pacotes client do grafo e workflows; automatizar ausência de renderer/input/GPU e testar o pacote publicado em diretório limpo. |
 | Limpeza do produto server-only | [ ] | [ ] | [x] | — | Limpar arquivos exclusivamente client identificados, atualizar README/docs, validar critérios finais e preparar integração separada. |
@@ -61,24 +61,38 @@ não houver itens adicionais.
 
 | Fase | Tarefa descoberta / motivo | Arquivos afetados | Validação e resultado | Feito | Em andamento | Pendente |
 |---|---|---|---|---|---|---|
-| — | — | — | — | [ ] | [ ] | [ ] |
+| Inventário / threads | A cópia integral de `horizon-threads` mistura scheduler/allocator server com UI de boot/menu e profiling de heap; testes de amostragem excedem limiares no host ARM64. Não portar pacote completo no escuro. | `crates/horizon-threads/`, `third_party/libmimalloc-sys/` (cópia provisória descartada) | 56 testes passaram; 13 de sampling falharam; UI removida antes do teste. Crate e patch não ficaram na branch. | [ ] | [ ] | [x] |
+| Teste server-only / world probe | O agregado `world_probe` ainda referenciava `face_visibility_fixture`, que chamava o módulo client `block_render` já removido do crate server. Excluir apenas esse fixture e suas referências, mantendo probes de simulação. | `crates/horizon-world/examples/probe/main.rs`; removido `crates/horizon-world/examples/probe/face_visibility_fixture.rs` | `cargo fmt --all -- --check` passou; `cargo test --workspace` passou (1.260 testes, 0 falhas, 10 ignorados; ARM64). | [x] | [ ] | [ ] |
+| Baseline antigo / resíduos de mods | O grafo dedicado sem a feature `.so` ainda inclui o crate antigo `horizon-mods` e o build-time generator `horizon-mod-api-gen`; release da main ativa `server-plugins` embora o archive não contenha `.so`. Isso não deve ser confundido com árvore vanilla server-only nem trazido ao novo workspace. | `docs/server-only-migration-roadmap.md`; ver `crates/horizon-client/Cargo.toml`, `.github/workflows/server-release.yml` somente no checkout de referência | `cargo tree -i` estático: `horizon-mods` via client/client-lib; `horizon-mod-api-gen` via build-dependency client; plugin API/loader não resolvem sem feature. Nenhuma build foi executada. | [x] | [ ] | [ ] |
+| Corte server-safe / chunk tickets | `ticket_levels` implementa níveis vanilla de carregamento/simulação dos chunks (player, forced, portal e dragon). Imports de produção limitam-se a `horizon_core::fast_hash::FxHashMap` e `std`; sem dependência de `horizon-client-core`, mods, plugins ou GPU. Copiado como módulo de `horizon-world`, sem trazer `horizon-sim-data` inteiro. | `crates/horizon-world/src/ticket_levels.rs`, `crates/horizon-world/src/lib.rs` | `cargo fmt --all -- --check`; teste direcionado: 11 passaram, 0 falhas, 1 benchmark ignorado. `cargo test --workspace --locked` e verificação do grafo concluídos sem falha. | [x] | [ ] | [ ] |
+| Corte server-safe / spawn | `world_spawn` contém a espiral de spawn inicial e a busca vanilla de spawn/respawn; depende somente do `HeightmapType` de `horizon-world` e tipos std. Copiado da main com o import ajustado para `crate::heightmap`; sem lógica de UI, assets, mods ou plugins. | `crates/horizon-world/src/world_spawn.rs`, `crates/horizon-world/src/lib.rs` | `cargo fmt --all -- --check`; teste direcionado: 4 passaram, 0 falhas; validação completa depois do corte também passou (workspace: 1.275 passaram, 0 falhas, 11 ignorados; árvore sem client/mod/plugin/render/GPU). | [x] | [ ] | [ ] |
+| Exclusão de APIs nativas de mods | A revisão do código portado encontrou callbacks explícitos para loot tables, condições/funções de loot e componentes padrão de itens (`NativeLoadHooks`, `docs/native-mods.md`). Foram removidos os hooks, pontos de chamada, API de contexto/place de loot e testes específicos de mod; comportamentos vanilla permanecem e tipos de loot desconhecidos não são executados. Ainda foi encontrada `worldgen/native_generate.rs`, uma API explícita de `native_chunk_generate`/far-column para mods, além de sampling de far terrain com uso client; esses trechos continuam na branch e são bloqueio de escopo até remoção/isolamento. | `crates/horizon-world/src/lib.rs`, `item_defaults.rs`, `loot.rs`; removidos `native_load_hooks.rs` e `tests/native_load_hooks.rs`; pendente `worldgen/native_generate.rs` e pontos de integração em `worldgen/generator.rs` | `cargo fmt --all -- --check` e `cargo test -p horizon-world --lib` passaram após a remoção (511 passaram, 0 falhas, 4 ignorados). A tentativa de suíte workspace foi encerrada por fechamento do prompt antes do sumário; não conta como aprovação. A árvore Cargo não foi afetada por dependências. Ainda falta retirar `worldgen/native_generate` e far-terrain client. | [ ] | [x] | [ ] |
 
 ## Diário de execução
 
 | Data | Atividade/evidência | Estado | Próximo passo |
 |---|---|---|---|
-| 2026-11-24 | Clonada a `main` separadamente em `/home/ubuntu/BorizonServer-main`, commit `f2e5556cbc`; checkout de trabalho segue em `BorizonV26.3`. Nenhuma alteração de código server foi migrada ou validada ainda. | Em andamento (preparação) | Conferir a origem da branch, inventariar o código real da `main` e medir o baseline permitido sem compilar o client. |
+| 2026-11-24 | Clonada a `main` em `/home/ubuntu/BorizonServer-main` (`f2e5556cbc`); levantados metadados (57 pacotes) e baseline estático com `dedicated-server` sem feature `.so` (947 linhas; client/render/GPU e resíduos `horizon-mods`/`horizon-mod-api-gen` presentes). | Em andamento | Comparar histórico de branch, Actions e smoke existente; não compilar o client. |
+| 2026-11-24 | Copiado `horizon-core` da main sem alterações; workspace mínimo só com crates server. `cargo fmt --all -- --check` e `cargo test -p horizon-core`: 160 unit, 2 integration passaram; 4 ignorados. `cargo tree -p horizon-core`: só `libm 0.2.16`. | Validado (crate) | Ligar os primitives ao runtime dedicado depois de extrair seus módulos. |
+| 2026-11-24 | Copiado `horizon-world`; removido `block_render` (culling de faces de render) e chamadas de `horizon-threads::work` (marcadores de profiling, não gameplay). `cargo check -p horizon-world --lib`; `cargo test -p horizon-world --lib`: 501 passaram, 3 ignorados. | Validado (crate) | Continuar conferindo módulos de apresentação e uso server real durante a extração de `Game`. |
+| 2026-11-24 | Copiado `horizon-protocol`; excluídos módulos custom `mod_list`/`mod_net`; mantidos pacotes de handshake/login vanilla (inclui packet vanilla chamado Login Plugin Query, não API de mods). `cargo test -p horizon-protocol --lib`: 456 passaram, 1 ignorado. | Validado (crate) | Integrar transporte na entrada server-owned e revisar suporte opcional a versões antigas. |
+| 2026-11-24 | Copiado `horizon-server-files` (properties/EULA/listas/cache/perfis). `cargo test -p horizon-server-files --lib`: 26 passaram. `cargo check --workspace` passou com 4 crates; graph do workspace não contém `horizon-client`, renderer, wgpu ou winit. | Validado (crates/base) | Integrar API de arquivos no host/engine e seguir com runtime. |
+| 2026-11-24 | Tentativa provisória de copiar o `horizon-threads` inteiro: removidos boot_paint e system_menu de UI; 56 testes passaram, 13 de sampling/profiling falharam por limiares de amostragem no host cloud ARM64 (3 ignorados). A cópia foi descartada: não é dependência dos crates portados e a fronteira server mínima ainda precisa ser identificada. | Tentativa/limite registrado | Auditar o uso runtime antes de extrair só scheduler/sinais/allocator necessários; não reintroduzir pacote completo sem teste alvo. |
+| 2026-11-24 | `cargo test --workspace` inicialmente parou ao compilar `world_probe`: o `face_visibility_fixture` exigia `block_render`, removido por ser culling visual. Removida só a fixture e as duas referências; probes server de mundo/simulação foram preservados. `cargo fmt --all -- --check` e a suíte completa passaram: 1.260 testes, 0 falhas, 10 ignorados; nenhuma build client. | Validado (workspace, host ARM64) | Seguir o inventário e manter o alvo x86_64/Actions como validação pendente. |
+| 2026-11-24 | A baseline dedicada sem `server-plugins` conta 947 linhas, mas não é vanilla limpa: `cargo tree -i` confirma `horizon-mods` como dependência normal e `horizon-mod-api-gen` como build-dependency do `horizon-client`; os pacotes `horizon-server-plugin-api`/`loader` não aparecem sem a feature opcional. O workflow de release da main habilita essa feature (server-release.yml:65) e apenas omite `.so` externo. Nada disso foi migrado ou compilado. | Advertência de baseline | Excluir também os resíduos de mods/gerador do engine server-owned; não usar workflow legado como build de destino. |
+| 2026-11-24 | Auditoria estática separou a CLI do engine: o grafo normal de `horizon-server` (404 linhas) não contém crate client/GPU/janela/plugin; seu código procura primeiro `horizon-engine` e ainda aceita `horizon-client` como fallback (`crates/horizon-server/src/engine.rs:14-18, 51-64`). `horizon-prepare` (44 linhas; grafo sem workspace deps) exige `facts.json`, `block-tags.json`, `registries.json` e `commands.json`; usa inputs/jars do jogo e compila exporters server e client (`crates/horizon-prepare/src/lib.rs:47-50, 121-159`). O engine atual ainda valida fontes de font/textures (`engine.rs:158-168`), e a geração de worldgen compara os dois lados. | Auditoria concluída (sem build/edição de código) | Ao extrair engine/preparer, remover fallback e saídas client só depois de substituir dependências verificadas; mapear exporters e consumidores de assets antes de podar. |
+| 2026-11-24 | Portado `ticket_levels` de `horizon-sim-data` para `horizon-world`: níveis de chunk vanilla a partir de player/view/simulation distance, forced chunks, portal tickets e arena do dragão. Imports de produção: somente `horizon-core::fast_hash` e `std`; atualizado o comentário do benchmark para o pacote novo. `cargo fmt --all -- --check`, teste direcionado (11 passed, 1 ignored) e `cargo test --workspace --locked` passaram; o grafo atual (181 linhas) não contém client/mod/plugin/render/GPU. | Validado (módulo/workspace, host ARM64) | Integrar `ChunkTickets` ao runtime após a extração do tick; a suíte x86_64/Actions continua pendente. |
+| 2026-11-24 | Portado `world_spawn` de `horizon-sim-data` para `horizon-world`: espiral vanilla de spawn inicial, busca de spawn/respawn e seleção de candidatos em chunks. Import ajustado de `horizon_world::heightmap` para `crate::heightmap`; demais APIs e testes preservados. `cargo fmt --all -- --check` e teste direcionado passaram (4 testes). A seguir, a validação completa do workspace passou (1.275 testes, 0 falhas, 11 ignorados); árvore Cargo (181 linhas) sem client/mod/plugin/render/GPU. | Validado (módulo/workspace, host ARM64) | Integrar no runtime ao extrair criação/respawn de `Game`; a suíte x86_64/Actions continua pendente. |
+| 2026-11-24 | Revisão de escopo localizou e removeu APIs nativas de mod portadas inadvertidamente em `horizon-world`: callbacks de loot/item defaults, contexto/place nativo, módulo de instalação global e testes de hooks. A auditoria também identificou `worldgen/native_generate` e sampling de far-terrain client como resíduos a excluir; nada disso deve ser integrado ao engine vanilla. | Mudança de escopo; testes da lib world aprovados | Reexecutar workspace completo; remover/investigar integrações de worldgen native e far-terrain antes de considerar o crate server-only. |
 
 ## Ponto de partida verificado
 
-Retrato da `main` em 2026-11-24, commit `1608bd3d5e4ac60f24e2e8923b51e31454b30316`:
+Retrato da `main` em 2026-11-24, commit `f2e5556cbcb8060313f513d1871ccf3e7fb6e6ec`:
 
 - `horizon-server` é o CLI/supervisor que inicializa e administra o servidor.
 - `horizon-prepare` importa os arquivos locais de Minecraft e prepara os dados
   usados pelo engine.
-- O executável entregue como `horizon-engine` ainda é compilado pelo pacote
-  `crates/horizon-client`, com `--no-default-features` e as features
-  `dedicated-server,server-plugins`.
+- O workflow legado de release (`.github/workflows/server-release.yml:65-70`) ainda compila `crates/horizon-client` como binário e o renomeia para `horizon-engine`, habilitando `dedicated-server,server-plugins`; a release diz não incluir plugin `.so`, mas compila o host/API C ABI. Não reproduzir esse build na branch vanilla.
 - O caminho de runtime dedicado já tem entrada própria em
   `crates/horizon-client/src/game/dedicated.rs` e integração de plugins em
   `crates/horizon-client/src/game/server_plugins.rs`, mas o tipo `Game` e vários
@@ -104,12 +118,49 @@ Comando que reproduz o grafo dedicado atual no Linux:
 ```sh
 cargo tree --locked --target x86_64-unknown-linux-gnu \
   -p horizon-client --no-default-features \
-  --features dedicated-server,server-plugins
+  --features dedicated-server
 ```
 
-Essa saída é o baseline da migração. Medir novamente após cada corte e comparar
-crates, dependências nativas, duração de build e memória do runner. Não estimar
-ganhos sem uma medição reproduzível.
+Essa saída é o baseline estático do engine legado sem feature `server-plugins`; ela ainda inclui `horizon-mods` e o build-dependency `horizon-mod-api-gen` (o `cargo tree -i` aponta entrada pelo pacote e pelo build script, respectivamente). O workflow de release atual da main habilita `.so` plugins; esse caminho não faz parte do destino vanilla. Medir novamente após cada corte e comparar crates, dependências nativas, duração de build e memória do runner. Não estimar ganhos sem medição reproduzível.
+
+### Auditoria estática do CLI e do preparer (2026-11-24)
+
+| Alvo | Evidência observada | Consequência para a migração |
+|---|---|---|
+| `horizon-server` (CLI/supervisor) | `cargo tree --locked --edges normal -p horizon-server` na referência: 404 linhas; árvore com `horizon-platform`, `horizon-server-files`, `horizon-world`, `horizon-protocol`, `horizon-threads`, `horizon-core`, `horizon-system`, `horizon-bench`, `horizon-perf-format`, `horizon-hooks`, `horizon-mcp`, `horizon-anticheat`, `horizon-chat-filter` e `horizon-release-sign`. Sem `horizon-client`, renderer, `wgpu`, `winit`, `naga` ou plugin host. | O supervisor pode migrar separadamente do engine; suas dependências extras/serviços ainda precisam ser avaliados contra o marco vanilla. Ele executa o binário do jogo e não é o engine. |
+| Seleção do engine pela CLI | `crates/horizon-server/src/engine.rs:14-18, 51-64`: tenta `horizon-engine` primeiro, mas mantém fallback ao executável `horizon-client`. | Após existir engine server-owned, remover o fallback e atualizar mensagens/installer para que o produto não dependa de client. |
+| `horizon-prepare` (binário e biblioteca) | `cargo tree --locked --edges normal,build -p horizon-prepare`: 44 linhas; sem dependências Cargo de workspace. Runtime direto: `crc32fast`, `regex`, `sha1`, `sha2`, `zip`, com `libc` em Linux/macOS; build usa `sha2` para hash de fontes (`build.rs:5-37`). | O pacote é independente de Cargo, mas seu comportamento e dados produzidos ainda podem depender de fontes Java e jars do cliente; não basta preservar seu manifest. |
+| Dados requeridos pelo engine atual | `crates/horizon-server/src/engine.rs:158-168` valida `facts.json`, `block-tags.json`, `registries.json`, `commands.json` e diretórios de font/textures. `horizon-prepare/src/lib.rs:47-50, 121-159` distingue exporters server/client; worldgen também compara bundles dos dois jars. | Preservar os dados até a nova fronteira de carregamento provar quais arquivos são necessários. Auditar/condicionar as saídas client e empacotar exporters server somente após rastrear consumidores e fallbacks. |
+
+As árvores foram obtidas sem `cargo build/check/test` nesses dois pacotes e sem compilar o client. `cargo tree` resolveu metadata/dependências e baixou alguns crates para o cache; nenhuma alteração foi feita no checkout de referência.
+
+### Auditorias estáticas de command/items/sim-data e core compartilhado (2026-11-24)
+
+As auditorias abaixo foram feitas somente na cópia de referência `/home/ubuntu/BorizonServer-main`. Não houve build, testes, edição ou cópia destes quatro pacotes durante a auditoria. Os achados guiam o recorte; não autorizam arrastar a crate client inteira.
+
+| Pacote/fronteira | Evidência de código e uso | Decisão provisória server-only |
+|---|---|---|
+| `horizon-client-core` | Manifesto direto: apenas `horizon-world`, `serde` e `serde_json` (`crates/horizon-client-core/Cargo.toml:9-12`), sem dependências de GPU/janela. Exporta NBT/SNBT/path, texto/componentes/idiomas, registries, gamerules, scoreboard, potions, partículas, bossbar, sound source, UUID/Who e `key_display`. `component.rs:421-425` resolve `keybind` através de `key_display`, que contém layout/nome de teclado. | Não copiar como `horizon-client-core`. A camada de tipos compartilhados pode ser extraída com nome neutro; deixar `key_display` no client e manter o `keybind` estruturado no protocolo sem fingir conhecer layout/configuração do usuário. `text`/NBT e `lang` exigem decidir quais semânticas são dados de jogo vs apresentação. |
+| `horizon-command` | `vanilla.rs:41-73,574-642` constrói dispatcher e árvore dedicada; `tree_extra` contém registros dedicados; `network.rs:11-12` serializa `Commands` via `horizon-protocol`. Parsing, sugestões, permissões, mensagens de erro, ordem e árvore são parte do comportamento vanilla. `/pregen` vem da extensão Horizon opcional, não do dispatcher vanilla. Depende de módulos do core como gamerules, sound_source, bossbar, text/lang, NBT, registries, scoreboard e particle_type. | Candidato server-side, porém só após substituir a dependência nominal em `horizon-client-core` por APIs comuns extraídas. Preservar semântica e testes dedicados; excluir extensão `/pregen` do dispatcher vanilla. |
+| `horizon-items` | Não tem dependência direta de renderer/protocolo; contém regras de ferramenta, mineração, loot/consumíveis, durabilidade/cooldowns, componentes de item e codecs NBT (`item_nbt.rs`). Usa scoreboard/component/NBT e lang via core. `enchant::full_name*` é apresentação; `blocks::StateFacts` mistura dureza/fluido/colisão/suporte/som com `RenderShape`, `solid_render`, `random_offset`, `outline` e `outline_edges`. | Mover regras/codec/dados que o servidor consume e cortar apresentação só com mapa de consumidores. `outline` pode servir picking/colisão; não eliminar sem provar que nenhum cálculo server usa. Não habilitar `test-support`. |
+| `horizon-sim-data` | Núcleo valioso: chunks, block entities, world/tickets/spawn, colisão, lighting, block edits, containers/furnaces, brewing, efeitos, raids, sculk/vault, POI e random sources. Mistura HUD, custom sky, pack palettes/hooks, CEM, animação de render, containers/blocos modded, auth/skins, crash/telemetria. Manifesto acopla `horizon-client-core`, `horizon-threads`, `horizon-system`, assets/protocol/items/command e externos (`png`, `ureq`, `glam`, `bytemuck`, compressão). | Não copiar integral: `ticket_levels` e `world_spawn` foram extraídos em separado para `horizon-world`, cada qual com testes próprios; os demais módulos requerem corte por uso/import. Manter fronteiras mistas `chunk/block_entity.rs`, `containers.rs`, `block_entities.rs` e pack data sob investigação. |
+
+**Testes sugeridos após extração:** suíte de comando vanilla/dedicado (árvore, parse, permissões, mensagens); round-trip NBT de stacks e componentes; invariantes de chunks/tickets/colisão/lighting/block entities; nenhuma dessas suítes foi executada nesta rodada.
+
+### Auditoria estática do runtime dedicado legado (2026-11-24)
+
+| Fronteira | Evidência na `main` | Implicação para o porte server-only |
+|---|---|---|
+| Bootstrap dedicado | `crates/horizon-client/src/game/dedicated.rs:46-105` parte de `run`, usa `load_resources`, cria `Game::new` e termina em `run_dedicated`; passa `UiResources` e `Audio` para a construção. | É um ponto de entrada reutilizável, não um engine autônomo. Preservar lógica vanilla de startup, mas mover a propriedade do estado e o boot para o pacote server-owned antes de retirar `horizon-client`. |
+| Bundle de recursos | `resource_load.rs:124-143, 151-257, 342-474` carrega dados headless por branches, mas o tipo `CoreTables` ainda contém `Assets`, `RenderAssets`, `ItemRenderer` e `FaceVisibility`, constrói `MeshTables`/`PackResources` e carrega metadados/language. A versão server deste branch removeu `horizon-world::block_render`; portanto a cópia integral deste loader não compila sem adaptar essa fronteira. | Separar primeiro tabelas de registry/gameplay/biome/collision/behavior necessárias ao servidor dos bundles de meshing/render; não reintroduzir `block_render` para preservar um tipo do loader client. |
+| Construção de `Game` | `game.rs:2026-2031` define `UiResources` como atlas de GUI e panorama; `game.rs:2152-2425` contém no mesmo `Game` `World`, `Streaming`, save/ticks/entidades e estado de player/container, junto de input/winit, window/renderer, telas/UI, geometria GPU e áudio/music. | A auditoria confirma que separar server não é trocar nome de binário: extrair estado e métodos por domínio enquanto preserva as implementações de simulação e save. |
+| Recursos CPU visuais | `resource_loader.rs:64-113` constrói `GameCpuResources::server` com modelos/variantes vazios para satisfazer o construtor compartilhado; é caminho de compatibilidade do build dedicado. | Não portar bundle visual vazio como API server. Substituir por recursos de simulação realmente usados, sem stubs para tipos do client. |
+| Tick/níveis | `game/levels.rs:43-104, 644-795` guarda níveis, mundos, saves, streaming, entidades e tick server; usa tipos de `horizon-client` e também instrumentação/plugin callbacks no loop. | Preservar código vanilla de níveis/tick e remover chamadas de profiling/mod/plugin por corte verificável; mapear dependências por símbolo antes de copiar o módulo integral. |
+
+
+**Triagem dos submódulos em `game/dedicated.rs` (main, 2026-11-24):** `events.rs` é um buffer para endpoint Horizon `/api/v1/events`, não um requisito vanilla; `predicate_graph.rs` declara ser validação parcial nova, não port de `RegistryDataLoader`/`ValidationContext`; ambos ficam fora do núcleo vanilla. `watchdog.rs` é comportamento server-side pertinente, mas chama `horizon_threads::stack_dump` e `horizon_client::crash`/logging, então requer uma fronteira neutra de stack/crash antes de portar. `management.rs`, `status.rs`, `transfer.rs` e `report.rs` acessam `Game` ou tipos/profiling client; não migrar integralmente nesta etapa.
+
+**Próxima sequência técnica:** receber o resultado da suíte completa e do `cargo tree` pós-`world_spawn`; mapear os usos de produção no caminho do `Game` dedicado; estabelecer fronteiras neutras para NBT/text/scoreboard/keybind e separar loaders de recurso de simulação dos bundles visuais. Na próxima extração, considerar somente código vanilla server-safe já existente, mantendo adapter temporário de `Game`; excluir endpoints/eventos Horizon, a validação parcial de predicados e APIs nativas de mod do núcleo vanilla. Foi removida a camada de hooks de loot/itens, mas a API `worldgen/native_generate` e as rotinas de far-terrain (client) ainda bloqueiam o corte server-only e precisam ser retiradas antes de declarar a base limpa. O watchdog dedicado só pode ser extraído após desacoplar crash-report/stack-dump do crate client. Nenhuma das crates `horizon-client-core`, `horizon-command`, `horizon-items` ou `horizon-sim-data` foi copiada integralmente; apenas `ticket_levels` e `world_spawn` foram migrados para `horizon-world`. Não foi feita build de `horizon-client` nem de alvo legado.
 
 ## Inventário completo do workspace atual
 
@@ -181,12 +232,12 @@ marcadas AUDITAR ainda exigem a inspeção da etapa 1 antes de apagar código.
 | `horizon-server-plugin-sdk` | ADIAR; não migrar agora | Wrappers Rust públicos do ABI; não pertence ao marco vanilla puro. |
 | `horizon-shader-api` | REMOVER | API de shader packs Horizon e ferramenta de shader, sem função em servidor vanilla. |
 | `horizon-shaders` | REMOVER do engine vanilla | Leitura de shader packs custom do client; não confundir com carregamento vanilla de datapack/recursos. |
-| `horizon-sim-data` | MANTER/MOVER módulos server-safe | Extrair apenas tipos/dados usados por tick, chunks, colisões, entidades e worldgen; a finalidade final é server-owned, sem promessa de compartilhamento com client. |
+| `horizon-sim-data` | SPLIT; não migrar como crate inteira | `ticket_levels` e `world_spawn` server-safe já foram migrados para `horizon-world`; extrair os demais módulos por uso/import, mantendo fora HUD/sky/CEM/animações, auth/skins, crash/telemetria, hooks e dados de mods. |
 | `horizon-system` | ADIAR/condicional à CLI | Informações do processo/máquina. Não é simulação; manter apenas se status/diagnóstico da ferramenta de hospedagem precisar. |
 | `horizon-telemetry` | REMOVER | Consentimento/outbox/upload de telemetria do client. |
 | `horizon-theme` | REMOVER | Fontes, ícones e design system de UI; não manter por relatórios visuais da CLI sem decisão explícita. |
 | `horizon-threads` | MANTER e auditar deps de plataforma | Runtime de threads/allocator usado pelo engine; remover somente as partes client-specific, mantendo scheduling e alocador requeridos. |
-| `horizon-world` | MANTER | NBT, regiões, chunks e armazenamento vanilla do mundo. |
+| `horizon-world` | MANTER | NBT, regiões, chunks e armazenamento vanilla do mundo; agora também inclui `ticket_levels` (níveis de chunk tickets) e `world_spawn` (spawn inicial/respawn vanilla). |
 | `xtask` | ADIAR/REDUZIR | Ferramentas do repositório. Manter apenas tarefas de empacotamento/checagem server; pode sair do workspace runtime. |
 
 ### Pacotes fora do workspace e diretórios
@@ -274,10 +325,9 @@ ficam fora deste projeto server vanilla.
 
 ### Branch e baseline
 
-- [ ] Registrar e verificar a relação de origem entre `BorizonV26.3` e a `main`; a cópia local de referência está em `/home/ubuntu/BorizonServer-main` (commit `f2e5556cbc`).
-- [ ] Guardar no roadmap a saída do grafo server atual, o tempo/RAM do build do
-    workflow e o log de uma instalação limpa do release. Usar dados dos Actions e
-    do release já existente; não rebuildar `horizon-client` para criar baseline.
+- [x] Clonar `main` em checkout separado para referência: `/home/ubuntu/BorizonServer-main`, commit `f2e5556cbc`; manter o trabalho em `BorizonV26.3`.
+- [x] Capturar metadados (57 pacotes na origem) e baseline estático do alvo dedicado com `dedicated-server`, sem a feature `server-plugins` `.so` (947 linhas); a saída mostra crates client/GPU/janela e resíduos `horizon-mods`/`horizon-mod-api-gen`; não é uma baseline vanilla limpa. Nenhum build do client foi executado.
+- [ ] Verificar relação histórica da branch e registrar tempo/RAM dos Actions e smoke de instalação limpa usando dados existentes; não rebuildar `horizon-client` para baseline.
 - [ ] Corrigir o release/preparação até uma pasta vazia conseguir preparar recursos
     usando somente o arquivo publicado e os arquivos locais Minecraft do operador.
 
@@ -286,8 +336,9 @@ ficam fora deste projeto server vanilla.
 
 ### Inventário do uso server real
 
-- [ ] Gerar `cargo metadata` e `cargo tree` para o engine dedicado, `horizon-server`
-    e `horizon-prepare`. O SDK/loader de plugins está fora deste marco.
+- [x] Gerar `cargo metadata` da origem e `cargo tree` do engine legado dedicado (somente análise estática).
+- [x] Capturar árvores estáticas locked do `horizon-server` (normal) e `horizon-prepare` (normal + build); consultar manifestos e identificar crates de workspace/client ausentes.
+- [ ] Completar classificação de todas as dependências, incluindo dev-dependencies/target-specific e rotas Cargo indiretas; separar dependência Cargo da dependência de artefatos Java/empacotamento.
 - [ ] Para cada dependência de workspace, registrar: quem a importa, símbolos usados
     pelo caminho dedicado, se gera dados/runtime, estado (manter, mover, remover,
     investigar) e evidência em arquivo/linha.
@@ -339,8 +390,7 @@ ficam fora deste projeto server vanilla.
     `horizon-server-api` e referências a `native/`/`native-hooks.json` quando não
     forem usados pelo vanilla.
 - [ ] Remover do primeiro engine os extras Borizon anticheat e chat filter.
-- [ ] Não migrar nem integrar `.so` agora. Preservar código atual em `main` e
-    planejar sua volta numa etapa independente depois da validação vanilla.
+- [ ] Não migrar nem integrar `.so`, API de trait mods, SDK ou loader nesta branch; manter na `main`/histórico, sem etapa de reintegração planejada.
 - [ ] Preservar datapack vanilla, recursos e exporters que a simulação/preparer
     comprovadamente precisa; remover carregamento de mods executáveis e conteúdo
     client.
@@ -359,8 +409,7 @@ ficam fora deste projeto server vanilla.
     exclusivamente ligados a eles do grafo server. Verificar por `cargo tree`,
     incluindo `--target x86_64-unknown-linux-gnu`.
 - [ ] Remover workflows de launcher, binário client, bots, mods antigos e testes
-    visuais. Manter CI de engine vanilla, CLI e preparer. CI do plugin fica para
-    a etapa futura de reintegração.
+    visuais. Manter CI de engine vanilla, CLI e preparer. não incluir CI de plugins/mods nesta branch.
 - [ ] Release constrói apenas os artefatos que mudaram e são distribuídos: engine,
     server CLI e preparer; nenhum build/release do client ou de `horizon-bots`.
 - [ ] Atualizar o workflow para empacotar dependências/exporters de `horizon-prepare`

@@ -208,40 +208,6 @@ impl Behaviours {
         }
         false
     }
-    /// `BoneMealItem.useOn` on a client's level, where nothing grows: whether
-    /// it succeeds there (the server's packet does the growing). A sapling,
-    /// an azalea or a mushroom is only a valid target on a `ServerLevel`
-    /// (`isValidBonemealTarget`), so the client passes on them; `growWaterPlant`
-    /// takes any full water block beside a sturdy clicked face.
-    pub fn bone_meal_succeeds_on_client<L: LevelAccess + ?Sized>(
-        &self,
-        level: &mut L,
-        pos: BlockPos,
-        face: Direction,
-    ) -> bool {
-        let mut ticks = Ticks::default();
-        let mut sim = self.sim(level, &mut ticks);
-        let state = sim.state(pos);
-        // A mod block answers `isValidBonemealTarget` on both sides, so the
-        // client predicts the use with the mod's own answer.
-        let answer = sim.level.is_valid_bonemeal_target(pos, state);
-        if answer == Some(true) {
-            return true;
-        }
-        // Refused (`Some(false)`): growCrop fails, and only growWaterPlant
-        // below can still take the meal.
-        if answer.is_none()
-            && let Some(kind) = self.bonemeal_kind(state)
-            && !matches!(kind, Kind::Sapling | Kind::Azalea | Kind::Mushroom)
-            && sim.bonemeal_valid(kind, pos, state)
-        {
-            return true;
-        }
-        let water = sim.state(rel(pos, face));
-        self.is_face_sturdy(state, face)
-            && self.is_block(water, self.named.water)
-            && self.fluid(water).amount() == 8
-    }
     /// `BoneMealItem.growCrop` (dispensers call this directly).
     pub fn grow_crop<L: LevelAccess + ?Sized>(
         &self,
@@ -296,20 +262,6 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     /// meal is consumed even when `isBonemealSuccess` fails).
     pub(crate) fn grow_crop(&mut self, pos: BlockPos) -> bool {
         let state = self.state(pos);
-        // A mod block answers vanilla's three questions itself, ahead of the
-        // `BonemealableBlock` its template would give it; a block nothing
-        // answers for keeps its own, and vanilla's is what the port runs.
-        match self.level.is_valid_bonemeal_target(pos, state) {
-            Some(true) => {
-                if self.level.is_bonemeal_success(pos, state) {
-                    self.level.perform_bonemeal(self.ticks, pos, state);
-                }
-                return true;
-            }
-            // `growCrop` returns false and keeps the meal.
-            Some(false) => return false,
-            None => {}
-        }
         let Some(kind) = self.b.bonemeal_kind(state) else {
             return false;
         };

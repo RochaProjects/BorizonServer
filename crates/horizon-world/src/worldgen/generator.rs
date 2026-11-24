@@ -26,13 +26,12 @@ use super::{
     density::DensityRegistry,
     generator_structures::Starts,
     material_condition::{
-        CompiledSurfaceRule, MaterialConditionRegistry, MaterialConditions, MaterialDensitySources,
-        MaterialRule, MaterialRuleError, MaterialRuleLibrary, MaterialSurfaceQueries,
+        CompiledSurfaceRule, MaterialConditionRegistry, MaterialRule, MaterialRuleError,
+        MaterialRuleLibrary, MaterialSurfaceQueries,
     },
     material_extensions::{ExtensionBlocks, ExtensionNoises, MaterialExtensions},
     material_stage::{SurfaceInputs, TopMaterialInputs, build_surface_shared},
     material_surface::{ClayBandBlocks, MaterialSurface},
-    native_generate::{NativeGenerate, NativeProtoChunk, far_column, native_chunk_generate},
     overrides::{self, WorldgenOverrides},
     router::{NoiseRouter, RouterField, RouterSamplers},
     settings::NoiseSettings,
@@ -799,8 +798,6 @@ pub struct ProtoChunk {
     /// Entities placed by structures (`ProtoChunk.addEntity`), as NBT with
     /// absolute `Pos`.
     pub entities: Vec<crate::nbt::Compound>,
-    /// False when a native mod's generator turned decoration's placed
-    /// features off for this chunk (`native_chunk_generate`).
     pub(super) features: bool,
     /// A full chunk standing in a decoration region (`ImposterProtoChunk`
     /// with `allowWrites` false): features read it, their ordinary writes
@@ -955,8 +952,6 @@ struct Pipeline<R: RandomSource> {
     spawn_position: std::sync::OnceLock<[i32; 2]>,
     /// A superflat world: its layers stand where the noise terrain would.
     flat: Option<FlatLayers>,
-    /// The dimension it generates, as native mods are told.
-    dimension: String,
 }
 /// `FlatLevelGeneratorSettings.getLayers` as `FlatLevelSource` reads them: the states from the
 /// level's minimum Y up, with the layers `adjustGenerationSettings` replaced by `null`
@@ -1245,7 +1240,6 @@ where
             debug_density,
             spawn_position: std::sync::OnceLock::new(),
             flat: None,
-            dimension: "minecraft:overworld".to_owned(),
         };
         pipeline.decoration = pipeline
             .data
@@ -1279,11 +1273,6 @@ where
             }
         }
         Ok(pipeline)
-    }
-    /// The pipeline of the dimension `dimension` (the Overworld by default).
-    fn in_dimension(mut self, dimension: &str) -> Self {
-        dimension.clone_into(&mut self.dimension);
-        self
     }
     /// `NoiseBasedChunkGenerator.getOrigin`'s spawn column: the
     /// NoiseSpawnFinder position, or 0 0 when the noise settings have no
@@ -1610,7 +1599,7 @@ where
                         })
                     })
                 });
-        let mut center = neighbors[4].clone();
+        let center = neighbors[4].clone();
         let biomes =
             BiomeRegion::new(neighbors, obfuscate_seed(self.seed)).map_err(stage("biomes"))?;
         let possible = possible.map(|id| data.biome_name(id).to_owned()).collect();
@@ -1624,7 +1613,7 @@ where
         )
         .map_err(stage("noise"))?;
         chunk.set_generation_stage(PreLightChunkStage::Biomes);
-        let (mut references, mut own_starts) = match &self.structures {
+        let (references, own_starts) = match &self.structures {
             Some(structures) => {
                 let mut queries = StructureQueries {
                     pipeline: self,
@@ -1638,41 +1627,8 @@ where
             }
             None => (Vec::new(), Starts::default()),
         };
-        // A native mod may build the chunk's terrain itself.
-        let mut generate = NativeGenerate::Vanilla;
-        native_chunk_generate(
-            &self.dimension,
-            [pos.x, pos.z],
-            self.seed,
-            self.flat.is_some(),
-            &mut NativeProtoChunk {
-                terrain: &mut chunk,
-                biomes: &mut center,
-                data,
-                references: &mut references,
-                own_starts: &mut own_starts,
-            },
-            &mut generate,
-        );
-        let (native, run_surface, run_carvers, features) = match generate {
-            NativeGenerate::Vanilla => (false, true, true, true),
-            NativeGenerate::Replaced {
-                surface,
-                carvers,
-                structures,
-                decorations,
-            } => {
-                if !structures {
-                    references.clear();
-                    own_starts = Starts::default();
-                }
-                (true, surface, carvers, decorations)
-            }
-        };
         // `FlatLevelSource.buildTerrain`: the layers, and nothing else (no noise, surface or carvers).
-        if let Some(flat) = &self.flat
-            && !native
-        {
+        if let Some(flat) = &self.flat {
             for (i, &state) in flat.states.iter().enumerate() {
                 let y = flat.min_y + i as i32;
                 if y >= self.settings.level_min_y + self.settings.level_height {
@@ -1714,7 +1670,7 @@ where
                 structure_starts: references,
                 own_starts,
                 entities: Vec::new(),
-                features,
+                features: true,
                 full: false,
             });
         }
@@ -1777,37 +1733,27 @@ where
             )),
         };
         worker.timings.noise += lap(&mut clock);
-        if native {
-            // The mod's blocks stand where the noise's would: the surface rule
-            // reads the heightmaps noise filling builds.
-            chunk
-                .prime_heightmaps(&[HeightmapType::OceanFloorWg, HeightmapType::WorldSurfaceWg])
-                .map_err(stage("heightmaps"))?;
-        } else {
-            // The density cells this fill needs are mostly in the climate volumes
-            // of this chunk and its +X/+Z neighbours, sampled for their biomes.
-            let lattice = {
-                let cache = self.lattice_cache.lock().unwrap();
-                [(0, 0), (1, 0), (0, 1), (1, 1)]
-                    .into_iter()
-                    .filter_map(|(dx, dz)| {
-                        cache.get(&(pos.x.wrapping_add(dx), pos.z.wrapping_add(dz)))
-                    })
-                    .flat_map(|samples| samples.iter().cloned())
-                    .collect()
-            };
-            context.set_lattice(lattice);
-            let filled = fill_noise(
-                &mut chunk,
-                volume,
-                self.router.get(RouterField::FinalDensity).as_ref(),
-                context,
-                aquifer.as_mut(),
-                self.settings.default_block,
-            );
-            context.clear_lattice();
-            filled.map_err(stage("noise"))?;
-        }
+        // The density cells this fill needs are mostly in the climate volumes
+        // of this chunk and its +X/+Z neighbours, sampled for their biomes.
+        let lattice = {
+            let cache = self.lattice_cache.lock().unwrap();
+            [(0, 0), (1, 0), (0, 1), (1, 1)]
+                .into_iter()
+                .filter_map(|(dx, dz)| cache.get(&(pos.x.wrapping_add(dx), pos.z.wrapping_add(dz))))
+                .flat_map(|samples| samples.iter().cloned())
+                .collect()
+        };
+        context.set_lattice(lattice);
+        let filled = fill_noise(
+            &mut chunk,
+            volume,
+            self.router.get(RouterField::FinalDensity).as_ref(),
+            context,
+            aquifer.as_mut(),
+            self.settings.default_block,
+        );
+        context.clear_lattice();
+        filled.map_err(stage("noise"))?;
         let generation = self.generation();
         worker.timings.noise += lap(&mut clock);
         // The surface rule, compiled by this worker's first chunk.
@@ -1816,7 +1762,7 @@ where
             .take()
             .and_then(|cache| cache.downcast::<CompiledSurfaceRule<R>>().ok())
             .map(|cache| *cache);
-        if run_surface && !self.identity_end_surface(pos) {
+        if !self.identity_end_surface(pos) {
             build_surface_shared(
                 &mut chunk,
                 &self.rule,
@@ -1846,44 +1792,42 @@ where
             .map_err(stage("surface"))?;
         }
         worker.timings.surface += lap(&mut clock);
-        if run_carvers {
-            let carvers = &data.biome_carvers;
-            let mask = generate_carving_mask(self.seed, pos, generation, false, |origin| {
-                self.carver_biome(worker, origin)
-                    .map(|id| carvers[id.0 as usize].as_slice())
-            })
-            .map_err(stage("carvers"))?;
-            worker.timings.carvers += lap(&mut clock);
-            if !mask.is_empty() {
-                let mut resolver = self.source.resolver(
-                    &self.climate,
-                    self.router.get(RouterField::Erosion).as_ref(),
-                );
-                let mut biome_context = SamplerContext::default();
-                apply_carving_mask_shared(
-                    &mut chunk,
-                    &mask,
-                    &self.rule,
-                    &mut shared,
-                    TopMaterialInputs::<R, _> {
-                        generation,
-                        root: self.root.clone(),
-                        surface: SurfaceQueries {
-                            pipeline: self,
-                            temperatures: &mut worker.temperatures,
-                            biome: Biomes::Resolver(&mut resolver, &mut biome_context),
-                            uniform_biomes: None,
-                            possible: None,
-                        },
-                        preliminary_surface: self.preliminary.clone(),
-                        density_context: context,
+        let carvers = &data.biome_carvers;
+        let mask = generate_carving_mask(self.seed, pos, generation, false, |origin| {
+            self.carver_biome(worker, origin)
+                .map(|id| carvers[id.0 as usize].as_slice())
+        })
+        .map_err(stage("carvers"))?;
+        worker.timings.carvers += lap(&mut clock);
+        if !mask.is_empty() {
+            let mut resolver = self.source.resolver(
+                &self.climate,
+                self.router.get(RouterField::Erosion).as_ref(),
+            );
+            let mut biome_context = SamplerContext::default();
+            apply_carving_mask_shared(
+                &mut chunk,
+                &mask,
+                &self.rule,
+                &mut shared,
+                TopMaterialInputs::<R, _> {
+                    generation,
+                    root: self.root.clone(),
+                    surface: SurfaceQueries {
+                        pipeline: self,
+                        temperatures: &mut worker.temperatures,
+                        biome: Biomes::Resolver(&mut resolver, &mut biome_context),
+                        uniform_biomes: None,
+                        possible: None,
                     },
-                    aquifer.as_mut(),
-                    &data.carving_blocks,
-                    |[x, y, z]| blender.carving_filter(x, y, z).unwrap_or(true),
-                )
-                .map_err(stage("carvers"))?;
-            }
+                    preliminary_surface: self.preliminary.clone(),
+                    density_context: context,
+                },
+                aquifer.as_mut(),
+                &data.carving_blocks,
+                |[x, y, z]| blender.carving_filter(x, y, z).unwrap_or(true),
+            )
+            .map_err(stage("carvers"))?;
         }
         worker.surface_rule = shared.map(|rule| Box::new(rule) as Box<dyn Any + Send>);
         worker.timings.carvers += lap(&mut clock);
@@ -1906,7 +1850,7 @@ where
             structure_starts: references,
             own_starts,
             entities: Vec::new(),
-            features,
+            features: true,
             full: false,
         })
     }
@@ -2218,53 +2162,6 @@ enum Biomes<'a, 'b> {
         &'a mut super::biome_source::BiomeSourceResolver<'b>,
         &'a mut SamplerContext,
     ),
-    /// A resolver whose answers are kept per quart: far sampling paints eight
-    /// depths of every column, and neighbouring columns share quarts, so most
-    /// queries repeat one (each is a full climate sample and parameter search).
-    Memo(
-        &'a mut super::biome_source::BiomeSourceResolver<'b>,
-        &'a mut SamplerContext,
-        &'a mut BiomeMemo,
-    ),
-}
-/// Resolved biomes by quart (`Biomes::Memo`).
-struct BiomeMemo {
-    biomes: HashMap<[i32; 3], BiomeId>,
-    /// Quarts per side of the columns sharing one biome, the first one asked
-    /// (its surface's); 0 for one per quart. Far cells wider than a quart
-    /// don't show a biome change a few blocks down, and climate changes over
-    /// hundreds of blocks: a far tile shares one per 4x4 of its columns, in
-    /// cells up to 64 blocks wide.
-    /// (Painting asks through the biome zoom, which strays into neighbouring
-    /// quarts: per quart, those strays were most of the climate samples.)
-    cell: i32,
-}
-/// The biome at `quart`, resolved once per quart (`Biomes::Memo`).
-fn memo_biome(
-    data: &GeneratorData,
-    resolver: &mut super::biome_source::BiomeSourceResolver<'_>,
-    context: &mut SamplerContext,
-    memo: &mut BiomeMemo,
-    quart: [i32; 3],
-) -> Result<BiomeId, MaterialRuleError> {
-    let key = if memo.cell > 0 {
-        [
-            quart[0].div_euclid(memo.cell),
-            0,
-            quart[2].div_euclid(memo.cell),
-        ]
-    } else {
-        quart
-    };
-    if let Some(&id) = memo.biomes.get(&key) {
-        return Ok(id);
-    }
-    let name = resolver
-        .sample(context, quart)
-        .map_err(|_| MaterialRuleError::BiomeQueryFailed)?;
-    let id = data.biome_id(name).ok_or(MaterialRuleError::MissingBiome)?;
-    memo.biomes.insert(key, id);
-    Ok(id)
 }
 // Per quart cell of a block-biome lookup: a lazy equality proof for its
 // eight corners, or (when they differ) their jitter and biomes, so the blocks
@@ -2428,13 +2325,6 @@ impl<R: RandomSource> MaterialSurfaceQueries for SurfaceQueries<'_, '_, R> {
                     .map_err(|_| MaterialRuleError::BiomeQueryFailed)?;
                 data.biome_id(name).ok_or(MaterialRuleError::MissingBiome)?
             }
-            Biomes::Memo(resolver, context, memo) => memo_biome(
-                data,
-                resolver,
-                context,
-                memo,
-                self.pipeline.zoom.quart_at_block(p),
-            )?,
         };
         Ok(Some(id.0))
     }
@@ -2532,8 +2422,6 @@ trait SeededPipeline: Send + Sync {
         region: &mut [ProtoChunk; 9],
     ) -> Result<DecorateStats, GeneratorError>;
     fn data(&self) -> &Arc<GeneratorData>;
-    /// The dimension, seed and superflat flag native generators are told.
-    fn native_context(&self) -> (&str, i64, bool);
     /// What the shared caches hold, for `horizon-ctl memory`.
     fn cache_census(&self) -> CacheCensus {
         CacheCensus::default()
@@ -2548,22 +2436,6 @@ trait SeededPipeline: Send + Sync {
     fn disable_mob_generation(&self) -> bool;
     /// The level's build range (minimum Y, height).
     fn level(&self) -> (i32, i32);
-    fn surface_sample(
-        &self,
-        worker: &mut WorkerState,
-        x: i32,
-        z: i32,
-        spans: Option<&mut Vec<(i32, i32, BlockStateId)>>,
-    ) -> Option<SurfaceSample>;
-    fn lod_grid(
-        &self,
-        worker: &mut WorkerState,
-        x: i32,
-        z: i32,
-        width: i32,
-        side: usize,
-        approximate: bool,
-    ) -> Result<Vec<LodColumn>, GeneratorError>;
     fn structure_starts(
         &self,
         worker: &mut WorkerState,
@@ -2658,9 +2530,6 @@ where
     }
     fn data(&self) -> &Arc<GeneratorData> {
         &self.data
-    }
-    fn native_context(&self) -> (&str, i64, bool) {
-        (&self.dimension, self.seed, self.flat.is_some())
     }
     fn release_caches(&self) {
         // Taken out under the lock, dropped after it.
@@ -2885,428 +2754,6 @@ where
             }
         }
         None
-    }
-    fn surface_sample(
-        &self,
-        worker: &mut WorkerState,
-        x: i32,
-        z: i32,
-        mut spans: Option<&mut Vec<(i32, i32, BlockStateId)>>,
-    ) -> Option<SurfaceSample> {
-        let mut top = None;
-        let mut water = None;
-        let mut below = 0;
-        let mut surface_complete = false;
-        let mut visit = |y, state| {
-            let properties = self.data.states.get(state);
-            if let Some(spans) = spans.as_mut()
-                && !properties.is_air()
-            {
-                if let Some((min, _, previous)) = spans.last_mut()
-                    && *min == y + 1
-                    && *previous == state
-                {
-                    *min = y;
-                } else {
-                    spans.push((y, y + 1, state));
-                }
-            }
-            if surface_complete {
-                return false;
-            }
-            if properties.is_air() || properties.has_fluid() {
-                if top.is_some() {
-                    surface_complete = true;
-                    return spans.is_none();
-                }
-                if properties.has_fluid() {
-                    water.get_or_insert((y + 1, state));
-                } else {
-                    // Match the material traversal's water reset across air gaps.
-                    water = None;
-                }
-            } else {
-                top.get_or_insert((y + 1, state));
-                below += 1;
-            }
-            false
-        };
-        self.noise_column(x, z, &mut visit);
-        let (height, state) = top?;
-        // A superflat surface is its top layer, with its one biome.
-        if self.flat.is_some() {
-            let biome = self
-                .source
-                .possible_biomes()
-                .into_iter()
-                .find_map(|name| self.data.biome_id(name))?;
-            return Some(SurfaceSample {
-                height,
-                state,
-                water,
-                biome,
-            });
-        }
-        let y = height - 1;
-        let position = BlockPos::new(x, y, z);
-        let mut resolver = self.source.resolver(
-            &self.climate,
-            self.router.get(RouterField::Erosion).as_ref(),
-        );
-        // Use a fresh bounded context: far samples must not grow the chunk/structure caches.
-        let mut biome_context = SamplerContext::default();
-        let biome = resolver
-            .sample(&mut biome_context, self.zoom.quart_at_block(position))
-            .ok()?;
-        let biome = self.data.biome_id(biome)?;
-        let volume = DensityVolume::new([1; 3], [x, y, z], [1; 3]).ok()?;
-        let queries = SurfaceQueries {
-            pipeline: self,
-            temperatures: &mut worker.temperatures,
-            biome: Biomes::Resolver(&mut resolver, &mut biome_context),
-            uniform_biomes: None,
-            possible: None,
-        };
-        let sources = MaterialDensitySources::new(
-            queries,
-            volume,
-            self.preliminary.clone(),
-            SamplerContext::default(),
-        )
-        .ok()?;
-        let mut material =
-            MaterialConditions::<R, _>::new(self.generation(), self.root.clone(), sources);
-        let rule = material.add_rule(self.rule.clone()).ok()?;
-        // shortcut: distant surfaces omit slope rules and column extensions; nearby chunks provide full terrain.
-        material.update_xz(x, z, 0, 0);
-        material.update_y(1, below, water.map_or(i32::MIN, |(height, _)| height), y);
-        let state = material.try_apply(rule, position).ok()?.unwrap_or(state);
-        if let Some(spans) = spans
-            && let Some(index) = spans.iter().position(|&(min, max, _)| min <= y && y < max)
-            && spans[index].2 != state
-        {
-            let (min, max, _) = spans[index];
-            if min == y {
-                spans[index].2 = state;
-            } else {
-                spans[index].1 = y;
-                spans.insert(index, (y, max, state));
-            }
-        }
-        Some(SurfaceSample {
-            height,
-            state,
-            water,
-            biome,
-        })
-    }
-    fn lod_grid(
-        &self,
-        worker: &mut WorkerState,
-        x: i32,
-        z: i32,
-        width: i32,
-        side: usize,
-        approximate: bool,
-    ) -> Result<Vec<LodColumn>, GeneratorError> {
-        if width <= 0 || side == 0 || side > 64 {
-            return Err(resource("far sample dimensions"));
-        }
-        // A superflat world's columns are its layers: the surface sample, and its spans.
-        if self.flat.is_some() {
-            let mut columns = Vec::with_capacity(side * side);
-            for dz in 0..side {
-                for dx in 0..side {
-                    let (wx, wz) = (x + dx as i32 * width, z + dz as i32 * width);
-                    let mut spans = Vec::new();
-                    let sample =
-                        SeededPipeline::surface_sample(self, worker, wx, wz, Some(&mut spans));
-                    columns.push((sample, spans));
-                }
-            }
-            return Ok(columns);
-        }
-        let mut geometry = Vec::with_capacity(side * side);
-        // The coarse and band passes below share the 2D (x/z-only) parts.
-        let mut context = if approximate {
-            SamplerContext::sparse().with_planes()
-        } else {
-            SamplerContext::sparse()
-        };
-        let (min, height) = (self.settings.noise_min_y, self.settings.noise_height);
-        let step_xz = width.max(4);
-        let ox = x.div_euclid(4) * 4;
-        let oz = z.div_euclid(4) * 4;
-        let nx = ((x - ox + (side as i32 - 1) * width + step_xz - 1) / step_xz) + 1;
-        let nz = ((z - oz + (side as i32 - 1) * width + step_xz - 1) / step_xz) + 1;
-        // Reduced far detail: how many blocks down surface rules paint a far
-        // column. Vanilla's rules reach eight blocks (dirt under grass, sand
-        // under a beach, powder snow over a peak), but a tile this wide draws
-        // at most a block or two of each column's vertical face, so painting
-        // the six below it is work no view resolves. Depth 1 is always painted,
-        // so the surface the tile shows -- its height, its top state, its
-        // biome -- is exactly what Full detail gives; only the interior of a
-        // span, seen on a cliff, loses its vanilla material. Narrow tiles keep
-        // all eight: their faces are tall enough in view to show them.
-        let material_depth = if approximate && width >= 16 { 2 } else { 8 };
-        // Approximate: cells many blocks wide keep their interpolated shape on
-        // a coarser vertical lattice, for a fraction of the density work.
-        let step_y = match width {
-            _ if !approximate => 8,
-            ..32 => 8,
-            32..128 => 16,
-            _ => 32,
-        };
-        let final_density = self.router.get(RouterField::FinalDensity);
-        // Approximate: far tiles show the surface, so find its band on a
-        // coarse lattice (its points are the fine lattice's), then sample the
-        // fine lattice only inside it. Most of a tall world's column is sky or
-        // deep rock. Parts thinner than the coarse step above an air sample
-        // (floating islands, overhang lips) can be missed; below the band, a
-        // column is one span of the default block.
-        let (band_min, band_max) = if approximate {
-            const COARSE: i32 = 64;
-            let coarse_layers = (height + COARSE - 1) / COARSE + 1;
-            let coarse = DensityVolume::new(
-                [nx, coarse_layers, nz],
-                [ox, min, oz],
-                [step_xz, COARSE, step_xz],
-            )
-            .map_err(stage("far density"))?;
-            let mut coarse_densities = vec![0.; coarse.size()];
-            final_density
-                .sample_volume(&mut context, &mut coarse_densities, coarse)
-                .map_err(stage("far density"))?;
-            let (mut lowest, mut highest) = (i32::MAX, i32::MIN);
-            for iz in 0..nz as usize {
-                for ix in 0..nx as usize {
-                    let solid = (0..coarse_layers as usize)
-                        .rev()
-                        .find(|&iy| coarse_densities[coarse.index([ix, iy, iz]).unwrap()] > 0.);
-                    if let Some(iy) = solid {
-                        let y = min + iy as i32 * COARSE;
-                        lowest = lowest.min(y - COARSE);
-                        highest = highest.max(y + 2 * COARSE);
-                    }
-                }
-            }
-            if lowest > highest {
-                (min, min + height)
-            } else {
-                let lowest = lowest.max(min);
-                (
-                    min + (lowest - min) / step_y * step_y,
-                    highest
-                        .max(self.settings.sea_level + COARSE)
-                        .min(min + height),
-                )
-            }
-        } else {
-            (min, min + height)
-        };
-        let ny = (band_max - band_min + step_y - 1) / step_y + 1;
-        let volume =
-            DensityVolume::new([nx, ny, nz], [ox, band_min, oz], [step_xz, step_y, step_xz])
-                .map_err(stage("far density"))?;
-        let mut densities = vec![0.; volume.size()];
-        final_density
-            .sample_volume(&mut context, &mut densities, volume)
-            .map_err(stage("far density"))?;
-        let aquifer = DisabledAquifer::new(
-            self.picker,
-            self.data.registry.default_state("minecraft:air").unwrap(),
-        );
-        // Interpolate the supplied lattice, never the physical bounding volume.
-        let value = |wx: i32, iy: usize, wz: i32| {
-            let rx = (wx - ox) as f32 / step_xz as f32;
-            let rz = (wz - oz) as f32 / step_xz as f32;
-            let ix = rx.floor() as usize;
-            let iz = rz.floor() as usize;
-            let at = |dx: usize, dz: usize| {
-                densities[volume
-                    .index([
-                        (ix + dx).min(nx as usize - 1),
-                        iy,
-                        (iz + dz).min(nz as usize - 1),
-                    ])
-                    .unwrap()]
-            };
-            let mix = |a: f32, b: f32, t: f32| a + (b - a) * t;
-            mix(
-                mix(at(0, 0), at(1, 0), rx - ix as f32),
-                mix(at(0, 1), at(1, 1), rx - ix as f32),
-                rz - iz as f32,
-            )
-        };
-        let mut profile = vec![0.; ny as usize];
-        let mut resolver = self.source.resolver(
-            &self.climate,
-            self.router.get(RouterField::Erosion).as_ref(),
-        );
-        let mut biome_context = SamplerContext::cached();
-        let mut biome_memo = BiomeMemo {
-            biomes: HashMap::new(),
-            // Columns `width` blocks apart are width / 4 quarts apart; cells
-            // stop at 64 blocks (wider ones moved a third of level 6's biomes).
-            cell: if approximate && width >= 4 {
-                width.min(16)
-            } else {
-                0
-            },
-        };
-        for dz in 0..side {
-            for dx in 0..side {
-                let (wx, wz) = (x + dx as i32 * width, z + dz as i32 * width);
-                let mut top = None;
-                let mut water = None;
-                let mut below = 0;
-                let mut complete = false;
-                let mut spans: Vec<(i32, i32, BlockStateId)> = Vec::new();
-                for (iy, density) in profile.iter_mut().enumerate() {
-                    *density = value(wx, iy, wz);
-                }
-                for y in (band_min..band_max).rev() {
-                    let iy = ((y - band_min) / step_y) as usize;
-                    let alpha = ((y - band_min) % step_y) as f32 / step_y as f32;
-                    let density = profile[iy] + (profile[iy + 1] - profile[iy]) * alpha;
-                    let state = aquifer
-                        .compute_substance([wx, y, wz], f64::from(density))
-                        .unwrap_or(self.settings.default_block);
-                    let properties = self.data.states.get(state);
-                    if !properties.is_air() {
-                        if let Some((min, _, old)) = spans.last_mut()
-                            && *min == y + 1
-                            && *old == state
-                        {
-                            *min = y;
-                        } else {
-                            spans.push((y, y + 1, state));
-                        }
-                    }
-                    if !complete {
-                        if properties.is_air() || properties.has_fluid() {
-                            if top.is_some() {
-                                complete = true;
-                            } else if properties.has_fluid() {
-                                water.get_or_insert((y + 1, state));
-                            } else {
-                                water = None;
-                            }
-                        } else {
-                            top.get_or_insert((y + 1, state));
-                            below += 1;
-                        }
-                    }
-                }
-                if band_min > min {
-                    let fill = self.settings.default_block;
-                    if top.is_some() && !complete {
-                        below += band_min - min;
-                    }
-                    match spans.last_mut() {
-                        Some((low, _, state)) if *low == band_min && *state == fill => *low = min,
-                        _ => spans.push((min, band_min, fill)),
-                    }
-                }
-                // Void cells still need a biome: the End's small islands are
-                // features over the void, and their biome is 2D there.
-                let biome = if let Some((height, _)) = top {
-                    memo_biome(
-                        &self.data,
-                        &mut resolver,
-                        &mut biome_context,
-                        &mut biome_memo,
-                        self.zoom.quart_at_block(BlockPos::new(wx, height - 1, wz)),
-                    )
-                    .map_err(stage("far biome"))?
-                } else {
-                    BiomeId(0)
-                };
-                geometry.push((top, water, below, spans, biome));
-            }
-        }
-        if geometry.iter().all(|column| column.0.is_none()) {
-            return Ok(geometry
-                .into_iter()
-                .map(|(_, _, _, spans, _)| (None, spans))
-                .collect());
-        }
-        let volume =
-            DensityVolume::new([1; 3], [x, 0, z], [1; 3]).map_err(stage("far material"))?;
-        let queries = SurfaceQueries {
-            pipeline: self,
-            temperatures: &mut worker.temperatures,
-            biome: Biomes::Memo(&mut resolver, &mut biome_context, &mut biome_memo),
-            uniform_biomes: None,
-            possible: None,
-        };
-        let sources = MaterialDensitySources::new(
-            queries,
-            volume,
-            self.preliminary.clone(),
-            SamplerContext::cached(),
-        )
-        .map_err(stage("far material"))?;
-        let mut material =
-            MaterialConditions::<R, _>::new(self.generation(), self.root.clone(), sources);
-        let rule = material
-            .add_rule(self.rule.clone())
-            .map_err(stage("far material"))?;
-        let mut result = Vec::with_capacity(side * side);
-        for (index, (top, water, below, mut spans, biome)) in geometry.into_iter().enumerate() {
-            let (wx, wz) = (
-                x + (index % side) as i32 * width,
-                z + (index / side) as i32 * width,
-            );
-            let Some((height, mut state)) = top else {
-                result.push((None, spans));
-                continue;
-            };
-            material.update_xz(wx, wz, 0, 0);
-            for depth in 1..=below.min(material_depth) {
-                let y = height - depth;
-                material.update_y(
-                    depth,
-                    below - depth + 1,
-                    water.map_or(i32::MIN, |(height, _)| height),
-                    y,
-                );
-                let Some(index) = spans.iter().position(|&(min, max, _)| min <= y && y < max)
-                else {
-                    continue;
-                };
-                let (min, max, old) = spans[index];
-                let painted = material
-                    .try_apply(rule, BlockPos::new(wx, y, wz))
-                    .map_err(stage("far material"))?
-                    .unwrap_or(old);
-                if depth == 1 {
-                    state = painted;
-                }
-                if old == painted {
-                    continue;
-                }
-                let mut replacement = Vec::with_capacity(3);
-                if y + 1 < max {
-                    replacement.push((y + 1, max, old));
-                }
-                replacement.push((y, y + 1, painted));
-                if min < y {
-                    replacement.push((min, y, old));
-                }
-                spans.splice(index..=index, replacement);
-            }
-            result.push((
-                Some(SurfaceSample {
-                    height,
-                    state,
-                    water,
-                    biome,
-                }),
-                spans,
-            ));
-        }
-        Ok(result)
     }
     fn noise_biomes(&self, worker: &mut WorkerState, quarts: &[[i32; 3]]) -> Vec<Option<String>> {
         let mut resolver = self.source.resolver(
@@ -3697,31 +3144,25 @@ impl OverworldGenerator {
             .as_bool()
             .unwrap_or(false)
         {
-            Arc::new(
-                Pipeline::new(
-                    data,
-                    seed,
-                    LegacyRandom::new(seed),
-                    &generator,
-                    &settings_json,
-                    with_structures,
-                    level,
-                )?
-                .in_dimension(dimension),
-            )
+            Arc::new(Pipeline::new(
+                data,
+                seed,
+                LegacyRandom::new(seed),
+                &generator,
+                &settings_json,
+                with_structures,
+                level,
+            )?)
         } else {
-            Arc::new(
-                Pipeline::new(
-                    data,
-                    seed,
-                    XoroshiroRandom::new(seed),
-                    &generator,
-                    &settings_json,
-                    with_structures,
-                    level,
-                )?
-                .in_dimension(dimension),
-            )
+            Arc::new(Pipeline::new(
+                data,
+                seed,
+                XoroshiroRandom::new(seed),
+                &generator,
+                &settings_json,
+                with_structures,
+                level,
+            )?)
         };
         Ok(Self {
             pipeline,
@@ -3807,17 +3248,6 @@ impl OverworldGenerator {
     }
 }
 
-/// A surface-only noise column for far terrain. Heights are exclusive top faces.
-#[derive(Clone, Copy, Debug)]
-pub struct SurfaceSample {
-    pub height: i32,
-    pub state: BlockStateId,
-    pub water: Option<(i32, BlockStateId)>,
-    pub biome: BiomeId,
-}
-
-pub type LodColumn = (Option<SurfaceSample>, Vec<(i32, i32, BlockStateId)>);
-
 /// Per-thread generation state.
 pub struct GeneratorWorker {
     pipeline: Arc<dyn SeededPipeline>,
@@ -3830,40 +3260,6 @@ impl GeneratorWorker {
         let result = self.pipeline.generate(&mut self.state, pos);
         self.state.timings.chunks += 1;
         result
-    }
-    /// Noise/aquifer surface and its material rule, without chunks, structures or features.
-    pub fn surface_sample(&mut self, x: i32, z: i32) -> Option<SurfaceSample> {
-        let mut sample = self.pipeline.surface_sample(&mut self.state, x, z, None);
-        let pipeline = &*self.pipeline;
-        far_column(
-            pipeline.native_context(),
-            pipeline.data(),
-            [x, z],
-            &mut sample,
-            None,
-        );
-        sample
-    }
-    /// Noise/aquifer material runs, excluding air; bounds are half-open.
-    /// Features and carvers still require generated chunks.
-    pub fn surface_column(
-        &mut self,
-        x: i32,
-        z: i32,
-    ) -> (Option<SurfaceSample>, Vec<(i32, i32, BlockStateId)>) {
-        let mut spans = Vec::new();
-        let mut surface = self
-            .pipeline
-            .surface_sample(&mut self.state, x, z, Some(&mut spans));
-        let pipeline = &*self.pipeline;
-        far_column(
-            pipeline.native_context(),
-            pipeline.data(),
-            [x, z],
-            &mut surface,
-            Some(&mut spans),
-        );
-        (surface, spans)
     }
     /// `/locate structure`: the nearest start of one of `names`.
     pub fn locate(
@@ -3886,38 +3282,6 @@ impl GeneratorWorker {
     ) -> Option<(String, [i32; 3])> {
         self.pipeline
             .locate(&mut self.state, names, from, radius, skip)
-    }
-    /// Direct far sampling: work scales with rendered vertical resolution,
-    /// without allocating chunks, carving masks or propagated aquifers.
-    /// `approximate` (Reduced far detail) trades the exact tile for speed in
-    /// wide cells: one biome per 4x4 columns, a coarser vertical lattice, and
-    /// density only around the surface.
-    pub fn lod_grid(
-        &mut self,
-        x: i32,
-        z: i32,
-        width: i32,
-        side: usize,
-        approximate: bool,
-    ) -> Result<Vec<LodColumn>, GeneratorError> {
-        let mut columns =
-            self.pipeline
-                .lod_grid(&mut self.state, x, z, width, side, approximate)?;
-        let pipeline = &*self.pipeline;
-        for (index, (sample, spans)) in columns.iter_mut().enumerate() {
-            let column = [
-                x + (index % side) as i32 * width,
-                z + (index / side) as i32 * width,
-            ];
-            far_column(
-                pipeline.native_context(),
-                pipeline.data(),
-                column,
-                sample,
-                Some(spans),
-            );
-        }
-        Ok(columns)
     }
     pub fn noise_biomes(&mut self, quarts: &[[i32; 3]]) -> Vec<Option<String>> {
         self.pipeline.noise_biomes(&mut self.state, quarts)
@@ -4302,174 +3666,6 @@ mod tests {
             }
         }
         assert!(successes > 0 && failures > 0);
-    }
-
-    /// Reduced far detail paints only the top two blocks of a wide column
-    /// (`material_depth`). Vanilla's surface rules reach eight blocks down, so
-    /// Full detail layers dirt under grass; a tile 256 blocks across draws at
-    /// most a block or two of each column's face, so Reduced leaves the rest as
-    /// the default block. The second half of this test samples the same tile at
-    /// Full detail to prove the first half is discriminating, not vacuous.
-    #[test]
-    fn reduced_far_detail_paints_only_the_top_of_a_wide_column() {
-        let root = std::env::var_os("HORIZON_TEST_RESOURCES")
-            .or_else(|| std::env::var_os("HORIZON_RESOURCES"))
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/horizon-client/26.3")
-            });
-        if !root.join("worldgen/world_presets.json").exists() {
-            eprintln!("skipping: no worldgen bundle at {}", root.display());
-            return;
-        }
-        let registry: &'static BlockRegistry = Box::leak(Box::new(
-            crate::level::data::load_registry(&root).expect("registry"),
-        ));
-        let data = GeneratorData::load(&root.join("worldgen"), registry).expect("worldgen data");
-        let generator = OverworldGenerator::without_structures(data, 1234).expect("generator");
-        let mut worker = generator.worker();
-        // The block a column holds at `y`, where its spans cover it.
-        let at = |spans: &[(i32, i32, BlockStateId)], y: i32| {
-            spans
-                .iter()
-                .find(|&&(low, high, _)| low <= y && y < high)
-                .map(|&(_, _, state)| state)
-        };
-        // Two depths inside the eight vanilla rules reach, both below the two
-        // Reduced keeps. Only columns whose spans cover both are compared, so a
-        // cave or an overhang between them is never read as a painted layer.
-        let layered = |grid: &[LodColumn]| {
-            let mut compared = 0;
-            let mut differing = 0;
-            for (surface, spans) in grid {
-                let Some(surface) = surface else { continue };
-                let (Some(shallow), Some(deep)) =
-                    (at(spans, surface.height - 4), at(spans, surface.height - 8))
-                else {
-                    continue;
-                };
-                compared += 1;
-                differing += usize::from(shallow != deep);
-            }
-            (compared, differing)
-        };
-        // 16 columns 16 blocks apart: a level 4 tile, which the gate covers.
-        let (compared, differing) = layered(&worker.lod_grid(0, 0, 16, 16, true).expect("reduced"));
-        assert!(compared > 64, "only {compared} columns to compare");
-        assert_eq!(
-            differing, 0,
-            "{differing} of {compared} reduced columns still carry a painted layer below depth 2"
-        );
-        let (compared, differing) = layered(&worker.lod_grid(0, 0, 16, 16, false).expect("full"));
-        assert!(compared > 64, "only {compared} columns to compare");
-        assert!(
-            differing > 0,
-            "Full detail painted no layer below depth 2 either, so the check above proves nothing"
-        );
-    }
-    #[test]
-    fn far_surface_matches_undecorated_land_and_keeps_end_void() {
-        let root = std::env::var_os("HORIZON_TEST_RESOURCES")
-            .or_else(|| std::env::var_os("HORIZON_RESOURCES"))
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/horizon-client/26.3")
-            });
-        if !root.join("worldgen/world_presets.json").exists() {
-            eprintln!("skipping: no worldgen bundle at {}", root.display());
-            return;
-        }
-        let registry: &'static BlockRegistry = Box::leak(Box::new(
-            crate::level::data::load_registry(&root).expect("registry"),
-        ));
-        let data = GeneratorData::load(&root.join("worldgen"), registry).expect("worldgen data");
-        let generator =
-            OverworldGenerator::without_structures(data.clone(), 1234).expect("generator");
-        let mut worker = generator.worker();
-        let sample = worker.surface_sample(0, 0).expect("land");
-        let (column_surface, spans) = worker.surface_column(0, 0);
-        let column_surface = column_surface.expect("column land");
-        assert_eq!(column_surface.height, sample.height);
-        assert_eq!(column_surface.state, sample.state);
-        assert_eq!(column_surface.water, sample.water);
-        assert_eq!(column_surface.biome, sample.biome);
-        assert!(spans.iter().all(|&(min, max, state)| {
-            min < max && !generator.data().block_states().get(state).is_air()
-        }));
-        assert!(spans.windows(2).all(|pair| {
-            pair[1].1 <= pair[0].0 && (pair[1].1 != pair[0].0 || pair[1].2 != pair[0].2)
-        }));
-        assert!(spans.iter().any(|&(min, max, state)| {
-            min < sample.height && sample.height - 1 < max && state == sample.state
-        }));
-        assert!(sample.water.is_some_and(|(height, state)| {
-            spans
-                .iter()
-                .any(|&(min, max, block)| min < height && height - 1 < max && block == state)
-        }));
-        let chunk = worker.generate_proto(ChunkPos::new(0, 0)).expect("terrain");
-        assert_eq!(
-            sample.water.map_or(sample.height, |(height, _)| height),
-            chunk.surface_height(0, 0)
-        );
-        assert_eq!(sample.state, chunk.block(0, sample.height - 1, 0));
-        assert!(
-            sample.water.is_some(),
-            "fixture includes underwater terrain"
-        );
-        let started = std::time::Instant::now();
-        let mut exact = Vec::new();
-        for z in 0..8 {
-            for x in 0..8 {
-                exact.push(worker.surface_column(-1024 + x * 32, z * 32));
-            }
-        }
-        let dense_time = started.elapsed();
-        let started = std::time::Instant::now();
-        let direct = worker.lod_grid(-1024, 0, 32, 8, false).unwrap();
-        for z in 0..8 {
-            for x in 0..8 {
-                let wx = -1024 + x * 32;
-                let wz = z * 32;
-                let (surface, spans) = &direct[(z * 8 + x) as usize];
-                let expected = exact[(z * 8 + x) as usize].0;
-                if let (Some(surface), Some(expected)) = (surface, expected) {
-                    assert!(
-                        (surface.height - expected.height).abs() <= 32,
-                        "coarse height exceeds its vertical resolution at {wx} {wz}: {} vs {}",
-                        surface.height,
-                        expected.height
-                    );
-                    assert!(spans.iter().any(|&(min, max, state)| min < surface.height
-                        && surface.height - 1 < max
-                        && state == surface.state));
-                }
-                assert!(spans.iter().all(|&(min, max, _)| min < max));
-                assert!(spans.windows(2).all(|pair| pair[1].1 <= pair[0].0));
-            }
-        }
-        eprintln!(
-            "64 far columns: dense={dense_time:?}, direct32={:?}",
-            started.elapsed()
-        );
-        let end =
-            OverworldGenerator::for_dimension(data, 1234, "minecraft:normal", "minecraft:the_end")
-                .expect("End generator");
-        let mut worker = end.worker();
-        assert!(worker.surface_sample(0, 0).is_some());
-        assert!(worker.surface_sample(256, 0).is_none());
-        let (surface, spans) = worker.surface_column(256, 0);
-        assert!(surface.is_none());
-        assert!(spans.is_empty());
-        let (surface, spans) = worker
-            .lod_grid(256, 0, 32, 1, false)
-            .unwrap()
-            .pop()
-            .unwrap();
-        assert!(
-            surface.is_none() && spans.is_empty(),
-            "direct sampling retains End void"
-        );
     }
 
     #[test]
@@ -5188,14 +4384,16 @@ mod tests {
             )
             .expect("generator");
             let mut worker = generator.worker();
-            (0..32)
-                .map(|i| {
-                    worker
-                        .surface_sample(i * 137, i * 91)
-                        .expect("surface")
-                        .height
-                })
-                .collect::<Vec<_>>()
+            let chunk = worker
+                .generate_proto(ChunkPos::new(0, 0))
+                .expect("vanilla chunk");
+            let mut heights = Vec::with_capacity(256);
+            for z in 0..16 {
+                for x in 0..16 {
+                    heights.push(chunk.surface_height(x, z));
+                }
+            }
+            heights
         };
         let normal = surface("minecraft:normal");
         assert!(normal.iter().all(|height| (0..384).contains(height)));

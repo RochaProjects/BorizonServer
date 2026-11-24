@@ -352,8 +352,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             self.remove_moving_piston(pos);
         } else if block_changed
             && (self.b.has_flag(old, super::data::state_flags::BLOCK_ENTITY)
-                || self.level.has_native_block_entity(old)
-                || self.level.has_mod_block_entity(pos))
+                || self.level.has_native_block_entity(old))
             && !self.keeps_block_entity(state, old)
         {
             // BlockEntity.preRemoveSideEffects (unless UPDATE_SKIP_BLOCK_ENTITY_SIDEEFFECTS)

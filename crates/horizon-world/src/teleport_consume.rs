@@ -26,13 +26,6 @@ pub trait TeleportConsumeWorld {
     fn is_passenger(&mut self) -> Result<bool, Self::Error>;
     fn stop_riding(&mut self) -> Result<(), Self::Error>;
     fn position(&mut self) -> Result<Vec3, Self::Error>;
-    /// Horizon's mods (NeoForge's `EntityTeleportEvent.ChorusFruit`): before
-    /// each attempt, after the user stopped riding. They may move `target`;
-    /// false stops the effect without teleporting and without more draws.
-    fn teleport_allowed(&mut self, target: &mut Vec3) -> Result<bool, Self::Error> {
-        let _ = target;
-        Ok(true)
-    }
     /// showParticles=true and forbidden tag=CONSUMABLE_DOES_NOT_TELEPORT_TO.
     fn random_teleport(&mut self, position: Vec3) -> Result<bool, Self::Error>;
     /// Level TELEPORT event, old position, context containing this actor.
@@ -98,10 +91,7 @@ impl TeleportConsume {
                 world.stop_riding()?;
             }
             let old = world.position()?;
-            let mut target = Vec3::new(x, y, z);
-            if !world.teleport_allowed(&mut target)? {
-                return Ok(false);
-            }
+            let target = Vec3::new(x, y, z);
             if world.random_teleport(target)? {
                 world.teleport_event(level, old)?;
                 let fox = world.is_fox();
@@ -135,12 +125,10 @@ mod tests {
     use std::convert::Infallible;
 
     /// A user at the origin whose every landing fails unless `lands`; it
-    /// records the targets tried and how the mods answer.
+    /// records the targets tried.
     struct Stub {
         random: LegacyRandom,
-        allow: fn(&mut Vec3) -> bool,
         lands: bool,
-        asked: usize,
         tried: Vec<Vec3>,
     }
     impl TeleportConsumeWorld for Stub {
@@ -172,10 +160,6 @@ mod tests {
         fn position(&mut self) -> Result<Vec3, Infallible> {
             Ok(Vec3::ZERO)
         }
-        fn teleport_allowed(&mut self, target: &mut Vec3) -> Result<bool, Infallible> {
-            self.asked += 1;
-            Ok((self.allow)(target))
-        }
         fn random_teleport(&mut self, position: Vec3) -> Result<bool, Infallible> {
             self.tried.push(position);
             Ok(self.lands)
@@ -202,12 +186,10 @@ mod tests {
             Ok(())
         }
     }
-    fn stub(allow: fn(&mut Vec3) -> bool, lands: bool) -> Stub {
+    fn stub(lands: bool) -> Stub {
         Stub {
             random: LegacyRandom::new(7),
-            allow,
             lands,
-            asked: 0,
             tried: Vec::new(),
         }
     }
@@ -217,30 +199,10 @@ mod tests {
     };
 
     #[test]
-    fn a_refused_attempt_ends_the_effect_without_teleporting() {
-        let mut w = stub(|_| false, true);
+    fn vanilla_retries_all_sixteen_failed_attempts() {
+        let mut w = stub(false);
         assert_eq!(CHORUS.apply(&mut w, ()), Ok(false));
-        assert_eq!((w.asked, w.tried.len()), (1, 0), "asked once, never tried");
-    }
-
-    #[test]
-    fn the_mods_target_is_where_the_user_tries_to_land() {
-        let mut w = stub(
-            |t| {
-                *t = Vec3::new(100.5, 70.0, -3.5);
-                true
-            },
-            true,
-        );
-        assert_eq!(CHORUS.apply(&mut w, ()), Ok(true));
-        assert_eq!(w.tried, [Vec3::new(100.5, 70.0, -3.5)]);
-    }
-
-    #[test]
-    fn without_mods_all_sixteen_attempts_stay_vanillas() {
-        let mut w = stub(|_| true, false);
-        assert_eq!(CHORUS.apply(&mut w, ()), Ok(false));
-        assert_eq!((w.asked, w.tried.len()), (16, 16));
+        assert_eq!(w.tried.len(), 16);
         // Each target is within half the diameter of the user.
         assert!(w.tried.iter().all(|t| t.x.abs() <= 8.0 && t.z.abs() <= 8.0));
     }

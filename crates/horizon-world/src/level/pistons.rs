@@ -341,7 +341,6 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         }
         !b.has_flag(state, super::data::state_flags::BLOCK_ENTITY)
             && !self.level.has_native_block_entity(state)
-            && !self.level.has_mod_block_entity(pos)
     }
     fn is_slime_or_honey(&self, state: BlockStateId) -> bool {
         self.b.is_block(state, self.b.named.slime_block)

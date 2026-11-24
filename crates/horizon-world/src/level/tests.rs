@@ -78,8 +78,6 @@ pub(crate) struct TestLevel {
     pub opened: HashSet<BlockPos>,
     /// Players standing in every plate and tripwire, by UUID.
     pub occupants: Vec<u128>,
-    /// Occupants a mod's physical-trigger hook cancels.
-    pub spared: HashSet<u128>,
 }
 impl TestLevel {
     fn new(b: &Behaviours) -> Self {
@@ -106,22 +104,12 @@ impl TestLevel {
             shulker_closed: HashMap::new(),
             opened: HashSet::new(),
             occupants: Vec::new(),
-            spared: HashSet::new(),
         }
     }
 }
 impl LevelAccess for TestLevel {
-    fn count_entities_at(
-        &self,
-        _pos: BlockPos,
-        _block: &str,
-        _area: Aabb,
-        _query: EntityQuery,
-    ) -> usize {
-        self.occupants
-            .iter()
-            .filter(|p| !self.spared.contains(p))
-            .count()
+    fn count_entities(&self, _area: Aabb, _query: EntityQuery) -> usize {
+        self.occupants.len()
     }
     fn should_tick_blocks_at(&self, _chunk: ChunkPos) -> bool {
         self.block_events_ready

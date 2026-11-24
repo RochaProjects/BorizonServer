@@ -1,5 +1,500 @@
 # Server-side build scope
 
+## Política de meshing de folhas movida para dados compartilhados (2026-11-24)
+
+`LeafCullingMode` agora é definido em `horizon-sim-data::mesh_policy`, junto dos
+contratos de dados usados por simulação/streaming; `mesher`, seu algoritmo de
+culling e `streaming` consomem esse caminho sem importar
+`horizon-client-render::graphics`. O renderer mantém um reexport de
+compatibilidade para suas opções gráficas existentes. Os cinco modos, seus nomes,
+rótulos e a regra `is_interior` foram preservados, sem trocar o meshing por stub.
+
+Validação: `cargo check --offline --locked -j1 -p horizon-game --no-default-features
+--features dedicated-server --bin horizon-engine` passou; os testes
+`streaming::` passaram (33 aprovados, 2 ignorados); `cargo fmt --all` e
+`git diff --check` passaram; os testes de integração da política em
+`horizon-sim-data/tests/mesh_policy.rs` passaram (2/2). O filtro dos testes
+`mesher::leaf_culling_tests`, com `test-support`, compilou, mas os nove testes
+estão ignorados porque não há os recursos vanilla 26.3 preparados neste ambiente.
+Esse corte faz os consumidores
+do mesher/streaming independentes do módulo de configurações gráficas, mas **não
+removeu `horizon-client-render`, `wgpu` ou `winit` do grafo dedicado**. O check
+dedicado ainda compila o renderer e a raiz de runtime continua delegando ao
+`Game` misto; separar isso e validar boot de mundo/ticks/save/plugin `.so`
+continua pendente. Nenhum commit/push ou build release foi feito.
+
+## Raiz executável dedicada em `horizon-game` (2026-11-24; migração em andamento)
+
+Foi criado o binário `horizon-engine` em `crates/horizon-game/src/bin/dedicated.rs`.
+O root dedicado agora pertence ao crate `horizon-game`, e o Dockerfile passa a
+construir esse alvo em vez de renomear `horizon-client` para `horizon-engine`.
+`horizon-game` mantém `client` como feature padrão para preservar os executáveis
+existentes; `--no-default-features --features dedicated-server` habilita apenas
+`horizon-client/dedicated-server` e o loader/SDK `.so`. O marcador do mod API
+client-side não é compilado nesse perfil. O supervisor continua aceitando o
+binário legado `horizon-client` como fallback para instalações antigas.
+
+Validação básica: o novo alvo passou em `cargo check --offline --locked -j1 -p
+horizon-game --no-default-features --features dedicated-server --bin horizon-engine`,
+e respondeu a `--help`. Um smoke em diretório temporário com
+`horizon-engine --dedicated --initSettings` encerrou com sucesso e gerou
+`server.properties` e `eula.txt` (`eula=false`); o diretório foi descartado.
+Isso confirma a nova entrada de processo/preflight, **não** boot de mundo, ticks,
+save/restart/stop nem carregamento de plugin `.so`.
+
+Este é o primeiro corte da raiz do executável, não a separação completa do
+runtime: `horizon-game` ainda depende de `horizon-client`, cuja facade puxa
+`horizon-client-render` e `horizon-client-input`; o alvo também ainda alcança
+`wgpu` e `winit`. Não se reivindica grafo client-free nem redução de build. O
+próximo trabalho é extrair a raiz de inicialização server-side e seus serviços
+do `horizon-client::entry`/`Game`, mantendo gameplay real, tick e protocolo, e
+migrar os consumidores por fronteiras funcionais em vez de retirar dependências
+à força. Nenhum build release foi executado localmente.
+
+Tentativa de corte direto de `wgpu`: torná-lo opcional e ocultar `gfx`, `graphics`,
+`hud`, `post_chain` e módulos de GPU fez o check dedicado falhar com 102 erros,
+porque a facade do renderer também é consumida por `chat`, `font`, `mesher`,
+`streaming`, `Game` e outros módulos compilados no servidor. A tentativa foi
+revertida integralmente; o novo alvo voltou a passar no check em 16,35 s
+incremental, e `cargo tree` confirma que `horizon-server-plugin-loader` continua
+presente. Próximo passo real: separar os contratos server-safe usados por essas
+rotinas antes de condicionar os módulos gráficos, em vez de gatear o renderer
+monolítico de uma vez.
+
+## Runtime server-owned: políticas de tick e preflight dedicado (2026-11-23)
+
+Foi criado `horizon-server-runtime`, crate consumido pelo engine dedicado para
+as políticas de cadência do tick, pausa por servidor vazio e aviso de overload.
+O agendador preserva o tick real no engine, inclusive bombeamento de chunks,
+regra de sprint e skip somente quando o atraso excede dois segundos; não há
+simulador alternativo nem stub de gameplay.
+
+Nesta continuação, parsing de argumentos, leitura/armazenamento de
+`server.properties`, configuração de compressão de region files e verificação
+da EULA foram movidos para `horizon-server-runtime::preflight`. O engine mantém
+no adaptador as opções próprias de comandos e consome `ServerSetup` para seguir
+no fluxo dedicado já existente. Foram adicionados testes para `--help` e opção
+desconhecida, ambos sem tocar arquivos do diretório de trabalho.
+
+Validação observada: `cargo test --offline -j1 -p horizon-server-runtime`
+passou (7/7); o check dedicado locked/offline passou em 58,01 s nesta sandbox;
+`cargo fmt --all` e `git diff --check` passaram. A árvore normal do novo crate
+inclui `horizon-server-files` e `horizon-world`, e não inclui renderer, input,
+`wgpu` nem `winit`. **Isso comprova isolamento apenas do crate novo.** O check do
+binário ainda compila `horizon-client-render` e `horizon-client-input`; o grafo
+dedicado global e o objetivo de removê-los permanecem pendentes. Ainda faltam
+smoke tests do boot completo, mundo/save/restart e loader `.so`.
+
+Smoke real do executável: em diretório temporário, `cargo run --offline --locked
+-j1 -p horizon-client --no-default-features --features
+server-plugins,dedicated-server --bin horizon-client -- --dedicated
+--initSettings` compilou em perfil `dev` (8m49s) e executou com sucesso. Criou
+`server.properties` e `eula.txt` (com `eula=false`), registrou os caminhos e
+encerrou normalmente; o diretório descartável foi removido. Esse smoke cobre a
+entrada CLI e a inicialização/configuração, **não** o boot completo do mundo,
+ticks, save/restart/stop ou a integração do loader `.so`. Durante o build, o
+log confirmou compilação de `horizon-client-render`, `horizon-client-input`,
+`wgpu` e `winit`; portanto não se reivindica redução do build dedicado global.
+
+## Extração de operações server-side de chunks (2026-11-24)
+
+As operações não visuais de gerar/carregar chunks, decorar, finalizar,
+persistir protos e construir/calcular a visão de iluminação foram movidas para
+`horizon-server-runtime::chunk_jobs`. O dispatcher existente em
+`horizon-client-render::streaming` delega para essas funções; queueing,
+agendamento e meshing continuam no renderer. A extração reutiliza os algoritmos
+e contratos existentes, sem duplicar simulação nem trocar gameplay por stubs.
+
+Validação: os 7 testes de `horizon-server-runtime` passaram; a suíte filtrada
+`streaming::` do renderer teve 33 aprovados e 2 ignorados; o check dedicado
+locked/offline passou (aprox. 1m32s nesta execução), assim como `git diff
+--check`. O runtime crate continua sem renderer/input/`wgpu`/`winit` em suas
+dependências normais, mas essa extração **não removeu essas dependências do
+grafo do binário dedicado**: `horizon-client-render` e `horizon-client-input`
+seguem alcançáveis e a compilação ainda inclui `wgpu` e `winit`. A próxima
+fronteira de ownership relevante é separar o caminho server-side do queue e do
+estado de streaming atualmente compartilhados com meshing. Ainda não foi feito
+boot completo do mundo com ticks/save/restart/stop nem carregamento real de uma
+`.so`; portanto esses comportamentos e a ABI permanecem sem validação runtime
+nesta etapa.
+
+## Executor server-side e primitivas genéricas da fila (2026-11-24)
+
+O enum dos trabalhos não visuais (`Generate`, `Decorate`, `Finish`, `Light`,
+`Save` e `LightView`) e o despacho que os executa agora pertencem a
+`horizon-server-runtime::chunk_jobs` (`ServerJob`, `ServerJobDone` e
+`execute_server_job`). As primitivas genéricas de fila (`Queued<J>`,
+`rank_again` e `release_columns`) também foram movidas para
+`horizon-server-runtime::work_queue`; o desempate FIFO, biases e tarefas sem
+coluna mantêm a semântica original. `horizon-client-render::streaming` calcula
+prioridades a partir da distância, cancela tarefas, registra métricas e integra
+resultados. A heap e o mutex agora são encapsulados por
+`horizon-server-runtime::work_queue::JobQueue`, que fornece push/pop, consultas
+de rank, repriorização, liberação de colunas, retenção durante abort e capacidade
+para o censo de memória. Seu enum distingue explicitamente
+`Server(ServerJob)` de `Mesh`/`Free`. O mesher continua no renderer e recebe a
+mesma região imutável; não houve mudança nos algoritmos de gameplay, iluminação
+ou persistência.
+
+Validação mais recente: `cargo test --offline --locked -j1 -p
+horizon-server-runtime` passou (12/12); os testes filtrados `streaming::` do
+renderer passaram (33 aprovados, 2 ignorados); o check dedicado locked/offline
+passou (25,31 s incremental); `cargo fmt --all -- --check` e `git diff --check`
+passaram. Os testes novos verificam acesso à fila sincronizada, peek/pop,
+retenção de saves no abort e descarte de jobs ao descarregar colunas. **É uma
+separação de ownership e despacho, não a remoção do renderer do grafo:** as
+políticas e a propriedade da fila estão no runtime server-owned, mas o estado do
+`Streaming` e sua integração com mundo/mesher permanecem em
+`horizon-client-render`; `horizon-client-render`, `horizon-client-input`, `wgpu`
+e `winit` continuam alcançáveis pelo binário dedicado. O próximo corte deve
+separar o estado/política de streaming server-side dos estados e dados de
+meshing, preservando ordem de jobs e aplicação de resultados no mundo.
+
+## Corte de TTS nativo do perfil dedicado (2026-11-23)
+
+Foi implementado o feature `horizon-narrator/client-speech`. O backend TTS e
+seus bindings de plataforma agora só são compilados quando o cliente habilita
+`client-graphics`; o perfil dedicado usa o crate `horizon-narrator` apenas para
+as APIs compartilhadas de status/narração de telas e não compila `speech.rs`.
+As dependências de plataforma (`libloading`, `windows` e `objc2`) e `log` também
+ficaram opcionais sob esse feature. O comportamento do servidor não depende de
+fala: `init()` não inicia o worker sem `client-speech`, enquanto a lógica de
+status, registro de mensagens e testes segue disponível.
+
+Validação desta fatia: o check dedicado passou depois da alteração; os 15 testes
+de `horizon-narrator` passaram com `--no-default-features`; e o check padrão do
+crate com `client-speech` habilitado passou no Linux. **Isso remove código TTS do
+perfil dedicado, mas não reduz a contagem de pacotes no Linux.** `libloading`
+continua na árvore por ser dependência do `winit`; o crate `horizon-narrator`
+continua necessário para APIs de narração de tela/status chamadas pela facade
+compartilhada. A medição histórica reportou 229 em ambos os conjuntos; essa
+contagem não foi reproduzida pela normalização atual, descrita abaixo.
+
+## Persistência de LOD movida para camada server-safe (2026-11-23)
+
+O cache de colunas decoradas (`lod/cache.rs`) e o bake de amostras distantes
+(`lod/bake.rs`) agora pertencem a `horizon-sim-data::lod_data`, não ao módulo de
+meshing do renderer. `horizon-client-render::lod` mantém reexports de
+compatibilidade, e `save.rs` usa diretamente os tipos `lod_data` e os contratos
+de `streaming_api` para `SavedLodSampler`/`Persistent<G>`. Nenhum codec, chave,
+fingerprint, layout de arquivo ou ordenação de save foi alterado.
+
+Validação: o check dedicado passou após a extração; os novos testes server-safe
+passaram (3/3: cache, bake e formato do nome de servidor), incluindo reopen e
+separação de amostras aproximadas. `cargo fmt --all -- --check` e
+`git diff --check` também passaram. A árvore ainda contém
+`horizon-client-render`, `horizon-client-input`, `wgpu` e `winit`; a extração de
+ownership, por si só, **não prova redução do grafo**.
+
+## Cache de terreno de outros servidores excluído do perfil dedicado
+
+`horizon-client-render::server_terrain` carrega e mantém os chunks distantes que
+o cliente recebeu de servidores remotos ou lê do cache Bobby local; é separado
+do serviço `lod_net` que o servidor usa para atender requests `horizon:lod` de
+seus jogadores. O módulo agora é compilado somente com `client-graphics`. O
+helper puro `server_folder` foi extraído para `horizon-sim-data::server_address`
+e é reexportado pelo caminho cliente antigo, pois o indexador BlueMap ainda o
+usa. No alvo dedicado, o ramo de abertura desse cache remoto retorna sem abrir
+arquivos locais. O protocolo de terrain distante, `lod_net`, geradores, save e
+simulação não foram alterados.
+
+Validação: check dedicado passou; `cargo check` do renderer com
+`client-graphics` passou; os oito testes existentes `server_terrain::` passaram;
+os três testes de integração server-safe acima passaram. Isso exclui o código do
+cache remoto do cliente do crate renderer no perfil dedicado, mas não reduz
+dependências Cargo: renderer/input/`wgpu`/`winit` permanecem alcançáveis.
+
+## Downloader e autodetector BlueMap condicionados ao cliente (2026-11-23)
+
+O runtime `bluemap` (download/decode das tiles BlueMap) e `bluemap_detect` agora
+são compilados somente com `client-graphics`, assim como `server_terrain`. A
+preparação de LOD no alvo sem gráficos não abre cache remoto nem executa detecção;
+continua usando as fontes server-side existentes e preserva `lod_net`/`horizon:lod`.
+O estado BlueMap em `Game` e a atualização visual de tiles também ficaram no ramo
+gráfico. Para não quebrar o formato de preferências do cliente, `Settings`, o parse
+das linhas `blueMap:` e as chaves existentes foram extraídos para o módulo puro
+`bluemap_settings`; `bluemap::Settings` continua reexportado no cliente gráfico.
+
+Validação: check dedicado passou (45,87 s incremental); `cargo check` de
+`horizon-client-render` com `client-graphics` passou (14,53 s); os 12 testes
+`bluemap::` passaram; formatação e `git diff --check` passaram. Imediatamente após
+esta fatia, a contagem era 304/220; o corte do crate HDR registrado a seguir reduziu
+um pacote adicional. Renderer/input/`wgpu`/`winit` continuam no grafo e o objetivo
+central segue pendente.
+
+## Crate HDR excluído do perfil dedicado
+
+`horizon-client-render` agora declara `horizon-hdr` como dependência opcional,
+ativada pelo feature `client-graphics`. As chamadas de criação especial do device
+Vulkan, ray-query experimental e configuração de metadados HDR também ficam nesse
+feature; sem gráficos, o engine dedicado não abre renderer nem solicita as
+extensões HDR. O caminho gráfico ativo continua usando as mesmas APIs HDR.
+
+Validação: `cargo check` dedicado passou; `cargo check` de
+`horizon-client-render --features client-graphics` passou. A consulta inversa do
+alvo confirmou **nenhum caminho para `horizon-hdr`**; a árvore caiu de 304/220 para
+**303 IDs `nome+versão` / 219 nomes**. `wgpu` continua presente por arestas diretas
+de `horizon-client`, `horizon-client-lib` e `horizon-client-render`; esta fatia
+removeu um crate, não retirou ainda o conjunto gráfico nem prova ganho de tempo.
+
+## Arestas diretas de `wgpu` removidas do engine e da facade (2026-11-23)
+
+`horizon-client` agora declara `wgpu` como opcional, habilitado por
+`client-graphics`, e `horizon-client-lib` deixou de declarar essa dependência
+diretamente. Os dois usos diagnósticos em `game/control.rs` e `game/debug_keys.rs`
+foram ajustados para não referenciar enums/tipos de `wgpu` diretamente. O
+`Cargo.lock` foi sincronizado por check offline. O check dedicado passou com
+`--offline --locked -j1` em **40,63 s** nesta sandbox; o check de
+`horizon-client-render --features client-graphics` passou em **12,16 s**; fmt e
+`git diff --check` passaram.
+
+Isso remove as arestas diretas desses dois crates, mas não retira `wgpu` do
+servidor: `cargo tree -e normal -i wgpu` confirma que ele ainda é dependência
+normal de `horizon-client-render`, alcançado por `horizon-client` e
+`horizon-client-lib`. A medição do alvo `aarch64-unknown-linux-gnu`, com a
+normalização documentada, é **302 IDs `nome+versão` / 219 nomes**. Não há uma
+contagem anterior reproduzida com as mesmas opções após a mudança, portanto não
+se declara redução de grafo nem ganho de tempo. O renderer tem referências a
+`wgpu` em muitos arquivos (incluindo `gfx/` e UI); torná-lo opcional sem separar
+essas implementações de consumidores de gameplay seria um toggle especulativo,
+não um corte seguro. `winit`, renderer e input também permanecem no grafo.
+
+Correção de medição: a contagem de 305/229 registrada antes não é reproduzível
+com o comando documentado. Na medição anterior à fatia de arestas diretas abaixo,
+remover com regex a marca de dependência repetida `(*)` retornava **304 IDs
+`nome+versão`** e **220 nomes de crate**. O pipeline reproduzível para os IDs é:
+
+```sh
+cargo tree --offline --locked -e normal -p horizon-client \
+  --no-default-features --features server-plugins,dedicated-server \
+  --target aarch64-unknown-linux-gnu --prefix none |
+python3 -c 'import re,sys; print(len({re.sub(r" \(\*\)$", "", x.rstrip()) for x in sys.stdin}))'
+```
+
+Para nomes de crate, acrescente `.split(" v", 1)[0]` à expressão dentro do
+conjunto. Baseline e estado atual precisam usar a mesma unidade e target antes de
+declarar variação numérica.
+
+## Continuação e revalidação anterior às últimas arestas de `wgpu` (2026-11-23)
+
+Após as extrações documentadas abaixo, o check dedicado foi repetido com
+`cargo check --offline --locked -j1 -p horizon-client --no-default-features
+--features server-plugins,dedicated-server --bin horizon-client`. Passou em
+**1,04 s incremental** nesta sandbox. Esse resultado é histórico; o check mais
+recente e seu tempo estão registrados na seção de arestas diretas acima. Check
+incremental não mede build frio, build release nem ganho de tempo.
+
+A árvore normal dedicada naquela validação continha 304 IDs `nome+versão` (220 nomes
+distintos) pela normalização corrigida. A medição posterior registrada acima contém
+302 IDs / 219 nomes; não há baseline medido com as mesmas opções imediatamente antes
+da mudança para declarar delta. As consultas inversas ainda mostram `horizon-client-render`,
+`horizon-client-input`, `wgpu` e `winit`; `horizon-client-backends` não aparece.
+Portanto, as extrações atuais preservam a compilação e isolam contratos/dados
+compartilhados, mas **não atingem o objetivo de retirar código ou dependências
+client-only do grafo dedicado**.
+
+O bloqueio concreto continua sendo de ownership, não de configuração: o binário
+dedicado é `horizon-client`, que compila o mesmo `game.rs`/`client_lib.rs` usados
+pela aplicação cliente. Há mais de cem módulos de `game/` com uso de APIs de
+render e dezenas com APIs de input; a estrutura `Game` também mantém esses
+estados junto à simulação. Tornar renderer/input opcionais antes de migrar esses
+consumidores já foi testado e produziu 414 erros. Um corte real requer uma raiz
+de compilação server-owned e a migração incremental dos call sites que hoje
+atravessam essa facade. Não foi feita outra alteração de arquitetura nesta
+revalidação, para não introduzir uma remoção especulativa que só substitua
+comportamento real por stubs.
+
+## Verificação atual e direção de implementação (2026-11-22)
+
+Esta seção prevalece sobre os handoffs datados abaixo quando houver conflito.
+
+- Cópia verificada: `main` em `1608bd3d5e` (`origin/main`), inicialmente limpa.
+- O check dedicado **passou** em build frio com:
+  `cargo check --locked -j1 -p horizon-client --no-default-features --features server-plugins,dedicated-server --bin horizon-client`.
+  Tempo observado nesta sandbox: **11 min 01 s**. Isto é `cargo check` de desenvolvimento, não build release nem prova de tempo do CI.
+- A compilação registrou `wgpu`, `winit`, `horizon-client-render`, `horizon-client-input`, `horizon-sim-data`, `horizon-shaders`, `horizon-narrator`, `horizon-server-plugin-api` e `horizon-server-plugin-loader`. Portanto, o servidor funciona no alvo dedicado, mas esse alvo ainda compila uma cadeia substancial de cliente.
+- `cargo tree` **não aceita `--bin`**. Para inspecionar dependências normais do pacote/feature, usar `cargo tree --locked -e normal -p horizon-client --no-default-features --features server-plugins,dedicated-server -i <crate>`. A consulta confirmou `horizon-client-render`, `wgpu`, `winit`, `naga`, `horizon-shaders` e `horizon-narrator` no grafo. Não contar `dev-dependencies` como parte do release.
+- A causa arquitetural confirmada: `horizon-client` continua sendo o pacote/binário do engine dedicado; `horizon-client-lib` aponta para `crates/horizon-client/src/client_lib.rs` e depende incondicionalmente de render/input; essa facade reexporta amplamente o renderer; `game.rs` declara centenas de módulos e mistura `Game` de simulação com estado visual/input. `game::dedicated::run` separa o startup em runtime, mas ainda cria e executa o mesmo `Game` compartilhado.
+
+### Tentativa de corte pela facade (2026-11-23)
+
+Foi testado tornar `horizon-client-render` opcional nos manifests de `horizon-client`
+e `horizon-client-lib`, condicionar seus reexports a `client-graphics` e, no perfil
+dedicado, reexportar os tipos já presentes em `horizon-sim-data`. O primeiro check
+offline do alvo dedicado falhou em `horizon-client-lib` com **414 erros**: esconder
+os reexports não impede que `client_lib.rs` compile dezenas de módulos de cliente,
+que continuam importando caminhos do renderer (por exemplo `widgets`, `options_ui`,
+`sound_engine`, `hud_kit` e `biome`). As cópias de tipos render/sim-data também não
+foram demonstradas intercambiáveis. A contagem por arquivo no log capturado foi
+liderada pela própria facade (`client_lib.rs`, 182 localizações), seguida por
+`title.rs` (42), `save.rs` (39), `client_perf/request.rs` (28),
+`title/create_world.rs` e `vanillagen.rs` (16 cada), `title/flat.rs` (14) e
+`realms_dedicated.rs` (7). Ou seja, gatear só telas de menu não basta: existem
+consumidores de exports render/client também em save, worldgen e módulos usados
+no dedicado, exigindo extração/adaptação por API em vez de um gate amplo cego.
+
+Essa alteração experimental foi integralmente revertida, inclusive o lockfile; ao
+fim daquela tentativa não permaneceu alteração de código ou feature dela no branch.
+O `cargo tree --locked` posterior ao rollback confirmou que `horizon-client-render` continua alcançável diretamente por
+`horizon-client` e por `horizon-client-lib`, e que `wgpu` também tem pais nesses dois
+crates, além de `horizon-client-render`/`horizon-hdr`. Portanto, **nenhuma redução do
+grafo foi obtida** e o check desta tentativa não passou.
+
+Conclusão operacional: a próxima alteração não pode apenas esconder reexports nem
+ativar tipos do sim-data no lugar dos tipos canônicos. É necessário separar a
+facade/raiz de compilação dedicada dos módulos client-side que hoje são compilados
+incondicionalmente e migrar consumidores server-side para tipos canônicos comuns,
+preservando o `Game`/tick e a API `.so`. Só então o renderer poderá sair do caminho
+normal do alvo dedicado. Não executar builds release localmente; manter `-j1`.
+
+### Primeira extração server-safe implementada (2026-11-23)
+
+Em vez de repetir o toggle que quebrou a facade, foram movidas as fronteiras de
+dados/contratos de geração que save e worldgen já compartilham:
+
+- Novo `horizon-sim-data::lod_data`: tipos `Surface`, `Span`, `Spans` e `Column`,
+  incluindo redução de colunas e resumo das colunas de um chunk. `lod.rs` do
+  renderer reexporta os mesmos tipos, sem cópias nem conversões que mudem IDs.
+- Novo `horizon-sim-data::streaming_api`: `ChunkGenerator`, `LodSampler`,
+  `LodSource`, `LodDetail`, `Proto` e `IDLE_RELEASE`. `streaming.rs` do renderer
+  reexporta esses contratos; save e implementações de geradores continuam usando
+  a mesma interface.
+
+Checks observados nesta fatia: `cargo check --offline -j1 -p horizon-sim-data`
+passou; `cargo check --offline -j1 -p horizon-client-render --features
+client-graphics` passou; e a revalidação final do alvo dedicado passou com
+`cargo check --locked -j1 -p horizon-client --no-default-features --features
+server-plugins,dedicated-server --bin horizon-client` em 28,26 s incremental.
+Também passaram `cargo test --offline --locked -j1 -p horizon-sim-data --test
+lod_data` (3/3) e `cargo test --offline --locked -j1 -p horizon-client-render
+--features client-graphics,test-support lod::` (83 passaram, 5 ignorados por
+requererem recursos preparados; 2018 filtrados). A formatação Rust e
+`git diff --check` passaram.
+
+O comando amplo `cargo test --offline --locked -j1 -p horizon-sim-data` **não
+compila seus unit tests herdados**: eles esperam `Items::for_tests` em
+`brewing.rs` e `Assets::reload` em `collisions.rs`, APIs/fixtures não disponíveis
+no crate isolado. Os testes LOD foram colocados num alvo de integração separado
+e passaram; não se declara a suíte unitária inteira de sim-data aprovada.
+
+Uma consulta inicial de `cargo tree` foi registrada como 305 identificadores
+únicos, mas essa contagem incluía referências abreviadas repetidas. A
+normalização descrita no início deste documento corrige a baseline para 229 IDs
+de pacote. As árvores inversas confirmam `horizon-client-render` e
+`horizon-client-input` como
+dependências de `horizon-client`/`horizon-client-lib`; `wgpu` ainda chega pelos
+dois crates, pelo renderer e por `horizon-hdr`; `winit` chega pelo engine, input,
+facade e renderer. `horizon-client-backends`, ao contrário, não aparece no perfil
+dedicado (continua opcional). **Nenhuma redução nova do grafo nem ganho de tempo foi
+demonstrado por esta fatia.** Permanecem avisos de manifests sobre `[lints]` e
+warnings preexistentes de dependências declaradas não usadas.
+
+**Esta fatia ainda não reduz o grafo dedicado.** Consultas inversas após as mudanças
+confirmam que `horizon-client-render` continua filho de `horizon-client` e
+`horizon-client-lib`, e `wgpu` continua alcançável por ambos, por renderer e por
+`horizon-hdr`. A leitura dos manifests também confirma que `horizon-client` e
+`horizon-client-lib` declaram renderer/input como dependências obrigatórias; a
+facade do renderer (`horizon-client-render/src/lib.rs`) exporta incondicionalmente
+uma superfície extensa de gameplay, mundo e apresentação. Portanto, remover somente
+uma aresta direta ou trocar um feature flag não retira o renderer com segurança.
+
+Há dois limites de código a migrar, não apenas um. O `Streaming` worker mistura
+geração/decoração/iluminação/saves com meshing, upload backlog e tipos de mesh; seu
+caminho runtime `!self.mesh` desliga a submissão visual, mas os campos/tarefas ainda
+compilam. Separar essa implementação é necessário para mover a API de simulação, mas
+não suficiente: `Game` e os módulos compartilhados ainda usam extensivamente APIs de
+render/input e `winit` (há centenas de referências nas fontes do engine). O alvo real
+é migrar o runtime dedicado para uma fronteira server-owned que não importe a facade
+cliente e, em paralelo, extrair do worker apenas a geração/iluminação/save, mantendo
+meshing como extensão client-side. Não remover nem substituir essas rotinas por stub;
+validar cada corte com o build dedicado e nova consulta inversa antes de afirmar
+redução.
+
+### Auditoria arquitetural por fatias (2026-11-22)
+
+Foi feita uma leitura estática do entrypoint/`Game`, tick e entidades, rede/jogadores,
+recursos/worldgen/save, plugins `.so`/hooks e facade de apresentação/input. A auditoria
+não editou código nem executou novos builds; as únicas mudanças desta continuação até
+esta anotação são documentais. O check dedicado de 11m01s acima continua sendo a última
+medição validada; não há redução de dependências ou tempo demonstrada nesta etapa.
+
+Evidências e limites confirmados:
+
+- O dedicated percorre `game::dedicated::run` → `Game::new` → `run_dedicated` →
+  `tick_server_spans` → `tick_server`/`tick_world`. Portanto, a simulação vanilla não
+  é um simulador alternativo; está misturada à mesma implementação compartilhada.
+  `Game` (por volta de `game.rs:2152-2325`) reúne `World`, streaming, jogador/clock,
+  inventário e estado de níveis com GUI, renderer, HUD, janela, teclas, mouse, cursor,
+  IME e gamepad. O construtor dedicado ainda exige `UiResources` e cria o mesmo tipo.
+- O tick preserva ordem vanilla de packets, block/random ticks, entidades/mobs,
+  veículos/portais, block entities, sculk, pistões e sincronização. Dentro dessa
+  orquestração há chamadas visuais/input (HUD, mão local, partículas/animações e frame
+  visuals); separar deve ser por operação/subsistema, sem remover chunks, streaming,
+  callbacks de gameplay ou alterar a ordem/cadência do tick.
+- `game/remote.rs` é a implementação do cliente remoto e contém input/UI/predição;
+  não é o listener do servidor. O caminho server-side é `lan`/`Hub`: recebe packets,
+  atualiza convidados e faz save/sync no mesmo ciclo do mundo. `TickCtx` depende de
+  `World`, colisão e streaming; mover `lan.rs` inteiro não seria uma fronteira real.
+- Recursos de apresentação (sprites, modelos, atlas visual, mesh/render tables)
+  já têm alguns caminhos headless. Em contraste, registry/tabelas de gameplay,
+  receitas/tags/loot, data packs, biomes, worldgen e saves são usados pelo servidor e
+  devem preservar os IDs, codecs, migrações e comportamento atuais. A persistência está
+  em `crates/horizon-client/src/save.rs` (não em `game/save.rs`).
+- `horizon-server-api` e `server-plugins/api` + `server-plugins/loader` são fronteiras
+  sem renderer: manter API e ABI v2/v3, símbolos, ciclo de vida da biblioteca, eventos,
+  permissões e callbacks. Porém, a implementação `GameHost`/bridge e `native_hooks.rs`
+  ainda vivem em arquivos mistos; `mod_api_host.rs` é o sistema legado de trait mods,
+  não o host `.so`.
+- A facade `horizon-client-lib` continua dependendo diretamente de
+  `horizon-client-render` e `horizon-client-input`, além de declarar `wgpu`, `winit` e
+  `pollster`; `client_lib.rs` reexporta amplamente essas APIs. Há consumidores de
+  `winit` em dezenas de arquivos do engine, incluindo tipos de evento em código
+  compartilhado. Remover uma declaração de feature/dependência antes de migrar os
+  consumidores não cria isolamento e quebra a compilação.
+
+Conclusão de implementação: a primeira alteração de código precisa criar uma nova
+fronteira consumida pelo fluxo dedicado, e não apenas mover `dedicated.rs`, reexportar
+`horizon-server-api` (que já está separado), nem recortar uma dependência do manifest.
+O primeiro candidato proposto — extrair `lan/io_pool.rs` para uma crate independente —
+foi rejeitado após inspecionar seus acoplamentos: o pool chama `super::conn::frame_body`,
+e `conn.rs` usa tipos internos do pool, inclusive `Worker`, para acordar conexões. Mover
+esse arquivo sozinho preservaria um acoplamento invertido ou exigiria uma API artificial;
+não é uma fronteira que reduza o grafo por si só. Uma extração futura de transporte
+precisa substituir essa chamada por um contrato explícito de framing e encapsular o
+despertar do worker, com testes de ordem/framing/keep-alive preservados. `Hub`/`TickCtx`
+também não podem ser movidos como bloco porque dependem diretamente de `World`, colisão
+e streaming. Até uma fronteira server-owned compilar e ser chamada pelo caminho dedicado,
+não afirmar que qualquer crate client-only foi removida. O objetivo de grafo continua
+pendente: retirar `horizon-client-render`, `horizon-client-input`, `wgpu` e `winit` do
+alvo dedicado.
+
+### Primeira fatia avaliada nesta sessão (2026-11-22)
+
+A candidata client-only de menor aparência, `horizon-narrator`, **não foi removida**. A consulta `cargo tree --locked -e normal -p horizon-client --no-default-features --features server-plugins,dedicated-server -i horizon-narrator` mostra caminhos diretos por `horizon-client` e indiretos por `horizon-client-lib` e `horizon-client-render`. O código de `horizon-client` também chama essa API em `game.rs` (estado `narration` e inicialização), `game/narrator.rs`, `game/control.rs`, `game/remote.rs`, `game/options.rs`, `game/startup_menu.rs`, `game/resource_loader.rs` e `game/pad/radial_play.rs`; além disso, `screen_narrator.rs` sustenta APIs chamadas por diversas telas. Tornar a dependência opcional, retirar seu reexport ou trocar chamadas por no-op não provaria uma fronteira real e poderia quebrar caminhos compartilhados de chat/controle. Não houve alteração de código/feature nem compilação do client nesta fatia.
+
+Próxima extração concreta para possibilitar remover o narrador sem mascarar comportamento: (1) separar de `game/narrator.rs` a interface/política de fala usada por chat da integração TTS e do ciclo de vida do backend client; (2) migrar os call sites de `game/remote.rs` que emitem fala de chat/sistema para a interface server-safe, preservando no cliente o encaminhamento ao backend; (3) mover `ScreenNarrator`, toasts, hotkeys e navegação para módulos client-only, cobrindo `game/control.rs`, `game/options.rs`, `game/startup_menu.rs`, `game/pad/radial_play.rs` e o campo `Game::narration` em `game.rs`; (4) condicionar `game/narrator.rs`, `screen_narrator.rs`, os reexports em `horizon-client-lib` e a dependência `horizon-narrator` ao feature client somente após esses call sites migrarem. Essa sequência depende primeiro de separar o estado de apresentação/runtime do `Game` misto; não é segura como toggle isolado.
+
+Comandos executados: `git status --short --branch`, `git rev-parse HEAD`, inspeção dos manifests/call sites e a consulta inversa de `cargo tree` acima. A árvore confirma que `horizon-narrator` continua incluído. Nenhum build foi executado pois nenhuma alteração de código foi feita. O renderer/input e sua cadeia gráfica continuam sendo o corte de maior impacto, mas a próxima ação segura é extrair estado/runtime compartilhado de `Game` antes de tentar removê-los pelo manifesto.
+
+### Meta e plano de conclusão
+
+Meta deste fork: priorizar um engine server-side rápido e funcional, com gameplay vanilla, protocolo, mundo/persistência e o SDK/loader de plugins `.so` preservados. **Não é requisito manter o cliente compilando** durante ou depois da separação. Também não se deve manter módulo client-only só para preservar uma facade pública do cliente, salvo decisão explícita posterior.
+
+O próximo corte de alto impacto não é outro toggle isolado em `Cargo.toml`. É criar uma fronteira de runtime de servidor que não dependa da facade client-side e migrar para ela, sem duplicar a simulação vanilla:
+
+1. Inventariar as entradas server-owned usadas no tick, rede, comandos, recursos/data packs, worldgen/save e host `.so`; marcar UI, janela, input físico, renderização, HUD, áudio de saída, narrador, splitscreen e serviços desktop como client-only, exceto tipos concretos que o servidor realmente consumir.
+2. Extrair por fatias compiláveis o estado e as rotinas do runtime dedicado de dentro do `Game` misto. A fronteira deve possuir startup, ciclo de vida/tick e estado server-side sem construir bundle GUI nem importar APIs de renderer/janela. Reutilizar a simulação compartilhada em vez de copiar o gameplay para um segundo engine.
+3. Fazer o alvo de release dedicado depender da nova fronteira; permitir remoção, substituição ou quebra de módulos exclusivamente client-side quando necessário. Não deixar o novo binário voltar a depender de `horizon-client`/`horizon-client-lib` completos só para chegar ao runtime antigo.
+4. Só depois dos call sites migrarem, retirar do grafo dedicado `horizon-client-render`, `horizon-client-input`, `wgpu`, `winit` e demais crates visuais comprovadamente não necessárias. Manter `naga` ou parser de pack apenas se houver validação de dados realmente usada pelo servidor, e separar essa validação da compilação/renderização de shaders.
+5. Preservar a ABI pública do plugin SDK `.so`, o loader e seus hooks/eventos server-side. Não confundir o plugin API com `mod_api`/mods legados do client; o sistema legado não precisa ser mantido para satisfazer o build do servidor.
+
+### Critérios de aceite
+
+- O comando dedicado de `cargo check` e os jobs server-side de CI/release passam; testes de simulação/paridade, rede, worldgen/save e SDK/loader `.so` relevantes passam.
+- `cargo tree --locked -e normal -p <pacote dedicado> --features <features do server>` confirma a ausência das crates client-only acordadas (inicialmente renderer, input, `wgpu`, `winit` e APIs/telas de cliente), em vez de inferir sucesso pela ausência de janela em runtime.
+- O build client-side não é bloqueador. O objetivo é validar o servidor primeiro.
+- A redução de tempo deve ser comparada com builds **release limpos do CI** antes/depois. Os 11m01s acima são somente a linha de base de `cargo check` local; não são a duração do release.
+
 ## Status da integração com o PR #2 (2026-11-22)
 
 Foi feita a integração local do PR #2 (`1a554f14`) com o commit WIP local
@@ -504,7 +999,7 @@ activated by client graphics as well.
 | Window/input stack (`winit`, `horizon-client-input`, gamepad/UI input) | `horizon-client-input` is unconditionally depended on and broadly re-exported. The game source has direct input references. | Client-only after its types/callbacks are removed from the server runtime; split the game loop before dropping these crates. |
 | Shader compilation and visual pack formats (`naga`, `horizon-shaders`, `horizon-shader-api`, OptiFine visual support) | Naga's SPIR-V, Metal and HLSL output features are disabled for the dedicated target; shader manifests and parsing remain reachable through shared renderer source. | Output backends are separated. Further removal requires separating shader/renderer modules from shared data loading. |
 | Menus, screens, HUD, mouse/keyboard UI, realms and desktop services | Most modules are declared in the shared `game.rs`/`client_lib.rs`; many depend on renderer and input APIs. | Move behind a client runtime boundary as a group; do not try to gate one screen at a time before ownership is clear. |
-| Narration | `horizon-narrator` is unconditional and referenced from shared game code, screens, and controls. | Likely client-only, but gate only after those call sites are moved or stubbed at a narrow interface. |
+| Narration | Native speech (`speech.rs` and platform bindings) is gated by `client-speech`, enabled with `client-graphics`; `horizon-narrator` remains for shared screen/status APIs. | TTS code is absent from the dedicated profile; full crate removal still requires moving screen narration and separating client UI/control call sites. |
 | Legacy mod registry/index | `legacy-mod-index` is off for the dedicated target; its signature and Wasm parser dependencies are absent. | Already separated. Keep `horizon-mods` content/manifest parsing until shared data-pack references are split. |
 | `horizon-client-lib` | Compiles from a source file inside `horizon-client`; its current API combines shared simulation helpers with a broad client facade. | Split its server-safe shared modules from the client facade; make the server target depend only on the server-safe crate. |
 | Server simulation, protocol, world storage/generation, commands, anticheat, chat filter and `.so` host | Needed at runtime or by plugins. | Retain in the server target. |
@@ -559,3 +1054,51 @@ shows the removal; and the focused CI and release workflow still build the serve
 No byte/time estimate is claimed yet. Compare clean Actions builds before and after
 the renderer/window chain is removed, since local compilation is avoided on this
 machine to prevent memory pressure.
+
+### Revalidação da continuação (2026-11-23)
+
+Após reverter o experimento que tornou `wgpu`, `winit` e `pollster` opcionais sem
+migrar os consumidores, o alvo dedicado voltou a passar:
+`cargo check --offline --locked -j1 -p horizon-client --no-default-features
+--features server-plugins,dedicated-server --bin horizon-client` (1,69 s
+incremental neste sandbox). `git diff --check` também passou. A árvore normalizada
+foi medida novamente e continua em **229 IDs de pacote**; `horizon-client-render`,
+`horizon-client-input`, `wgpu`, `winit`, `horizon-shaders` e `horizon-narrator`
+continuam presentes. Portanto, não há redução nova de grafo demonstrada nesta
+continuação, e o tempo incremental não é comparável a um build limpo de release.
+
+O experimento descartado falhou porque o renderer e o código compartilhado contêm
+milhares de referências diretas aos tipos/APIs de `wgpu`; opcionalizar a dependência
+no manifest antes de criar uma fronteira de módulos não é um corte válido. O diff
+atual do manifest mantém apenas as alterações herdadas (TTS e `test-support`), não
+o toggle experimental. A próxima unidade de implementação precisa migrar operações
+e estado do runtime dedicado para fora da facade visual, em vez de repetir toggles
+de dependências.
+
+Na sequência, `horizon-client-render::biome` foi movido para
+`horizon-sim-data::biome`; o renderer preserva seu caminho público como reexport.
+Isso transfere a leitura dos biomes, registros de packs, regras de temperatura,
+spawn e dados usados por simulação para uma crate compartilhável sem GPU/janela,
+sem duplicar tipos nem alterar IDs. O check dedicado passou após a mudança; a suíte
+de tint no renderer passou com 4 testes (2 ignorados por exigir recursos locais),
+e `cargo fmt --all -- --check`/`git diff --check` passaram. `Biomes::from_jsons`
+fica disponível apenas em testes ou com `horizon-sim-data/test-support`, para
+preservar fixtures que os testes do renderer usam. O novo teste de integração
+`horizon-sim-data/tests/biome_data.rs` passou (1/1), cobrindo IDs built-in,
+substituição/aditamento por datapack, features, spawn entries, spawn costs e
+comportamento de neve/temperatura.
+
+Essa extração reduz ownership/acoplamento, mas **não reduz o grafo dedicado**:
+a medição posterior segue em 229 IDs, com renderer, input, `wgpu`, `winit`,
+`horizon-shaders` e `horizon-narrator` presentes. Não atribuir a ela ganho de
+compilação; a fronteira ainda precisa avançar até o runtime dedicado deixar de
+depender da facade e do renderer.
+
+Como limpeza complementar da nova camada, foram retiradas de
+`horizon-sim-data/Cargo.toml` seis dependências diretas sem referências no código
+(`bytemuck`, `horizon-assets`, `horizon-command`, `horizon-hooks`,
+`horizon-perf-format` e `zip`), com remoção confirmada no bloco correspondente do
+`Cargo.lock`. O check locked de sim-data e o check locked do binário dedicado
+passaram depois da atualização. A árvore do binário continuou em 229 IDs, pois
+esses pacotes ainda chegam por outros caminhos; esta limpeza não é contabilizada
+como redução do grafo do servidor.

@@ -1,6 +1,6 @@
-//! The engine: the game itself, run headless (`horizon-client --dedicated`, crates/horizon-client
-//! game/dedicated.rs). It reads the vanilla files the supervisor writes, takes console commands on stdin and
-//! logs on stdout.
+//! The dedicated executable root: the game itself, run headless (`horizon-engine --dedicated`,
+//! crates/horizon-game/src/bin/dedicated.rs). It reads the vanilla files the supervisor writes, takes
+//! console commands on stdin and logs on stdout.
 
 use crate::config::Config;
 use std::{
@@ -58,7 +58,7 @@ pub fn program_in(
         })
         .find(|p| p.is_file())
         .ok_or_else(|| {
-            "the game program (horizon-client) is neither beside horizon-server nor on the PATH: \
+            "the game program (horizon-engine or fallback horizon-client) is neither beside horizon-server nor on the PATH: \
              install it there, or set engine.path in server.toml"
                 .into()
         })

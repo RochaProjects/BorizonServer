@@ -2216,6 +2216,7 @@ struct Game<'a> {
     lod_level: Option<String>,
     /// The server's BlueMap far terrain draws from, when the player named one
     /// or Find BlueMap found it.
+    #[cfg(feature = "client-graphics")]
     lod_blue_map: Option<Arc<horizon_client::bluemap::BlueMap>>,
     /// Beacon beam sections kept after their chunk unloads, so far terrain
     /// LOD still draws their beams (`beacon_geometry` refreshes them).
@@ -11483,6 +11484,7 @@ impl<'a> Game<'a> {
             lod_observe: Default::default(),
             lod_held: Default::default(),
             lod_level: None,
+            #[cfg(feature = "client-graphics")]
             lod_blue_map: None,
             lod_covered_at: None,
             view_arrival: Default::default(),

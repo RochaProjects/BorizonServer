@@ -154,14 +154,15 @@ mod tests {
     /// (`Streaming::requeue` ranks them again).
     #[test]
     fn queued_jobs_follow_a_forced_chunk() {
-        use super::super::{Job, Queued, rank_again};
+        use super::super::{Job, Queued, ServerJob};
+        use horizon_server_runtime::work_queue::rank_again;
         use std::collections::BinaryHeap;
         let job = |x, z, order| Queued {
             priority: 0,
             at: Some((x, z)),
             bias: 0,
             order,
-            job: Job::Generate(x, z),
+            job: Job::Server(ServerJob::Generate(x, z)),
         };
         let first_after = |forced: &HashSet<(i32, i32)>| {
             let ranges = Ranges {

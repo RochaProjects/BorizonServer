@@ -6759,6 +6759,8 @@ impl Renderer {
         hdr: Option<&hdr::Hdr>,
         device_lost: &std::sync::atomic::AtomicBool,
     ) -> std::result::Result<(), String> {
+        #[cfg(not(feature = "client-graphics"))]
+        let _ = hdr;
         let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         surface.configure(device, config);
@@ -6769,8 +6771,11 @@ impl Renderer {
         if device_lost.load(std::sync::atomic::Ordering::Relaxed) {
             return Err("the graphics device was lost".into());
         }
-        if let Some(hdr) = hdr {
-            horizon_hdr::set_metadata(device, surface, hdr.declared_peak(), hdr.black);
+        #[cfg(feature = "client-graphics")]
+        {
+            if let Some(hdr) = hdr {
+                horizon_hdr::set_metadata(device, surface, hdr.declared_peak(), hdr.black);
+            }
         }
         Ok(())
     }
@@ -6807,8 +6812,11 @@ impl Renderer {
         }
     }
     fn send_hdr_metadata(&self) {
-        if let (Some(surface), Some(hdr)) = (&self.surface, &self.hdr) {
-            horizon_hdr::set_metadata(&self.device, surface, hdr.declared_peak(), hdr.black);
+        #[cfg(feature = "client-graphics")]
+        {
+            if let (Some(surface), Some(hdr)) = (&self.surface, &self.hdr) {
+                horizon_hdr::set_metadata(&self.device, surface, hdr.declared_peak(), hdr.black);
+            }
         }
     }
     /// This renderer's output as applied, with what its destination offers and reports.

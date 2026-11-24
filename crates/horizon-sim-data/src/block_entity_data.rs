@@ -38,7 +38,7 @@ pub struct EnchantingBook {
 }
 
 /// Per-block-entity animation state read by the renderer each frame.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct BlockAnim {
     /// `ShulkerBoxBlockEntity` progress and progressOld.
     pub shulker: (f32, f32),

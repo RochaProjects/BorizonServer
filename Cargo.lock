@@ -1527,6 +1527,7 @@ dependencies = [
  "horizon-server-files",
  "horizon-server-plugin-api",
  "horizon-server-plugin-loader",
+ "horizon-server-runtime",
  "horizon-shader-api",
  "horizon-shaders",
  "horizon-system",
@@ -1640,7 +1641,6 @@ dependencies = [
  "sha2",
  "unicode-bidi",
  "ureq",
- "wgpu",
  "winit",
  "xxhash-rust",
  "zip",
@@ -1673,6 +1673,7 @@ dependencies = [
  "horizon-perf-format",
  "horizon-polytone",
  "horizon-protocol",
+ "horizon-server-runtime",
  "horizon-shader-api",
  "horizon-shaders",
  "horizon-sim-data",
@@ -2111,6 +2112,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-server-runtime"
+version = "0.1.0"
+dependencies = [
+ "horizon-server-files",
+ "horizon-sim-data",
+ "horizon-world",
+]
+
+[[package]]
 name = "horizon-shader-api"
 version = "0.1.0"
 dependencies = [
@@ -2140,17 +2150,12 @@ name = "horizon-sim-data"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
- "bytemuck",
  "chrono",
  "flate2",
  "glam",
- "horizon-assets",
  "horizon-client-core",
- "horizon-command",
  "horizon-core",
- "horizon-hooks",
  "horizon-items",
- "horizon-perf-format",
  "horizon-protocol",
  "horizon-system",
  "horizon-threads",
@@ -2164,7 +2169,6 @@ dependencies = [
  "sha2",
  "smallvec",
  "ureq",
- "zip",
 ]
 
 [[package]]

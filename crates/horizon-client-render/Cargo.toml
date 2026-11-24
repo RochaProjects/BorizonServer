@@ -15,13 +15,14 @@ lz4_flex = { version = "0.14", default-features = false, features = ["std", "saf
 horizon-assets = { path = "../horizon-assets" }
 horizon-client-core = { path = "../horizon-client-core" }
 horizon-sim-data = { path = "../horizon-sim-data" }
+horizon-server-runtime = { path = "../horizon-server-runtime" }
 horizon-client-input = { path = "../horizon-client-input", default-features = false }
 horizon-command = { path = "../horizon-command" }
 horizon-core = { path = "../horizon-core" }
-horizon-hdr = { path = "../horizon-hdr", default-features = false }
+horizon-hdr = { path = "../horizon-hdr", default-features = false, optional = true }
 horizon-items = { path = "../horizon-items" }
 # The narrator option's status and whether the narrator is there (Options.narrator).
-horizon-narrator = { path = "../horizon-narrator" }
+horizon-narrator = { path = "../horizon-narrator", default-features = false }
 # OptiFine-format pack files: random entity textures (hud.rs), connected textures
 # (connected.rs) and custom item texture rules (cit.rs).
 horizon-optifine = { path = "../horizon-optifine" }
@@ -71,6 +72,8 @@ default = ["client-graphics"]
 # Optional platform backends are used by the client renderer, not a headless server.
 client-graphics = [
     "dep:horizon-client-backends",
+    "dep:horizon-hdr",
+    "horizon-narrator/client-speech",
     "horizon-hdr/vulkan-backend",
     "horizon-hdr/wayland-color-management",
     "horizon-client-input/client-windowing",
@@ -81,7 +84,7 @@ client-graphics = [
 # Sound output: horizon-client's `audio` feature.
 audio = ["dep:cpal", "dep:symphonia"]
 # Helpers horizon-client's tests build their fixtures with.
-test-support = []
+test-support = ["horizon-sim-data/test-support"]
 # The `scene_replay` example's allocator counts allocations (horizon-threads' `alloc-count`).
 alloc-count = ["horizon-threads/alloc-count"]
 

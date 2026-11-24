@@ -174,12 +174,12 @@ pub(super) async fn open_adapter(
         experimental_features: ray_query::experimental(features),
         ..Default::default()
     };
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), feature = "client-graphics"))]
     let opened = match info.backend {
         wgpu::Backend::Vulkan => horizon_hdr::open_vulkan_device(adapter, &desc),
         _ => None,
     };
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", not(feature = "client-graphics")))]
     let opened = None;
     let opened = match opened {
         Some(opened) => opened,

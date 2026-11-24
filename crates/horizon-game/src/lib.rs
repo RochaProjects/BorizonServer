@@ -26,6 +26,7 @@ pub use horizon_threads::{ALLOCATOR, Allocator};
 /// The mod API level this game serves. The executable keeps it in the program, where the
 /// launcher reads it without running it (`horizon_mods::api_level::MARK`): a `static` its
 /// `main` reads, so the linker keeps it.
+#[cfg(feature = "client")]
 pub const MOD_API_LEVEL: [u8; horizon_mods::api_level::MARK.len()] = horizon_mods::api_level::MARK;
 
 /// Runs the game with the hooks registered so far, and returns when it ends. Register hooks

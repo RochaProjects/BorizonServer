@@ -18,8 +18,11 @@ pub mod block_entity_cem;
 pub mod block_entity_render;
 pub mod block_sprites;
 pub mod block_states;
+#[cfg(feature = "client-graphics")]
 pub mod bluemap;
+#[cfg(feature = "client-graphics")]
 pub mod bluemap_detect;
+pub mod bluemap_settings;
 pub mod border_render;
 pub mod breaking;
 pub use horizon_sim_data::brewing;
@@ -123,6 +126,7 @@ pub mod screen_draw;
 pub mod screen_effects;
 pub use horizon_sim_data::sculk;
 pub use horizon_sim_data::section_mask;
+#[cfg(feature = "client-graphics")]
 pub mod server_terrain;
 pub mod settings;
 pub mod settings_shell;

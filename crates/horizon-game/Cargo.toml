@@ -7,9 +7,28 @@ rust-version.workspace = true
 description = "The game as the platform runs it: the engine's entry with the platform's parts registered, for an executable to start (docs/layers.md)"
 
 [dependencies]
-horizon-client = { path = "../horizon-client" }
+horizon-client = { path = "../horizon-client", default-features = false }
 horizon-threads = { path = "../horizon-threads" }
-horizon-mods = { path = "../horizon-mods", default-features = false, features = ["index"] }
+horizon-mods = { path = "../horizon-mods", default-features = false, features = ["index"], optional = true }
+
+[features]
+default = ["client"]
+# Preserve the platform game's existing behavior for normal client executables.
+client = [
+    "dep:horizon-mods",
+    "horizon-client/audio",
+    "horizon-client/controllers",
+    "horizon-client/horizon-extras",
+    "horizon-client/client-graphics",
+    "horizon-client/legacy-mod-index",
+]
+# Dedicated executable: no client defaults; the shared engine still owns gameplay for now.
+dedicated-server = ["horizon-client/dedicated-server", "horizon-client/server-plugins"]
+
+[[bin]]
+name = "horizon-engine"
+path = "src/bin/dedicated.rs"
+required-features = ["dedicated-server"]
 
 [lints]
 workspace = true

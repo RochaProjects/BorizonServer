@@ -15,8 +15,11 @@ The owner's guide is [hosting.md](hosting.md); every command, `server.toml` key 
 ### How it runs
 
 The dedicated server is the game itself, run headless:
-`horizon-client --resources <prepared> --dedicated [--nogui] [--port N] [--world NAME] [--universe DIR]
-[--initSettings]`, started in the server folder (`crates/horizon-client/src/game/dedicated.rs`).
+`horizon-engine --resources <prepared> --dedicated [--nogui] [--port N] [--world NAME] [--universe DIR]
+[--initSettings]`, started in the server folder. `horizon-engine` is now its own binary root in
+`crates/horizon-game/src/bin/dedicated.rs`; it enters the same engine runtime while building with the
+dedicated feature set (`crates/horizon-client/src/game/dedicated.rs`). The client executable remains a
+development fallback, not the server's primary root.
 
 - **Startup.** It follows vanilla's `Main.main` and `DedicatedServer.initServer`. It reads `server.properties`
   and writes it straight back with vanilla's defaults filled in (`horizon_client::server`, byte-exact with
@@ -61,7 +64,7 @@ secure_chat server_dimension_players server_player_combat server_player_damage`.
                   backups, updates, crash restart       │ ──► stdin: console commands
                                                         │ ◄─► engine endpoint: status, TPS/MSPT, players
                                                         ▼
-                                   the engine: horizon-client --dedicated   (the game, headless)
+                                   the engine: horizon-engine --dedicated   (dedicated binary root)
 ```
 
 `horizon-server` is a new crate and binary (`crates/horizon-server`). It is the only program an owner runs.
@@ -81,7 +84,8 @@ The supervisor/engine split stays even after the engine becomes headless, for th
 - **No conflicts.** The supervisor touches none of the game code that the tick and integrated-server work
   (perf-server-1, perf-ticks-2) are changing.
 
-**The engine today** is `horizon-client --dedicated`. It needs one small, additive change: a status endpoint.
+**The engine today** is `horizon-engine --dedicated`, a dedicated executable root over the shared game runtime.
+It needs one small, additive change: a status endpoint.
 With `--control-socket <dir>/.horizon/engine.json` (the existing control protocol: TCP on 127.0.0.1 plus a token, on
 every OS), the dedicated loop answers `server-status` with TPS, MSPT (average, P50/P95/P99 from the tick
 clock `/tick query` uses), players (name, UUID, address, ping, position), loaded chunks and uptime. It answers
@@ -426,14 +430,15 @@ game built in `Game::new`, the integrated server on its own thread. On that base
 
 **Binaries.** The release archives hold `horizon-client`, `horizon-ctl`, `horizon-prepare` and
 `horizon-server`. On Linux the release also has `horizon-server-linux-x86_64.tar.gz`: `horizon-server`,
-`horizon-prepare` and `horizon-engine`, the game built with `--no-default-features` (no sound, no
-controllers, no Play with Friends: the `friends` feature; nor Discord presence or the "I'm playing" ping, which
-only the official executable has), which links neither `libasound.so.2` nor `libudev.so.1`. `release.yml` builds it after the
-client archive (`xtask package-server`) and fails if `tools/check_imports.py --server` finds either library;
-CI lints the same build. `horizon-server` runs `horizon-engine` when it is beside it or on the PATH, else
-`horizon-client`. Build it yourself with `cargo build --release -p horizon-client --no-default-features`
-and copy `target/release/horizon-client` as `horizon-engine`. macOS and Windows have no such libraries to
-avoid, so they keep the one archive.
+`horizon-prepare` and `horizon-engine`, the game built with `--no-default-features --features
+server-plugins,dedicated-server` (no sound, controllers or Play with Friends: the `friends` feature; nor
+Discord presence or the "I'm playing" ping, which only the official executable has). It links neither
+`libasound.so.2` nor `libudev.so.1`. `.github/workflows/server-release.yml` builds it and fails if
+`tools/check_imports.py --server` finds either library; CI lints the same dedicated/plugin-enabled target.
+`horizon-server` runs `horizon-engine` when it is beside it or on the PATH, else `horizon-client`. Build it
+yourself with `cargo build --release -p horizon-client --no-default-features --features
+server-plugins,dedicated-server --bin horizon-client` and copy `target/release/horizon-client` as
+`horizon-engine`. macOS and Windows have no such libraries to avoid, so they keep the one archive.
 
 **Game files: the owner's own copy, as with `prepare`.** Nothing of Mojang's is redistributed and nothing is
 downloaded on the owner's behalf. `horizon-server` looks for prepared resources in this order:

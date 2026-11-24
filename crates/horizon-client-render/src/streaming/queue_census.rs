@@ -16,8 +16,10 @@ impl Streaming {
         use std::mem::size_of;
         let table = |capacity: usize, entry: usize| capacity * (entry + 1);
         let queued = {
-            let queue = self.shared.queue.lock().unwrap();
-            (queue.len(), queue.capacity() * size_of::<Queued>())
+            (
+                self.shared.queue.len(),
+                self.shared.queue.capacity() * size_of::<Queued>(),
+            )
         };
         QueueCensus {
             generation: (

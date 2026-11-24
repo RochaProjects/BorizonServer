@@ -15,6 +15,7 @@
 //! `getFinalSoundSourceVolume(VOICE)`.
 
 pub mod screen;
+#[cfg(feature = "client-speech")]
 mod speech;
 
 use std::collections::VecDeque;
@@ -221,11 +222,14 @@ fn narrator() -> MutexGuard<'static, GameNarrator> {
 /// `HORIZON_NO_AUDIO` set the narrator is active but silent, so scripted runs
 /// still narrate into [`recent`]. Calling it again does nothing.
 pub fn init() {
-    let mut narrator = narrator();
-    if narrator.sink.is_none() {
-        narrator.sink = Some(Box::new(speech::Thread::spawn(
-            std::env::var_os("HORIZON_NO_AUDIO").is_some(),
-        )));
+    #[cfg(feature = "client-speech")]
+    {
+        let mut narrator = narrator();
+        if narrator.sink.is_none() {
+            narrator.sink = Some(Box::new(speech::Thread::spawn(
+                std::env::var_os("HORIZON_NO_AUDIO").is_some(),
+            )));
+        }
     }
 }
 

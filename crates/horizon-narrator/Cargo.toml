@@ -6,22 +6,26 @@ license.workspace = true
 rust-version.workspace = true
 description = "The narrator: vanilla's text-to-speech (GameNarrator, com.mojang.text2speech) and screen narration state"
 
+[features]
+default = ["client-speech"]
+client-speech = ["dep:log", "dep:windows", "dep:libloading", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
+
 [dependencies]
-log = "0.4"
+log = { version = "0.4", optional = true }
 
 # NarratorWindows: SAPI's SpVoice over COM, the voice the Windows narrator settings pick.
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Media_Speech", "Win32_System_Com"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Media_Speech", "Win32_System_Com"], optional = true }
 
 # NarratorLinux: flite and its cmu_us_kal16 voice, opened at run time as JNA does.
 [target.'cfg(target_os = "linux")'.dependencies]
-libloading = "0.8.9"
+libloading = { version = "0.8.9", optional = true }
 
 # NarratorMac: AppKit's NSSpeechSynthesizer, the voice of the system's spoken content settings.
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = { version = "0.6.5", default-features = false, features = ["std"] }
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSSpeechSynthesizer"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSDate", "NSObjCRuntime", "NSRunLoop", "NSString"] }
+objc2 = { version = "0.6.5", default-features = false, features = ["std"], optional = true }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSSpeechSynthesizer"], optional = true }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSDate", "NSObjCRuntime", "NSRunLoop", "NSString"], optional = true }
 
 [lints]
 workspace = true

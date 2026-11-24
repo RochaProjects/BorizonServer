@@ -17,7 +17,8 @@
 //! ([`backed`]), so the layer seen through the canopy's outer holes stays.
 
 use super::{B, Info, P, Padded, pi};
-use crate::{blocks::RenderShape, chunk::Chunk, graphics::LeafCullingMode};
+use crate::{blocks::RenderShape, chunk::Chunk};
+use horizon_sim_data::mesh_policy::LeafCullingMode;
 
 /// A cell of the padded snapshot, as far as leaf culling cares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

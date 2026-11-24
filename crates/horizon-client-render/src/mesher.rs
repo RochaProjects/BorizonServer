@@ -17,12 +17,12 @@ use crate::{
     biome::{Biomes, GrassModifier},
     blocks::{BlockFacts, RenderShape},
     chunk::{Chunk, MIN_Y},
-    graphics::LeafCullingMode,
     models::catalog::BakedFace,
 };
 use horizon_assets::model::Direction as ModelDirection;
 use horizon_core::{biome::BiomeZoom, geometry::Direction, position::BlockPos};
 use horizon_optifine::ctm::connect::{Axes as CtmAxes, Face as CtmFace};
+use horizon_sim_data::mesh_policy::LeafCullingMode;
 use horizon_world::{
     block_render::FaceVisibility,
     fluid::{FluidKind, FluidState},

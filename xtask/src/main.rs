@@ -7,8 +7,9 @@
 //! from their own copy. .github/workflows/release.yml makes the release folders with it.
 //!
 //! `package-server ENGINE OUTDIR`: a server folder (docs/server.md): the server build of the game
-//! (`cargo build --release -p horizon-client --no-default-features`, without sound or controllers)
-//! as horizon-engine, with horizon-prepare and horizon-server from beside it and the same sources.
+//! (`cargo build --release -p horizon-client --no-default-features --features
+//! server-plugins,dedicated-server`, without sound or controllers) as horizon-engine, with
+//! horizon-prepare and horizon-server from beside it and the same sources.
 //!
 //! `tokens`: writes `crates/horizon-theme/tokens.css`, the design tokens of `crates/horizon-theme` as CSS
 //! custom properties (a horizon-theme test fails when the file is out of date).

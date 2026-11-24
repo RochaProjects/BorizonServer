@@ -14,7 +14,10 @@ impl Game<'_> {
         self.lod_source_attempted = false;
         self.lod_observe.clear();
         self.lod_held.clear();
-        self.lod_blue_map = None;
+        #[cfg(feature = "client-graphics")]
+        {
+            self.lod_blue_map = None;
+        }
         self.far_beacons.clear();
         self.lod_covered_at = None;
         if let Some(renderer) = &mut self.renderer {
@@ -70,6 +73,9 @@ impl Game<'_> {
                 None
             }
             // No offer from a server: draw what it sent, on this visit and before.
+            #[cfg(not(feature = "client-graphics"))]
+            (None, None, Some(_remote)) => None,
+            #[cfg(feature = "client-graphics")]
             (None, None, Some(remote)) => std::env::current_dir().ok().map(|home| {
                 use horizon_client::server_terrain as terrain;
                 let address = &remote.session.address;
@@ -186,10 +192,15 @@ impl Game<'_> {
                 self.lod_observe.insert((x >> 4, z >> 4));
             }
         }
-        if let (Some(map), Some(p), Some(lod)) = (&self.lod_blue_map, &self.player, &mut self.lod) {
-            map.set_center(p.position.x.floor() as i32, p.position.z.floor() as i32);
-            for change in map.take_changed() {
-                lod.refresh(change.area, change.widths);
+        #[cfg(feature = "client-graphics")]
+        {
+            if let (Some(map), Some(p), Some(lod)) =
+                (&self.lod_blue_map, &self.player, &mut self.lod)
+            {
+                map.set_center(p.position.x.floor() as i32, p.position.z.floor() as i32);
+                for change in map.take_changed() {
+                    lod.refresh(change.area, change.widths);
+                }
             }
         }
         if let Some(p) = &self.player {

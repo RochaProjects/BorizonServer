@@ -46,11 +46,10 @@ horizon-shaders = { path = "../horizon-shaders" }
 # Horizon's own shader packs: the format, the stages and the check (docs/shaders.md).
 horizon-shader-api = { path = "../horizon-shader-api", default-features = false }
 # The narrator (GameNarrator): text-to-speech of chat, system messages and screens.
-horizon-narrator = { path = "../horizon-narrator" }
+horizon-narrator = { path = "../horizon-narrator", default-features = false }
 # Horizon mods: sandboxed WebAssembly components, off unless installed and turned on (docs/mods.md).
 # Their runtime is the `mods` feature.
 horizon-mods = { path = "../horizon-mods", default-features = false }
-wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "naga-ir"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 pollster = "0.4"
 bytemuck = { version = "1.24", features = ["derive"] }
@@ -120,6 +119,7 @@ controllers = ["dep:gilrs", "horizon-client-input/controllers"]
 client-graphics = [
     "horizon-client-render/client-graphics",
     "horizon-client-input/client-windowing",
+    "horizon-narrator/client-speech",
     "horizon-shader-api/shader-backends",
 ]
 server-event-types = ["horizon-client-input/server-event-types"]

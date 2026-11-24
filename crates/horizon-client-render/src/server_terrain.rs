@@ -41,29 +41,7 @@ const MAX_KEPT_SIDE: i32 = 128;
 
 type Columns = Arc<[Column; 256]>;
 
-/// The folder of a server's terrain: its address as typed, lowercased, with
-/// the default port left out, and every character a file name can't hold
-/// replaced (`play.example.net:25566` → `play.example.net_25566`).
-pub fn server_folder(address: &str) -> String {
-    let address = address.trim().to_ascii_lowercase();
-    let address = address.strip_suffix(":25565").unwrap_or(&address);
-    let name: String = address
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let name = name.trim_matches('.');
-    if name.is_empty() {
-        "_".into()
-    } else {
-        name.into()
-    }
-}
+pub use horizon_sim_data::server_address::server_folder;
 
 /// `root/<server>/<seed>/<namespace>/<path>` for a level key
 /// (`minecraft:overworld`) and the login's hashed seed, which keeps

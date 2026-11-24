@@ -878,26 +878,27 @@ impl Game<'_> {
             }
             self.admin_feedback.clear();
         }
-        let now = Instant::now();
-        if !paused && self.clock.sprinting() {
-            *next = now;
-            return None;
-        }
-        *next += self.clock.tick_duration();
-        if *next > now {
-            // The chunks loading (the players', force-loaded ones, a
-            // `/pregen` task) keep the workers fed until the next tick.
-            self.pump_chunks(*next, paused);
-            let now = Instant::now();
-            if *next > now {
-                std::thread::sleep(*next - now);
+        use horizon_server_runtime::{TickPacing, advance_tick_schedule};
+        match advance_tick_schedule(
+            next,
+            Instant::now(),
+            self.clock.tick_duration(),
+            paused,
+            self.clock.sprinting(),
+        ) {
+            TickPacing::RunImmediately | TickPacing::Continue => None,
+            TickPacing::WaitUntil(deadline) => {
+                // Keep the existing Game-owned streaming pump, which feeds
+                // players' and force-loaded chunks before sleeping.
+                self.pump_chunks(deadline, paused);
+                let now = Instant::now();
+                if deadline > now {
+                    std::thread::sleep(deadline - now);
+                }
+                None
             }
-        } else if now - *next > Duration::from_secs(2) {
-            let behind = now - *next;
-            *next = now;
-            return Some(behind);
+            TickPacing::Overloaded(behind) => Some(behind),
         }
-        None
     }
 
     /// The level whose id is exactly `id` (`MinecraftServer.getLevel` of a `ResourceKey`).

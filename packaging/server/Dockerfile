@@ -16,9 +16,9 @@ FROM rust:1-slim-bookworm AS build
 WORKDIR /src
 COPY . .
 # The server build of the game (no sound, no controllers: it needs neither ALSA nor udev) as horizon-engine.
-RUN cargo build --release --locked -p horizon-client --no-default-features --features server-plugins --bin horizon-client \
+RUN cargo build --release --locked -p horizon-game --no-default-features --features dedicated-server --bin horizon-engine \
     && cargo build --release --locked -p horizon-server --bin horizon-server \
-    && mkdir /out && cp target/release/horizon-client /out/horizon-engine && cp target/release/horizon-server /out/
+    && mkdir /out && cp target/release/horizon-engine /out/ && cp target/release/horizon-server /out/
 
 FROM debian:bookworm-slim
 RUN useradd --system --home-dir /data --shell /usr/sbin/nologin horizon \

@@ -23,7 +23,6 @@ use crate::{
     biome::Biomes,
     chunk::{BIOME_STRATEGY, Chunk, ColumnLayout, Light, Section, block_strategy},
     mobs::{spawner::SpawnerExt, trial_spawner::TrialSpawnerExt},
-    streaming::ChunkGenerator,
 };
 use horizon_core::{
     paletted::PalettedContainer,
@@ -118,6 +117,7 @@ pub fn chunks_with_block_entities<'a, N: std::hash::BuildHasher>(
 
 use horizon_client_core::nbt_value::string;
 pub use horizon_client_core::nbt_value::{float, number, text};
+use horizon_sim_data::streaming_api::ChunkGenerator;
 /// Insert or replace a key of a compound tag.
 pub(crate) fn put(tag: &mut Tag, key: &str, value: Tag) {
     if let Tag::Compound(map) = tag {
@@ -5011,24 +5011,24 @@ pub struct Persistent<G> {
     pub registry: Arc<crate::assets::Assets>,
     pub biomes: Arc<Biomes>,
 }
-type LodSurfaces = Arc<[crate::lod::Column; 256]>;
+type LodSurfaces = Arc<[horizon_sim_data::lod_data::Column; 256]>;
 /// The coarsest far tile spacing whose columns read saved chunks: 16 blocks
 /// a column, and 4 with Reduced far detail (`LodSampler::set_approximate`).
 const SAVED_LOD_STRIDE: i32 = 16;
 const SAVED_LOD_STRIDE_REDUCED: i32 = 4;
 struct SavedLodSampler<G: ChunkGenerator> {
     generator: Arc<Persistent<G>>,
-    inner: Box<dyn crate::streaming::LodSampler>,
+    inner: Box<dyn horizon_sim_data::streaming_api::LodSampler>,
     cache: std::collections::VecDeque<((i32, i32), Option<LodSurfaces>)>,
-    details: Vec<crate::streaming::LodDetail>,
+    details: Vec<horizon_sim_data::streaming_api::LodDetail>,
     /// Reduced far detail: saved chunks only in tiles up to
     /// `SAVED_LOD_STRIDE_REDUCED` blocks a column.
     approximate: bool,
     /// Chunks the generator decorated for far terrain alone, kept from
     /// earlier sessions; saved chunks take precedence over them.
-    generated: Arc<crate::lod::cache::DiskCache>,
+    generated: Arc<horizon_sim_data::lod_data::cache::DiskCache>,
     /// The generator's far samples from earlier sessions (`lod::bake`).
-    bake: Option<Arc<crate::lod::bake::LodBake>>,
+    bake: Option<Arc<horizon_sim_data::lod_data::bake::LodBake>>,
 }
 impl<G: ChunkGenerator> SavedLodSampler<G> {
     fn saved_columns(&mut self, key: (i32, i32)) -> Option<LodSurfaces> {
@@ -5050,8 +5050,8 @@ impl<G: ChunkGenerator> SavedLodSampler<G> {
         columns
     }
 }
-impl<G: ChunkGenerator> crate::streaming::LodSampler for SavedLodSampler<G> {
-    fn fork(&self) -> Option<Box<dyn crate::streaming::LodSampler>> {
+impl<G: ChunkGenerator> horizon_sim_data::streaming_api::LodSampler for SavedLodSampler<G> {
+    fn fork(&self) -> Option<Box<dyn horizon_sim_data::streaming_api::LodSampler>> {
         Some(Box::new(Self {
             generator: self.generator.clone(),
             inner: self.inner.fork()?,
@@ -5083,7 +5083,7 @@ impl<G: ChunkGenerator> crate::streaming::LodSampler for SavedLodSampler<G> {
         }
         self.inner.request_detail(&missing, center);
     }
-    fn drain_details(&mut self) -> Vec<crate::streaming::LodDetail> {
+    fn drain_details(&mut self) -> Vec<horizon_sim_data::streaming_api::LodDetail> {
         let mut details = std::mem::take(&mut self.details);
         for (key, generated) in self.inner.drain_details() {
             // A generation batch also returns neighbouring, unrequested chunks.
@@ -5096,7 +5096,13 @@ impl<G: ChunkGenerator> crate::streaming::LodSampler for SavedLodSampler<G> {
         }
         details
     }
-    fn grid(&mut self, x: i32, z: i32, stride: i32, side: usize) -> Vec<crate::lod::Column> {
+    fn grid(
+        &mut self,
+        x: i32,
+        z: i32,
+        stride: i32,
+        side: usize,
+    ) -> Vec<horizon_sim_data::lod_data::Column> {
         let approximate = self.approximate;
         let baked = (self.bake.as_ref()).and_then(|b| b.grid(approximate, [x, z], stride, side));
         let mut columns = baked.unwrap_or_else(|| {
@@ -5124,7 +5130,7 @@ impl<G: ChunkGenerator> crate::streaming::LodSampler for SavedLodSampler<G> {
                     z + (index / side) as i32 * stride,
                 );
                 if let Some(saved) = self.saved_columns((wx >> 4, wz >> 4)) {
-                    *column = crate::lod::Column::reduced(
+                    *column = horizon_sim_data::lod_data::Column::reduced(
                         &saved,
                         (wx & 15) as usize,
                         (wz & 15) as usize,
@@ -5135,17 +5141,17 @@ impl<G: ChunkGenerator> crate::streaming::LodSampler for SavedLodSampler<G> {
         }
         columns
     }
-    fn sample(&mut self, x: i32, z: i32) -> Option<crate::lod::Surface> {
+    fn sample(&mut self, x: i32, z: i32) -> Option<horizon_sim_data::lod_data::Surface> {
         self.column(x, z).surface
     }
-    fn column(&mut self, x: i32, z: i32) -> crate::lod::Column {
+    fn column(&mut self, x: i32, z: i32) -> horizon_sim_data::lod_data::Column {
         self.reduced_column(x, z, 1)
     }
-    fn reduced_column(&mut self, x: i32, z: i32, width: i32) -> crate::lod::Column {
+    fn reduced_column(&mut self, x: i32, z: i32, width: i32) -> horizon_sim_data::lod_data::Column {
         if width <= 16
             && let Some(columns) = self.saved_columns((x >> 4, z >> 4))
         {
-            return crate::lod::Column::reduced(
+            return horizon_sim_data::lod_data::Column::reduced(
                 &columns,
                 (x & 15) as usize,
                 (z & 15) as usize,
@@ -5254,10 +5260,12 @@ fn decode_lod_surfaces(
         })
         .collect();
     sections.sort_unstable_by_key(|(y, _)| std::cmp::Reverse(*y));
-    let mut columns: Box<[crate::lod::Column; 256]> =
-        Box::new(std::array::from_fn(|_| crate::lod::Column {
-            surface: None,
-            spans: crate::lod::Spans::new(),
+    let mut columns: Box<[horizon_sim_data::lod_data::Column; 256]> =
+        Box::new(std::array::from_fn(|_| {
+            horizon_sim_data::lod_data::Column {
+                surface: None,
+                spans: horizon_sim_data::lod_data::Spans::new(),
+            }
         }));
     let mut water = [None; 256];
     let light = lod_light_layers(&sections, layout, sky_light);
@@ -5345,7 +5353,7 @@ fn decode_lod_surfaces(
                             if fluid {
                                 water[cell].get_or_insert((height, state));
                             } else {
-                                column.surface = Some(crate::lod::Surface {
+                                column.surface = Some(horizon_sim_data::lod_data::Surface {
                                     height,
                                     state,
                                     water: water[cell],
@@ -5364,7 +5372,7 @@ fn decode_lod_surfaces(
                         {
                             previous.min = min;
                         } else {
-                            column.spans.push(crate::lod::Span {
+                            column.spans.push(horizon_sim_data::lod_data::Span {
                                 min,
                                 max,
                                 state,
@@ -5472,13 +5480,16 @@ impl<G: ChunkGenerator> ChunkGenerator for Persistent<G> {
         }));
         self.inner.worker()
     }
-    fn lod_sampler(self: Arc<Self>) -> Box<dyn crate::streaming::LodSampler> {
+    fn lod_sampler(self: Arc<Self>) -> Box<dyn horizon_sim_data::streaming_api::LodSampler> {
         let inner = ChunkGenerator::lod_sampler(self.inner.clone());
-        let generated = Arc::new(crate::lod::cache::DiskCache::new(
+        let generated = Arc::new(horizon_sim_data::lod_data::cache::DiskCache::new(
             self.save.root.join("data/horizon_far_terrain"),
-            crate::lod::cache::build_key(self.registry.registry.len(), self.biomes.list.len()),
+            horizon_sim_data::lod_data::cache::build_key(
+                self.registry.registry.len(),
+                self.biomes.list.len(),
+            ),
         ));
-        let bake = crate::lod::bake::LodBake::open(
+        let bake = horizon_sim_data::lod_data::bake::LodBake::open(
             &self.save.root,
             self.save.shape,
             self.registry.registry.len(),
@@ -5506,7 +5517,12 @@ impl<G: ChunkGenerator> ChunkGenerator for Persistent<G> {
         chunk.entities.extend(self.save.load_entities(x, z));
         Some(chunk)
     }
-    fn lod_surface(&self, worker: &mut G::Worker, x: i32, z: i32) -> Option<crate::lod::Surface> {
+    fn lod_surface(
+        &self,
+        worker: &mut G::Worker,
+        x: i32,
+        z: i32,
+    ) -> Option<horizon_sim_data::lod_data::Surface> {
         // Resident/visited summaries override this procedural fallback in the LOD cache.
         self.inner.lod_surface(worker, x, z)
     }
@@ -5519,7 +5535,12 @@ impl<G: ChunkGenerator> ChunkGenerator for Persistent<G> {
     fn idle(&self, worker: &mut G::Worker) {
         self.inner.idle(worker);
     }
-    fn proto(&self, worker: &mut G::Worker, x: i32, z: i32) -> crate::streaming::Proto {
+    fn proto(
+        &self,
+        worker: &mut G::Worker,
+        x: i32,
+        z: i32,
+    ) -> horizon_sim_data::streaming_api::Proto {
         let mut proto = self.inner.proto(worker, x, z);
         if let Some(saved) = self
             .save
@@ -5529,25 +5550,28 @@ impl<G: ChunkGenerator> ChunkGenerator for Persistent<G> {
         }
         proto
     }
-    fn is_decorated(&self, proto: &crate::streaming::Proto) -> bool {
+    fn is_decorated(&self, proto: &horizon_sim_data::streaming_api::Proto) -> bool {
         self.inner.is_decorated(proto)
     }
-    fn light_view(&self, proto: &crate::streaming::Proto) -> Option<Chunk> {
+    fn light_view(&self, proto: &horizon_sim_data::streaming_api::Proto) -> Option<Chunk> {
         self.inner.light_view(proto)
     }
     fn non_air_sections(
         &self,
-        proto: &crate::streaming::Proto,
+        proto: &horizon_sim_data::streaming_api::Proto,
     ) -> Option<crate::section_mask::SectionMask> {
         self.inner.non_air_sections(proto)
     }
     fn cache_census(&self) -> Vec<(&'static str, usize, Option<usize>)> {
         self.inner.cache_census()
     }
-    fn proto_heap_bytes(&self, proto: &crate::streaming::Proto) -> ([usize; 6], [usize; 16]) {
+    fn proto_heap_bytes(
+        &self,
+        proto: &horizon_sim_data::streaming_api::Proto,
+    ) -> ([usize; 6], [usize; 16]) {
         self.inner.proto_heap_bytes(proto)
     }
-    fn save_protos(&self, protos: &[&crate::streaming::Proto]) {
+    fn save_protos(&self, protos: &[&horizon_sim_data::streaming_api::Proto]) {
         self.save
             .tables
             .get_or_init(|| Arc::new(SaveTables::new(&self.registry)));
@@ -5586,27 +5610,31 @@ impl<G: ChunkGenerator> ChunkGenerator for Persistent<G> {
         &self,
         worker: &mut G::Worker,
         snapshot: &Chunk,
-    ) -> Option<crate::streaming::Proto> {
+    ) -> Option<horizon_sim_data::streaming_api::Proto> {
         self.inner.proto_beside_final(worker, snapshot)
     }
     fn final_writes(
         &self,
         snapshot: &Chunk,
-        proto: &crate::streaming::Proto,
+        proto: &horizon_sim_data::streaming_api::Proto,
     ) -> Vec<([i32; 3], u32)> {
         self.inner.final_writes(snapshot, proto)
     }
     fn final_block_entities(
         &self,
-        proto: &crate::streaming::Proto,
+        proto: &horizon_sim_data::streaming_api::Proto,
         writes: &[([i32; 3], u32)],
     ) -> Vec<((i32, i32, i32), crate::chunk::block_entity::BlockEntity)> {
         self.inner.final_block_entities(proto, writes)
     }
-    fn decorate(&self, worker: &mut G::Worker, region: &mut [crate::streaming::Proto; 9]) {
+    fn decorate(
+        &self,
+        worker: &mut G::Worker,
+        region: &mut [horizon_sim_data::streaming_api::Proto; 9],
+    ) {
         self.inner.decorate(worker, region);
     }
-    fn finish(&self, proto: crate::streaming::Proto) -> Chunk {
+    fn finish(&self, proto: horizon_sim_data::streaming_api::Proto) -> Chunk {
         self.inner.finish(proto)
     }
 }
@@ -6446,9 +6474,9 @@ mod tests {
                 .all(|s| s.light & 0xf0 == 0),
             "no invented skylight in Nether saves"
         );
-        struct SavedOnly(Vec<crate::streaming::LodDetail>);
-        impl crate::streaming::LodSampler for SavedOnly {
-            fn sample(&mut self, _: i32, _: i32) -> Option<crate::lod::Surface> {
+        struct SavedOnly(Vec<horizon_sim_data::streaming_api::LodDetail>);
+        impl horizon_sim_data::streaming_api::LodSampler for SavedOnly {
+            fn sample(&mut self, _: i32, _: i32) -> Option<horizon_sim_data::lod_data::Surface> {
                 panic!("saved data must win")
             }
             fn request_detail(&mut self, chunks: &[(i32, i32)], _: [i32; 2]) {
@@ -6457,7 +6485,7 @@ mod tests {
                     "saved builds must not request speculative generation"
                 );
             }
-            fn drain_details(&mut self) -> Vec<crate::streaming::LodDetail> {
+            fn drain_details(&mut self) -> Vec<horizon_sim_data::streaming_api::LodDetail> {
                 std::mem::take(&mut self.0)
             }
         }
@@ -6474,17 +6502,21 @@ mod tests {
             cache: Default::default(),
             details: Vec::new(),
             approximate: false,
-            generated: Arc::new(crate::lod::cache::DiskCache::new(dir.join("far"), 1)),
+            generated: Arc::new(horizon_sim_data::lod_data::cache::DiskCache::new(
+                dir.join("far"),
+                1,
+            )),
             bake: None,
         };
-        use crate::streaming::LodSampler;
+        use horizon_sim_data::streaming_api::LodSampler;
         sampler.request_detail(&[(-2, 3)], [-32, 48]);
         let details = sampler.drain_details();
         assert_eq!(details.len(), 1);
         assert_eq!(&details[0].1[..], &surfaces[..]);
         sampler.cache.clear();
-        let generated: LodSurfaces =
-            Arc::new(std::array::from_fn(|_| crate::lod::Column::default()));
+        let generated: LodSurfaces = Arc::new(std::array::from_fn(|_| {
+            horizon_sim_data::lod_data::Column::default()
+        }));
         sampler.inner = Box::new(SavedOnly(vec![
             ((-2, 3), generated.clone()),
             ((-9, 9), generated.clone()),
@@ -6505,14 +6537,15 @@ mod tests {
         // generating it again.
         sampler.request_detail(&[(-9, 9)], [-144, 144]);
         assert_eq!(sampler.drain_details()[0].1, generated);
-        sampler.inner =
-            crate::streaming::ChunkGenerator::lod_sampler(sampler.generator.inner.clone());
+        sampler.inner = horizon_sim_data::streaming_api::ChunkGenerator::lod_sampler(
+            sampler.generator.inner.clone(),
+        );
         let grid = sampler.grid(-32, 48, 2, 16);
         for z in 0..8 {
             for x in 0..8 {
                 assert_eq!(
                     grid[z * 16 + x],
-                    crate::lod::Column::reduced(&surfaces, x * 2, z * 2, 2),
+                    horizon_sim_data::lod_data::Column::reduced(&surfaces, x * 2, z * 2, 2),
                     "saved builds must override a batched direct grid"
                 );
             }
@@ -9192,8 +9225,8 @@ mod tests {
 #[cfg(test)]
 mod far_census {
     use super::*;
-    use crate::lod::Column;
-    use crate::streaming::ChunkGenerator;
+    use horizon_sim_data::lod_data::Column;
+    use horizon_sim_data::streaming_api::ChunkGenerator;
 
     #[derive(Default, Debug)]
     struct Census {

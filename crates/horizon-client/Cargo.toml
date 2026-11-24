@@ -32,6 +32,7 @@ horizon-protocol = { path = "../horizon-protocol" }
 # server.properties, eula.txt and the user lists, shared with horizon-server.
 horizon-server-files = { path = "../horizon-server-files" }
 horizon-server-api = { path = "../horizon-server-api" }
+horizon-server-runtime = { path = "../horizon-server-runtime" }
 horizon-server-plugin-loader = { path = "../../server-plugins/loader", optional = true }
 horizon-server-plugin-api = { path = "../../server-plugins/api", optional = true }
 # The dedicated server's anticheat, off unless server.toml's [anticheat] turns it on (docs/anticheat.md).
@@ -46,11 +47,11 @@ horizon-shader-api = { path = "../horizon-shader-api", default-features = false 
 # Play with Friends: invite codes and their tunnel; the `friends` feature.
 horizon-friends = { path = "../horizon-friends", optional = true }
 # The narrator (GameNarrator): text-to-speech of chat, system messages and screens.
-horizon-narrator = { path = "../horizon-narrator" }
+horizon-narrator = { path = "../horizon-narrator", default-features = false }
 # Horizon mods: sandboxed WebAssembly components, off unless installed and turned on (docs/mods.md).
 # Their runtime is the `mods` feature.
 horizon-mods = { path = "../horizon-mods", default-features = false }
-wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "naga-ir"] }
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "naga-ir"], optional = true }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 pollster = "0.4"
 bytemuck = { version = "1.24", features = ["derive"] }
@@ -128,8 +129,10 @@ horizon-extras = ["dep:horizon-cosmetics", "horizon-client-render/horizon-extras
 # types but does not need Vulkan, Metal, DX12 or GLES implementations.
 client-graphics = [
     "dep:horizon-theme",
+    "dep:wgpu",
     "horizon-client-lib/client-graphics",
     "horizon-client-render/client-graphics",
+    "horizon-narrator/client-speech",
     "horizon-shader-api/shader-backends",
 ]
 # Excludes Horizon-only client cosmetics/emotes from the dedicated server target. Use with

@@ -14,7 +14,7 @@ use horizon_client::{
     Result,
     lan::{LoginGate, NetConfig, NetLog, OnlineMode, hub::HubConfig},
     server::{
-        eula, profiles,
+        profiles,
         properties::{GAME_MODES, ServerProperties, SystemEntropy},
         user_cache::UserCache,
         user_lists::{
@@ -121,15 +121,7 @@ pub(super) fn java_double(v: f64) -> String {
     }
 }
 
-/// What the startup read before the game's resources were loaded.
-struct Setup {
-    props: ServerProperties,
-    universe: PathBuf,
-    level_name: String,
-    port: Option<u16>,
-    started: Instant,
-}
-static SETUP: OnceLock<Mutex<Option<Setup>>> = OnceLock::new();
+static SETUP: OnceLock<Mutex<Option<horizon_server_runtime::ServerSetup>>> = OnceLock::new();
 /// usercache.json (Services.nameToIdCache): used by the server thread only.
 static USER_CACHE: Mutex<Option<UserCache>> = Mutex::new(None);
 
@@ -264,16 +256,6 @@ fn forwarding_secret(online: bool) -> Result<Option<Vec<u8>>> {
     Ok(Some(secret))
 }
 
-/// `MinecraftServer.runServer`'s overload warning for a server `behind` its
-/// schedule, in milliseconds and in ticks of `tick`.
-fn overload_warning(behind: Duration, tick: Duration) -> String {
-    format!(
-        "Can't keep up! Is the server overloaded? Running {}ms or {} ticks behind",
-        behind.as_millis(),
-        behind.as_nanos() / tick.as_nanos().max(1)
-    )
-}
-
 /// `ServerGamePacketListenerImpl.tick`'s idle kick: a player whose last action is more than
 /// `minutes` (`player-idle-timeout`, none when 0 or less) behind, counted here in ticks, is kicked,
 /// unless the End poem is showing (`ServerPlayer.wonGame`): its client sends no action until it
@@ -324,118 +306,30 @@ fn capture_log(f: impl FnOnce()) -> Vec<String> {
     CAPTURE.take().unwrap_or_default()
 }
 
-/// Main.main up to the server start: arguments, server.properties (stored
-/// back at once), eula.txt. False when the process should stop here.
+/// Engine adapter for server-owned argument/config/EULA preflight.
 pub(super) fn preflight(options: &mut Options) -> Result<bool> {
-    let args = options.dedicated.clone().unwrap_or_default();
-    let mut universe = PathBuf::from(".");
-    let mut world = None;
-    let mut port = None;
-    let mut init_settings = false;
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        let name = arg.trim_start_matches('-');
-        match name {
-            "nogui"
-            | "demo"
-            | "bonusChest"
-            | "forceUpgrade"
-            | "eraseCache"
-            | "recreateRegionFiles"
-            | "safeMode"
-            | "jfrProfile" => {}
-            "initSettings" => init_settings = true,
-            "help" => {
-                eprintln!(
-                    "Option                Description\n------                -----------\n--help\n--initSettings        Initializes 'server.properties' and 'eula.txt', then quits\n--nogui\n--port <Integer>      (default: -1)\n--universe <String>   (default: .)\n--world <String>"
-                );
-                return Ok(false);
-            }
-            "universe" => universe = PathBuf::from(it.next().ok_or("--universe needs a value")?),
-            "world" => world = Some(it.next().ok_or("--world needs a value")?.clone()),
-            "port" => {
-                let v: i32 = it.next().ok_or("--port needs a value")?.parse()?;
-                port = u16::try_from(v).ok();
-            }
-            "serverId" | "pidFile" => {
-                let value = it.next().ok_or("missing value")?;
-                if name == "pidFile" {
-                    std::fs::write(value, std::process::id().to_string())?;
-                }
-            }
-            _ => return Err(format!("{arg} is not a recognized option").into()),
-        }
-    }
-    let started = Instant::now();
-    let settings = PathBuf::from("server.properties");
-    let props = ServerProperties::from_file(&settings, &mut SystemEntropy::default())?;
-    for w in &props.warnings {
-        log("WARN", w);
-    }
+    let setup =
+        horizon_server_runtime::preflight(options.dedicated.as_deref().unwrap_or_default(), log)?;
+    let Some(setup) = setup else {
+        return Ok(false);
+    };
     // A dedicated server's tree: /op, /ban, /whitelist... (single player's
     // server thread is an integrated one and never gets here).
     horizon_client::command::vanilla::set_dedicated_commands(true);
     // Horizon's own commands are the owner's choice, off as on vanilla.
-    if props
+    if setup
+        .props
         .raw
         .get(horizon_client::command::vanilla::PREGEN_PROPERTY)
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
     {
         horizon_client::command::vanilla::set_horizon_commands(true);
     }
-    props.store(&settings)?;
-    // `RegionFileVersion.configure`: the compression every region file this
-    // server writes uses, from `region-file-compression`. An unknown name is
-    // logged with the ones there are, and the default (deflate) stays.
-    if !horizon_world::compression::Compression::configure(&props.region_file_compression) {
-        log(
-            "ERROR",
-            &format!(
-                "Invalid `region-file-compression` value `{}` in server.properties. Please use one of: {}",
-                props.region_file_compression,
-                horizon_world::compression::REGION_FILE_NAMES.join(",")
-            ),
-        );
-    }
-    let eula_file = PathBuf::from("eula.txt");
-    let agreed = match eula::agreed(&eula_file) {
-        Ok(a) => a,
-        Err(w) => {
-            log("WARN", &w);
-            false
-        }
-    };
-    if init_settings {
-        let abs = |p: &PathBuf| std::env::current_dir().map_or(p.clone(), |d| d.join(p));
-        log(
-            "INFO",
-            &format!(
-                "Initialized '{}' and '{}'",
-                abs(&settings).display(),
-                abs(&eula_file).display()
-            ),
-        );
-        return Ok(false);
-    }
-    if !agreed {
-        log(
-            "INFO",
-            "You need to agree to the EULA in order to run the server. Go to eula.txt for more info.",
-        );
-        return Ok(false);
-    }
-    let level_name = world.unwrap_or_else(|| props.level_name.clone());
     SETUP
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap()
-        .replace(Setup {
-            props,
-            universe,
-            level_name,
-            port,
-            started,
-        });
+        .replace(setup);
     Ok(true)
 }
 
@@ -863,28 +757,6 @@ fn auto_save(state: &ServerState) -> bool {
     state.lists.lock().unwrap().autosave
 }
 
-/// `MinecraftServer.tickServer`'s pause-when-empty count. `pause_after` is its
-/// `pauseWhenEmptySeconds() * 20`; while that is above 0, a tick with no player and no
-/// `/tick sprint` running (`ServerTickRateManager.isSprinting`) adds one to `empty_ticks`, and any
-/// other tick sets it back to 0. A `/pregen` task keeps the server busy as a player would: paused,
-/// nothing would post-process its chunks. Returns whether the server is paused this tick.
-fn count_empty_tick(
-    empty_ticks: &mut i32,
-    pause_after: i32,
-    players: usize,
-    pregen: bool,
-    sprinting: bool,
-) -> bool {
-    if pause_after > 0 {
-        if players == 0 && !pregen && !sprinting {
-            *empty_ticks += 1;
-        } else {
-            *empty_ticks = 0;
-        }
-    }
-    pause_after > 0 && *empty_ticks >= pause_after
-}
-
 /// `MinecraftServer.setAutoSave`: enable or disable periodic saves and report whether it changed.
 pub(super) fn set_auto_save(lists: &Mutex<Lists>, enabled: bool) -> bool {
     let mut l = lists.lock().unwrap();
@@ -936,7 +808,7 @@ impl Game<'_> {
         // This thread ticks the server (MinecraftServer.spin's priority).
         horizon_threads::favour_current();
         self.join_world_rest()?;
-        let Setup {
+        let horizon_server_runtime::ServerSetup {
             props,
             universe,
             level_name,
@@ -1400,7 +1272,7 @@ impl Game<'_> {
             // Vanilla reads pauseWhenEmptySeconds on every tick, so management changes take effect
             // without restarting the server.
             let pause_after = state.pause_when_empty_seconds.wrapping_mul(20);
-            let paused = count_empty_tick(
+            let paused = horizon_server_runtime::count_empty_tick(
                 &mut state.empty_ticks,
                 pause_after,
                 players,
@@ -1509,7 +1381,7 @@ impl Game<'_> {
                 overload_warned = Some(Instant::now());
                 log(
                     "WARN",
-                    &overload_warning(behind, self.clock.tick_duration()),
+                    &horizon_server_runtime::overload_warning(behind, self.clock.tick_duration()),
                 );
             }
         }
@@ -2549,9 +2421,7 @@ fn console_level(active: super::Dim) -> Option<super::Dim> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        capture_log, log, log_from, overload_warning, panic_message, parse_whitelist_bypass,
-    };
+    use super::{capture_log, log, log_from, panic_message, parse_whitelist_bypass};
     use std::{
         fs,
         io::{self, BufRead, BufReader, Read, Write},
@@ -2636,61 +2506,6 @@ mod tests {
             super::save_all_reply(false).translation_key(),
             Some("commands.save.failed")
         );
-    }
-
-    /// Vanilla's words, with how far behind the server is in milliseconds and in whole ticks.
-    #[test]
-    fn the_overload_warning_reads_as_vanilla_s() {
-        let tick = std::time::Duration::from_millis(50);
-        assert_eq!(
-            overload_warning(std::time::Duration::from_millis(13_027), tick),
-            "Can't keep up! Is the server overloaded? Running 13027ms or 260 ticks behind"
-        );
-    }
-
-    /// MinecraftServer.tickServer: a tick only counts toward pause-when-empty with no player and
-    /// no `/tick sprint` running (`ServerTickRateManager.isSprinting`); a sprint on an empty server
-    /// keeps the count at 0, so it is never paused, and the count starts again after it.
-    #[test]
-    fn a_sprint_on_an_empty_server_does_not_count_toward_the_pause() {
-        let pause_after = 60 * 20;
-        let mut empty_ticks = 0;
-        // One server tick: (players, a `/pregen` task, a `/tick sprint`) -> paused.
-        let tick = |empty_ticks: &mut i32, players, pregen, sprinting| {
-            super::count_empty_tick(empty_ticks, pause_after, players, pregen, sprinting)
-        };
-        for _ in 0..2000 {
-            assert!(!tick(&mut empty_ticks, 0, false, true));
-        }
-        assert_eq!(empty_ticks, 0);
-        // The sprint ended: 1200 empty ticks later the server pauses, not before.
-        for n in 1..=pause_after {
-            assert_eq!(
-                tick(&mut empty_ticks, 0, false, false),
-                n == pause_after,
-                "tick {n}"
-            );
-        }
-        // A sprint that starts while paused resumes the server at once.
-        assert!(!tick(&mut empty_ticks, 0, false, true));
-        assert_eq!(empty_ticks, 0);
-        // A player, or a `/pregen` task, resets the count too.
-        empty_ticks = 5;
-        assert!(!tick(&mut empty_ticks, 1, false, false));
-        assert_eq!(empty_ticks, 0);
-        empty_ticks = 5;
-        assert!(!tick(&mut empty_ticks, 0, true, false));
-        assert_eq!(empty_ticks, 0);
-        // pause-when-empty-seconds=0 never pauses and leaves the count alone.
-        empty_ticks = 5;
-        assert!(!super::count_empty_tick(
-            &mut empty_ticks,
-            0,
-            0,
-            false,
-            false
-        ));
-        assert_eq!(empty_ticks, 5);
     }
 
     /// A `panic!("literal")` carries a `&str`, a formatted one a `String`; anything else is

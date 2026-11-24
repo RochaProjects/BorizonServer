@@ -211,7 +211,7 @@ impl LightTables {
         Ok(tables)
     }
     /// Assembled tables (tests and benchmarks): derives the packed light cache.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn from_parts(cells: Vec<Cell>, occludes: Vec<bool>, faces: usize) -> Self {
         let mut tables = Self {
             cells,
@@ -1395,43 +1395,16 @@ fn relight_layer(
     }
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
     use super::*;
-    use crate::chunk::{HEIGHT, MIN_Y, SECTIONS};
-
-    #[test]
-    fn changed_cells_dirty_only_the_sections_within_a_block() {
-        let dirty = |cells: &[(usize, usize, usize)]| {
-            let a = [0u8; 4096];
-            let mut b = a;
-            for &(x, y, z) in cells {
-                b[y << 8 | z << 4 | x] = 1;
-            }
-            let mut changes = LightChanges::default();
-            changes.add((0, 5, 0), LightChanges::classes_differing(&a, &b));
-            let mut out = Vec::new();
-            changes.dirty_sections(|p| out.push(p));
-            out.sort_unstable();
-            out
-        };
-        assert_eq!(dirty(&[]), Vec::<Pos>::new());
-        assert_eq!(dirty(&[(5, 5, 5), (9, 1, 14)]), vec![(0, 5, 0)]);
-        assert_eq!(dirty(&[(0, 5, 5)]), vec![(-1, 5, 0), (0, 5, 0)]);
-        assert_eq!(
-            dirty(&[(15, 15, 5)]),
-            vec![(0, 5, 0), (0, 6, 0), (1, 5, 0), (1, 6, 0)]
-        );
-        assert_eq!(dirty(&[(0, 0, 0)]).len(), 8);
-    }
-
-    pub(crate) const AIR: u32 = 0;
-    const STONE: u32 = 1;
-    pub(crate) const TORCH: u32 = 2;
-    const SLAB: u32 = 3;
+    pub const AIR: u32 = 0;
+    pub const STONE: u32 = 1;
+    pub const TORCH: u32 = 2;
+    pub const SLAB: u32 = 3;
     /// Air, stone, torch and a bottom slab (full bottom face, half sides,
     /// empty top), with a third face shape for the half sides.
-    pub(crate) fn tables() -> LightTables {
+    pub fn tables() -> LightTables {
         let cell = |dampening, emission, faces: [u16; 6]| Cell {
             dampening,
             emission,
@@ -1450,11 +1423,11 @@ pub(crate) mod tests {
             3,
         )
     }
-    pub(crate) fn world(edit: impl Fn(&mut Chunk)) -> HashMap<(i32, i32), Arc<Chunk>> {
+    pub fn world(edit: impl Fn(&mut Chunk)) -> HashMap<(i32, i32), Arc<Chunk>> {
         world_of(crate::chunk::ColumnLayout::VANILLA, edit)
     }
     /// Lit chunks around (0, 0) of `layout`, stone up to y 0.
-    fn world_of(
+    pub fn world_of(
         layout: crate::chunk::ColumnLayout,
         edit: impl Fn(&mut Chunk),
     ) -> HashMap<(i32, i32), Arc<Chunk>> {
@@ -1487,6 +1460,39 @@ pub(crate) mod tests {
             .collect();
         lit.into_iter().collect()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{AIR, SLAB, STONE, TORCH, tables, world, world_of};
+    use super::*;
+    use crate::chunk::{HEIGHT, MIN_Y, SECTIONS};
+
+    #[test]
+    fn changed_cells_dirty_only_the_sections_within_a_block() {
+        let dirty = |cells: &[(usize, usize, usize)]| {
+            let a = [0u8; 4096];
+            let mut b = a;
+            for &(x, y, z) in cells {
+                b[y << 8 | z << 4 | x] = 1;
+            }
+            let mut changes = LightChanges::default();
+            changes.add((0, 5, 0), LightChanges::classes_differing(&a, &b));
+            let mut out = Vec::new();
+            changes.dirty_sections(|p| out.push(p));
+            out.sort_unstable();
+            out
+        };
+        assert_eq!(dirty(&[]), Vec::<Pos>::new());
+        assert_eq!(dirty(&[(5, 5, 5), (9, 1, 14)]), vec![(0, 5, 0)]);
+        assert_eq!(dirty(&[(0, 5, 5)]), vec![(-1, 5, 0), (0, 5, 0)]);
+        assert_eq!(
+            dirty(&[(15, 15, 5)]),
+            vec![(0, 5, 0), (0, 6, 0), (1, 5, 0), (1, 6, 0)]
+        );
+        assert_eq!(dirty(&[(0, 0, 0)]).len(), 8);
+    }
+
     fn sky(world: &HashMap<(i32, i32), Arc<Chunk>>, x: i32, y: i32, z: i32) -> u8 {
         world[&(x >> 4, z >> 4)].light(x & 15, y, z & 15) >> 4
     }

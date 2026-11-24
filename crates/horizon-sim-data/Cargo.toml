@@ -9,17 +9,12 @@ description = "Server-safe simulation data types: streaming, chunk, collisions, 
 [dependencies]
 horizon-core = { path = "../horizon-core" }
 horizon-client-core = { path = "../horizon-client-core" }
-horizon-command = { path = "../horizon-command" }
 horizon-items = { path = "../horizon-items" }
 horizon-protocol = { path = "../horizon-protocol" }
 horizon-threads = { path = "../horizon-threads" }
 horizon-world = { path = "../horizon-world" }
-horizon-assets = { path = "../horizon-assets" }
-horizon-hooks = { path = "../horizon-hooks" }
-horizon-perf-format = { path = "../horizon-perf-format" }
 horizon-system = { path = "../horizon-system" }
 base64 = "0.22"
-bytemuck = { version = "1.24", features = ["derive"] }
 chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
 flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs", "runtime_detection"] }
 glam = "0.30"
@@ -31,13 +26,22 @@ sha1 = "0.10"
 sha2 = "0.10.9"
 smallvec = { version = "1", features = ["const_new"] }
 ureq = { version = "2", default-features = false, features = ["tls"] }
-zip = { version = "9.1.3", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = ["std", "time"] }
 
 [features]
 test-support = []
+
+[[test]]
+name = "biome_data"
+path = "tests/biome_data.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "lod_persistence"
+path = "tests/lod_persistence.rs"
+required-features = ["test-support"]
 
 [lints]
 workspace = true

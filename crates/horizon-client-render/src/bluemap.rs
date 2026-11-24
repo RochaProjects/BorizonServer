@@ -49,108 +49,7 @@ const CHANGE_GAP: Duration = Duration::from_millis(250);
 /// theirs, and the edge of the map's data shows no wall down to the void.
 const SKIRT: i32 = 8;
 
-/// Where the player names the servers' maps (`Settings::servers`), beside
-/// `horizon-graphics.txt`: kept out of the graphics settings, which shared
-/// instances and modpacks carry, as a map the client asks for tiles around
-/// the player (where they stand, which server) is the player's to name, not
-/// a pack's.
-pub const SERVERS_FILE: &str = "horizon-bluemap.txt";
-/// The player's BlueMap settings: `blueMapRadius:<chunks>` (or `<blocks>b`)
-/// and `blueMapAutoDetect:true` in `horizon-graphics.txt`, and
-/// `blueMap:<server address> <map URL> [<level>=<map id> ...]` per server in
-/// `SERVERS_FILE`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Settings {
-    /// How far around the player tiles are downloaded, in chunks; 0 uses
-    /// `DEFAULT_RADIUS`.
-    pub radius: u32,
-    /// Look for the map of a server no `blueMap:` line names.
-    pub auto_detect: bool,
-    pub servers: Vec<Server>,
-}
-pub const DEFAULT_RADIUS: u32 = 64;
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Server {
-    pub address: String,
-    pub url: String,
-    /// `(level, map id)`: which of the server's maps draws which level;
-    /// unnamed levels are guessed from the map ids (`pick_map`).
-    pub maps: Vec<(String, String)>,
-}
-impl Settings {
-    /// `blueMapRadius:`'s value: chunks, or blocks with a `b` (`2048b`).
-    pub fn parse_radius(value: &str) -> Option<u32> {
-        let value = value.trim().to_ascii_lowercase();
-        let blocks = value
-            .strip_suffix("blocks")
-            .or_else(|| value.strip_suffix('b'));
-        let chunks = match blocks {
-            Some(blocks) => blocks.trim().parse::<u32>().ok()?.div_ceil(16),
-            None => value
-                .strip_suffix("chunks")
-                .unwrap_or(&value)
-                .trim()
-                .parse()
-                .ok()?,
-        };
-        Some(chunks.min(4096))
-    }
-    /// A `blueMap:` line's value.
-    pub fn parse_server(value: &str) -> Option<Server> {
-        let mut words = value.split_whitespace();
-        let address = words.next()?.to_owned();
-        let url = words.next()?.to_owned();
-        let maps = words
-            .filter_map(|w| w.split_once('='))
-            .map(|(level, map)| (level_key(level), map.to_owned()))
-            .collect();
-        Some(Server { address, url, maps })
-    }
-    /// The `blueMap:` lines of `SERVERS_FILE`.
-    pub fn parse_servers(text: &str) -> Vec<Server> {
-        // Notepad's "UTF-8 with BOM" would hide the first line.
-        text.trim_start_matches('\u{feff}')
-            .lines()
-            .filter_map(|line| line.split_once(':'))
-            .filter(|(key, _)| key.trim() == "blueMap")
-            .filter_map(|(_, value)| Self::parse_server(value))
-            .collect()
-    }
-    /// What goes in `horizon-graphics.txt` (the servers don't).
-    pub fn serialize(&self) -> String {
-        format!(
-            "blueMapRadius:{}\nblueMapAutoDetect:{}\n",
-            self.radius, self.auto_detect
-        )
-    }
-    /// The settings of the server at `address`, as typed to join it.
-    pub fn server(&self, address: &str) -> Option<&Server> {
-        let folder = crate::server_terrain::server_folder(address);
-        self.servers
-            .iter()
-            .find(|s| crate::server_terrain::server_folder(&s.address) == folder)
-    }
-    pub fn radius_blocks(&self) -> i32 {
-        self.radius_chunks() as i32 * 16
-    }
-    pub fn radius_chunks(&self) -> u32 {
-        if self.radius == 0 {
-            DEFAULT_RADIUS
-        } else {
-            self.radius
-        }
-    }
-}
-
-/// `nether` → `minecraft:the_nether`, `overworld` → `minecraft:overworld`.
-fn level_key(level: &str) -> String {
-    match level {
-        "nether" => "minecraft:the_nether".into(),
-        "end" => "minecraft:the_end".into(),
-        _ if level.contains(':') => level.into(),
-        _ => format!("minecraft:{level}"),
-    }
-}
+pub use crate::bluemap_settings::{DEFAULT_RADIUS, SERVERS_FILE, Server, Settings};
 
 /// The map drawing `level` among the server's map ids: the player's choice,
 /// else the first id naming the level's dimension (`world_nether`,
@@ -1030,7 +929,10 @@ impl Inner {
         let id = pick_map(&root.maps, &self.level, &self.chosen)?;
         let lowres = Lowres::parse(&get(
             &format!("{}/{id}/settings.json", root.data_root),
-            &format!("{}.json", crate::server_terrain::server_folder(&id)),
+            &format!(
+                "{}.json",
+                horizon_sim_data::server_address::server_folder(&id)
+            ),
         )?)?;
         Some(MapInfo {
             id,
@@ -1040,7 +942,7 @@ impl Inner {
     }
     fn tile_file(&self, map: &MapInfo, (level, x, z): Key) -> PathBuf {
         self.dir
-            .join(crate::server_terrain::server_folder(&map.id))
+            .join(horizon_sim_data::server_address::server_folder(&map.id))
             .join(level.to_string())
             .join(format!("{x}_{z}"))
     }
@@ -1291,7 +1193,7 @@ impl Worker {
             // before the new settings are kept, or they'd pass for theirs.
             let tiles = inner
                 .dir
-                .join(crate::server_terrain::server_folder(&map.id));
+                .join(horizon_sim_data::server_address::server_folder(&map.id));
             self.settings = true;
             self.answered();
             // Not gone (a file held open): no map this visit, not the wrong one.

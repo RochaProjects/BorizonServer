@@ -1137,8 +1137,7 @@ fn fix_profile_properties(v: Option<&Tag>) -> Option<Tag> {
 
 /// Java `String.hashCode`.
 pub(super) fn java_string_hash(s: &str) -> i32 {
-    s.encode_utf16()
-        .fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(i32::from(c)))
+    horizon_core::random::java_string_hash(s.encode_utf16())
 }
 
 /// Iteration order of a `java.util.HashMap`/`HashSet` built by inserting the

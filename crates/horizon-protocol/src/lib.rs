@@ -21,6 +21,7 @@ pub mod rsa;
 pub mod secure_chat;
 pub mod servers;
 pub mod text;
+pub mod text_component_snbt;
 
 /// SharedConstants.getProtocolVersion().
 pub const PROTOCOL_VERSION: i32 = horizon_core::version::PROTOCOL_VERSION;

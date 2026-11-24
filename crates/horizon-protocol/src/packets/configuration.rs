@@ -313,8 +313,8 @@ mod tests {
             Serverbound::SelectKnownPacks(SelectKnownPacks { packs: vec![] }),
             Serverbound::AcceptCodeOfConduct(Empty),
             Serverbound::CustomClickAction(CustomClickAction {
-                id: "authme:prejoin-register/submit".into(),
-                payload: Some(Tag::compound([("password", Tag::String("hunter2".into()))])),
+                id: "minecraft:custom_test".into(),
+                payload: Some(Tag::compound([("value", Tag::String("test".into()))])),
             }),
             Serverbound::CustomClickAction(CustomClickAction {
                 id: "minecraft:x".into(),

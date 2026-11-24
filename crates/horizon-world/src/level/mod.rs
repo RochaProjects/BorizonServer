@@ -255,17 +255,23 @@ pub struct GameRules {
 }
 impl Default for GameRules {
     fn default() -> Self {
+        Self::from(&crate::gamerules::GameRules::default())
+    }
+}
+
+impl From<&crate::gamerules::GameRules> for GameRules {
+    fn from(rules: &crate::gamerules::GameRules) -> Self {
         Self {
-            water_source_conversion: true,
-            lava_source_conversion: false,
-            random_tick_speed: 3,
-            block_drops: true,
-            mob_griefing: true,
-            max_snow_accumulation_height: 1,
-            spawn_mobs: true,
-            spawn_monsters: true,
-            fire_spread_radius_around_player: 128,
-            spread_vines: true,
+            water_source_conversion: rules.bool("water_source_conversion"),
+            lava_source_conversion: rules.bool("lava_source_conversion"),
+            random_tick_speed: rules.int("random_tick_speed"),
+            block_drops: rules.bool("block_drops"),
+            mob_griefing: rules.bool("mob_griefing"),
+            max_snow_accumulation_height: rules.int("max_snow_accumulation_height"),
+            spawn_mobs: rules.bool("spawn_mobs"),
+            spawn_monsters: rules.bool("spawn_monsters"),
+            fire_spread_radius_around_player: rules.int("fire_spread_radius_around_player"),
+            spread_vines: rules.bool("spread_vines"),
         }
     }
 }
@@ -453,8 +459,18 @@ pub trait LevelAccess {
     fn dimension_type(&self) -> &DimensionFacts {
         DimensionFacts::of_builtin_level(self.level_key())
     }
+    /// Complete vanilla game-rule state for this level, including rules not
+    /// consulted by block simulation. Server owners may override this to
+    /// provide the loaded/persisted level settings.
+    fn game_rule_catalog(&self) -> &crate::gamerules::GameRules {
+        static DEFAULT_RULES: std::sync::LazyLock<crate::gamerules::GameRules> =
+            std::sync::LazyLock::new(crate::gamerules::GameRules::default);
+        &DEFAULT_RULES
+    }
+    /// Compact projection of the catalog for hot simulation paths. The
+    /// catalog is the single source of defaults and configured values.
     fn game_rules(&self) -> GameRules {
-        GameRules::default()
+        GameRules::from(self.game_rule_catalog())
     }
     /// `Difficulty.getId()` (peaceful 0 .. hard 3).
     fn difficulty(&self) -> i32 {

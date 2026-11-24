@@ -98,7 +98,7 @@ mod tests {
             Clientbound::Compression(Compression { threshold: 256 }),
             Clientbound::CustomQuery(CustomQuery {
                 transaction: 3,
-                channel: "velocity:player_info".into(),
+                channel: "minecraft:test".into(),
                 data: vec![1],
             }),
             Clientbound::CookieRequest(CookieRequest { key: "a:b".into() }),
@@ -150,7 +150,7 @@ mod tests {
         let query = |n: usize| {
             Clientbound::CustomQuery(CustomQuery {
                 transaction: 3,
-                channel: "velocity:player_info".into(),
+                channel: "minecraft:test".into(),
                 data: vec![7; n],
             })
             .encode()

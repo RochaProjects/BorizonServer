@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 pub mod biome;
+pub mod bossbar;
 pub mod carving;
 pub mod density;
 pub mod fast_hash;
@@ -17,6 +18,7 @@ pub mod paletted;
 pub mod position;
 pub mod prepared_files;
 pub mod random;
+pub mod sound_source;
 pub mod storage;
 pub mod text;
 pub mod ticks;

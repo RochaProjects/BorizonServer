@@ -6,7 +6,7 @@ use super::{
     classes::{Class, Interface},
 };
 use crate::{
-    fluid::{FluidKind, FluidState, FluidTemplate},
+    fluid::{FluidKind, FluidState},
     registry::BlockStateId,
 };
 use horizon_core::{position::BlockPos, random::RandomSource};
@@ -34,28 +34,9 @@ impl BucketContent {
     }
 }
 
-/// `minecraft:lava_bucket`, or a content mod fluid's bucket copying lava: it
-/// fills and empties with lava's sounds.
+/// Whether the item is vanilla's lava bucket.
 pub fn is_lava_bucket(item: &str) -> bool {
     item == "minecraft:lava_bucket"
-        || FluidKind::of_bucket(item).is_some_and(|f| f.template() == FluidTemplate::Lava)
-}
-
-/// A content mod fluid's bucket as `bucket_contents` gives it: it pours the
-/// fluid's source with its template bucket's empty sound.
-pub fn mod_bucket_contents(
-    item: &str,
-) -> Option<(BucketContent, &'static str, Option<&'static str>)> {
-    let sound = if is_lava_bucket(item) {
-        "minecraft:item.bucket.empty_lava"
-    } else {
-        "minecraft:item.bucket.empty"
-    };
-    Some((
-        BucketContent::Fluid(FluidKind::of_bucket(item)?),
-        sound,
-        None,
-    ))
 }
 
 impl<L: LevelAccess + ?Sized> Sim<'_, L> {
@@ -70,9 +51,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                 FluidKind::Water => "minecraft:water_bucket",
                 FluidKind::Lava => "minecraft:lava_bucket",
                 FluidKind::Empty => return None,
-                // `LiquidBlock.pickupBlock` gives the fluid's bucket: a mod
-                // fluid without one stays where it is.
-                fluid => fluid.info().bucket?,
+                _ => return None,
             }
         } else if b.implements(state, Interface::SimpleWaterlogged)
             && b.table.has(state, b.props.waterlogged)

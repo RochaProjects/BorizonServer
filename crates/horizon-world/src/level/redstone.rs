@@ -36,8 +36,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         if self.b.is_block(state, self.b.named.redstone_wire) {
             return !self.wire_signal_off.get();
         }
-        self.level
-            .adjust_signal_source(state, self.b.has_flag(state, state_flags::SIGNAL_SOURCE))
+        self.b.has_flag(state, state_flags::SIGNAL_SOURCE)
     }
     /// `BlockState.getSignal(level, pos, direction)`.
     pub(crate) fn state_signal(
@@ -46,9 +45,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         pos: BlockPos,
         direction: Direction,
     ) -> i32 {
-        let vanilla = self.vanilla_signal(state, pos, direction);
-        self.level
-            .adjust_signal(pos, state, direction, false, vanilla)
+        self.vanilla_signal(state, pos, direction)
     }
     fn vanilla_signal(&self, state: BlockStateId, pos: BlockPos, direction: Direction) -> i32 {
         let b = self.b;
@@ -83,9 +80,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         pos: BlockPos,
         direction: Direction,
     ) -> i32 {
-        let vanilla = self.vanilla_direct_signal(state, pos, direction);
-        self.level
-            .adjust_signal(pos, state, direction, true, vanilla)
+        self.vanilla_direct_signal(state, pos, direction)
     }
     fn vanilla_direct_signal(
         &self,
@@ -684,21 +679,18 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         }
     }
 
-    /// `BlockState.hasAnalogOutputSignal`, as the level answers it (a mod's block).
+    /// `BlockState.hasAnalogOutputSignal`.
     pub(crate) fn has_analog_output(&self, state: BlockStateId) -> bool {
-        let vanilla = self.b.has_flag(state, state_flags::ANALOG_OUTPUT);
-        self.level.adjust_has_analog_output(state, vanilla)
+        self.b.has_flag(state, state_flags::ANALOG_OUTPUT)
     }
-    /// `BlockState.getAnalogOutputSignal`, as the level answers it (a mod's block), 0 to 15.
+    /// `BlockState.getAnalogOutputSignal`, 0 to 15.
     pub(crate) fn analog_output(
         &self,
         state: BlockStateId,
         pos: BlockPos,
         direction: Direction,
     ) -> i32 {
-        let vanilla = self.vanilla_analog_output(state, pos, direction);
-        self.level
-            .adjust_analog_output(pos, state, direction, vanilla)
+        self.vanilla_analog_output(state, pos, direction)
             .clamp(0, 15)
     }
     /// `getAnalogOutputSignal` for state-only sources; others ask the caller.
@@ -866,12 +858,9 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
 
     // ---- buttons, levers, plates ----
 
-    /// The signal a button, lever or plate at `pos` changes to: `new`, or what the level
-    /// makes of it (`LevelAccess::redstone_change`), within 0 to 15.
-    fn redstone_signal(&self, pos: BlockPos, old: i32, new: i32) -> i32 {
-        let mut signal = new;
-        self.level.redstone_change(pos, old, &mut signal);
-        signal.clamp(0, 15)
+    /// The vanilla signal a button, lever or plate changes to.
+    fn redstone_signal(&self, _pos: BlockPos, _old: i32, new: i32) -> i32 {
+        new.clamp(0, 15)
     }
 
     /// `ButtonBlock/LeverBlock.updateNeighbours`.
@@ -1300,16 +1289,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     }
     /// `NoteBlock.playNote`: queues the block event and emits the game event.
     pub(crate) fn note_play(&mut self, pos: BlockPos, state: BlockStateId) {
-        if !self.note_play_allowed(pos, state) {
-            return;
-        }
         self.note_play_unchecked(pos, state);
-    }
-    pub(crate) fn note_play_allowed(&self, pos: BlockPos, state: BlockStateId) -> bool {
-        let b = self.b;
-        let instrument = b.table.text(state, b.props.instrument);
-        let note = b.table.int(state, b.props.note);
-        self.level.allow_note_play(pos, instrument, note)
     }
     pub(crate) fn note_play_unchecked(&mut self, pos: BlockPos, state: BlockStateId) {
         let b = self.b;
@@ -1380,7 +1360,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     pub(crate) fn tnt_check(&mut self, pos: BlockPos) {
         // TntBlock.prime succeeds only on a ServerLevel. A client's piston
         // replay must leave priming and block removal to the server.
-        if !self.level.is_client_side() && self.has_neighbor_signal(pos) {
+        if self.has_neighbor_signal(pos) {
             self.prime_tnt(pos);
             self.remove_block(pos, false);
         }
@@ -1448,9 +1428,6 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     /// `BellBlock.attemptToRing`: `BellBlockEntity.onHit` queues block event 1
     /// with the struck direction, then the sound and game event.
     pub(crate) fn bell_ring(&mut self, pos: BlockPos, state: BlockStateId, direction: Direction) {
-        if !self.level.allow_bell_ring(pos) {
-            return;
-        }
         self.block_event(pos, self.b.block(state), 1, direction as i32);
         self.emit(LevelEvent::Sound {
             pos,

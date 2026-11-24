@@ -102,10 +102,6 @@ impl BlockLandingWorld for World<'_, '_> {
     fn is_server_level(&self) -> bool {
         self.flag("server")
     }
-    fn is_client_side(&mut self) -> io::Result<bool> {
-        self.query("client".into())?;
-        Ok(self.flag("client"))
-    }
     fn random_float(&mut self) -> io::Result<f32> {
         self.query("random".into())?;
         self.query("float".into())?;

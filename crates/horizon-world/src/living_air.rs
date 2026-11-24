@@ -28,11 +28,8 @@ pub trait LivingAirWorld {
     fn was_in_powder_snow(&self) -> bool;
     fn can_walk_powder_snow(&mut self) -> Result<bool, Self::Error>;
     fn levitation_amplifier(&mut self) -> Result<Option<i32>, Self::Error>;
-    fn is_client_side(&mut self) -> Result<bool, Self::Error>;
-    fn has_chunk_at(&mut self, position: BlockPos) -> Result<bool, Self::Error>;
     fn effective_gravity(&mut self) -> Result<f64, Self::Error>;
     fn y(&self) -> f64;
-    fn minimum_y(&mut self) -> Result<i32, Self::Error>;
     fn discard_friction(&mut self) -> Result<bool, Self::Error>;
     fn air_drag_modifier(&mut self) -> Result<f64, Self::Error>;
     fn omnidirectional_air_mover(&mut self) -> Result<bool, Self::Error>;
@@ -142,15 +139,8 @@ pub fn travel_in_air<W: LivingAirWorld>(world: &mut W, input: Vec3) -> Result<()
     let mut velocity = relative_friction_movement(world, input, friction)?;
     if let Some(amplifier) = world.levitation_amplifier()? {
         velocity.y += (0.05 * f64::from(amplifier.wrapping_add(1)) - velocity.y) * 0.2;
-    } else if !world.is_client_side()? || world.has_chunk_at(support)? {
-        velocity.y -= world.effective_gravity()?;
     } else {
-        let y = world.y();
-        velocity.y = if y > f64::from(world.minimum_y()?) {
-            -0.1
-        } else {
-            0.0
-        };
+        velocity.y -= world.effective_gravity()?;
     }
     if !world.discard_friction()? {
         let modifier = world.air_drag_modifier()? as f32;

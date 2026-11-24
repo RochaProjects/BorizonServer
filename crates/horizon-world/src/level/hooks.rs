@@ -695,9 +695,6 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         } else {
             b.default_of(b.named.water)
         };
-        if !self.level.allow_block_fade(pos, state, target) {
-            return;
-        }
         if self.level.dimension_type().water_evaporates {
             self.remove_block(pos, false);
         } else {

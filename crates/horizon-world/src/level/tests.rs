@@ -49,23 +49,8 @@ pub(crate) struct TestLevel {
     pub block_light: HashMap<BlockPos, i32>,
     /// `getBrightness(SKY, pos)` everywhere; `None` is 15, full daylight.
     pub sky_light: Option<i32>,
-    /// `Level.isClientSide`.
-    pub client_side: bool,
     pub tick_ready: bool,
     pub block_events_ready: bool,
-    /// Positions that refuse fluids, fire and piston moves, as a land claim would.
-    pub guarded: HashSet<BlockPos>,
-    /// What `adjust_signal` answers at a position: the weak and direct signal,
-    /// and the only direction they go in, if any.
-    pub signals: HashMap<BlockPos, (i32, i32, Option<Direction>)>,
-    /// What `adjust_analog_output` answers at a position, for the states in
-    /// `analog_states` (`adjust_has_analog_output`).
-    pub analog: HashMap<BlockPos, i32>,
-    pub analog_states: HashSet<BlockStateId>,
-    /// What `before_fire_odds` answers for a state.
-    pub fire_odds: HashMap<BlockStateId, (i32, i32)>,
-    /// What `before_smoke_source` answers for a state.
-    pub smoke_sources: HashMap<BlockStateId, bool>,
     /// What `recheck_container_openers` answers at a position: the opener
     /// count before and after the recount.
     pub openers: HashMap<BlockPos, (i32, i32)>,
@@ -85,20 +70,13 @@ impl TestLevel {
             blocks: HashMap::new(),
             air: b.air(),
             random: LegacyRandom::new(42),
-            signals: HashMap::new(),
-            analog: HashMap::new(),
-            analog_states: HashSet::new(),
             time: 0,
             day_time: 0,
             events: Vec::new(),
             block_light: HashMap::new(),
             sky_light: None,
-            client_side: false,
             tick_ready: true,
             block_events_ready: true,
-            guarded: HashSet::new(),
-            fire_odds: HashMap::new(),
-            smoke_sources: HashMap::new(),
             openers: HashMap::new(),
             opener_rechecks: Vec::new(),
             shulker_closed: HashMap::new(),
@@ -127,41 +105,6 @@ impl LevelAccess for TestLevel {
     fn shulker_is_closed(&self, pos: BlockPos) -> Option<bool> {
         self.shulker_closed.get(&pos).copied()
     }
-    fn adjust_has_analog_output(&self, state: BlockStateId, vanilla: bool) -> bool {
-        vanilla || self.analog_states.contains(&state)
-    }
-    fn adjust_analog_output(
-        &self,
-        pos: BlockPos,
-        _state: BlockStateId,
-        _direction: Direction,
-        vanilla: i32,
-    ) -> i32 {
-        self.analog.get(&pos).copied().unwrap_or(vanilla)
-    }
-    fn adjust_signal(
-        &self,
-        pos: BlockPos,
-        _state: BlockStateId,
-        direction: Direction,
-        direct: bool,
-        vanilla: i32,
-    ) -> i32 {
-        match self.signals.get(&pos) {
-            Some((_, _, Some(only))) if *only != direction => 0,
-            Some((weak, strong, _)) => {
-                if direct {
-                    *strong
-                } else {
-                    *weak
-                }
-            }
-            None => vanilla,
-        }
-    }
-    fn is_client_side(&self) -> bool {
-        self.client_side
-    }
     fn block_state(&self, pos: BlockPos) -> BlockStateId {
         self.blocks.get(&pos).copied().unwrap_or(self.air)
     }
@@ -188,32 +131,6 @@ impl LevelAccess for TestLevel {
     }
     fn emit(&mut self, event: LevelEvent) {
         self.events.push(event);
-    }
-    fn allow_spread(&self, _kind: Spread, _from: BlockPos, to: BlockPos) -> bool {
-        !self.guarded.contains(&to)
-    }
-    fn allow_piston_move(
-        &self,
-        _piston: BlockPos,
-        direction: Direction,
-        push: &[BlockPos],
-        destroy: &[BlockPos],
-    ) -> bool {
-        !push
-            .iter()
-            .flat_map(|&p| [p, update::rel(p, direction)])
-            .chain(destroy.iter().copied())
-            .any(|p| self.guarded.contains(&p))
-    }
-    fn before_fire_odds(&self, state: BlockStateId, odds: &mut Option<(i32, i32)>) {
-        if let Some(&answer) = self.fire_odds.get(&state) {
-            *odds = Some(answer);
-        }
-    }
-    fn before_smoke_source(&self, state: BlockStateId, smoke: &mut Option<bool>) {
-        if let Some(&answer) = self.smoke_sources.get(&state) {
-            *smoke = Some(answer);
-        }
     }
 }
 
@@ -401,65 +318,6 @@ fn block_observation_follows_successful_commits_only() {
     );
 }
 
-#[test]
-fn a_level_can_keep_a_lever_as_it_is() {
-    use std::cell::RefCell;
-
-    struct Holder {
-        inner: TestLevel,
-        hold: bool,
-        seen: RefCell<Vec<(BlockPos, i32, i32)>>,
-    }
-    impl LevelAccess for Holder {
-        fn block_state(&self, pos: BlockPos) -> BlockStateId {
-            self.inner.block_state(pos)
-        }
-        fn set_raw(&mut self, pos: BlockPos, state: BlockStateId) -> Option<BlockStateId> {
-            self.inner.set_raw(pos, state)
-        }
-        fn is_loaded(&self, pos: BlockPos) -> bool {
-            self.inner.is_loaded(pos)
-        }
-        fn random(&mut self) -> &mut LegacyRandom {
-            self.inner.random()
-        }
-        fn game_time(&self) -> i64 {
-            self.inner.game_time()
-        }
-        fn redstone_change(&self, pos: BlockPos, old: i32, new: &mut i32) {
-            self.seen.borrow_mut().push((pos, old, *new));
-            if self.hold {
-                *new = old;
-            }
-        }
-    }
-    let Some(f) = fixture() else { return };
-    let b = &f.behaviours;
-    let mut level = Holder {
-        inner: TestLevel::new(b),
-        hold: true,
-        seen: RefCell::new(Vec::new()),
-    };
-    let mut ticks = Ticks::new(0);
-    let pos = BlockPos::new(0, 80, 0);
-    let stone = f.registry.default_state("minecraft:stone").unwrap();
-    for z in [-1, 1] {
-        level.set_raw(BlockPos::new(0, 80, z), stone);
-    }
-    let lever = f.registry.default_state("minecraft:lever").unwrap();
-    level.set_raw(pos, lever);
-    // Held: the pull is heard, and the lever stays off.
-    b.sim(&mut level, &mut ticks).lever_pull(pos, lever);
-    assert_eq!(level.block_state(pos), lever);
-    assert_eq!(level.seen.borrow()[..], [(pos, 0, 15)]);
-    // Let go: the same pull turns it on.
-    level.hold = false;
-    b.sim(&mut level, &mut ticks).lever_pull(pos, lever);
-    let pulled = level.block_state(pos);
-    assert!(b.table.bool(pulled, b.props.powered));
-    assert_eq!(level.seen.borrow().len(), 2);
-}
-
 /// `LevelReader.getMaxLocalRawBrightness`: 15 outside the +-30,000,000 gate,
 /// where no chunk is there to answer, and the raw brightness inside it. With
 /// the sky light at 0 the two answers differ, so the gate is what is measured.
@@ -564,272 +422,6 @@ fn a_viewed_copper_chest_does_not_weather() {
     w.level.opened.clear();
     f.behaviours.random_tick(&mut w.level, &mut w.ticks, pos);
     assert_ne!(draw(&w), before, "a closed one rolls changeOverTime");
-}
-
-#[test]
-fn random_tick_hook_can_change_the_block_and_skip_its_own_tick() {
-    use std::cell::Cell;
-
-    struct Grower {
-        inner: TestLevel,
-        b: &'static Behaviours,
-        /// The state the hook sets, if any, and the `setBlock` flags it sets
-        /// it with.
-        to: Option<BlockStateId>,
-        flags: i32,
-        handle: bool,
-        /// `neighborChanged` calls the hook's writes made.
-        notified: Cell<usize>,
-        seen: Vec<(BlockPos, BlockStateId)>,
-        /// Moves on with every write, as `World::revision` does.
-        revision: u64,
-    }
-    impl LevelAccess for Grower {
-        fn block_state(&self, pos: BlockPos) -> BlockStateId {
-            self.inner.block_state(pos)
-        }
-        fn set_raw(&mut self, pos: BlockPos, state: BlockStateId) -> Option<BlockStateId> {
-            self.revision += 1;
-            self.inner.set_raw(pos, state)
-        }
-        fn is_loaded(&self, pos: BlockPos) -> bool {
-            self.inner.is_loaded(pos)
-        }
-        fn random(&mut self) -> &mut LegacyRandom {
-            self.inner.random()
-        }
-        fn game_time(&self) -> i64 {
-            self.inner.game_time()
-        }
-        fn observe_neighbor_changed(
-            &self,
-            _pos: BlockPos,
-            _state: BlockStateId,
-            _changed: BlockId,
-            _moved: bool,
-        ) {
-            self.notified.set(self.notified.get() + 1);
-        }
-        fn before_random_tick(
-            &mut self,
-            ticks: &mut Ticks,
-            pos: BlockPos,
-            state: &mut BlockStateId,
-            handled: &mut bool,
-        ) {
-            assert_eq!(self.block_state(pos), *state);
-            self.seen.push((pos, *state));
-            // The hook, then the level's part of the contract as `GameLevel`
-            // keeps it: re-read the block if the hook wrote.
-            let revision = self.revision;
-            if let Some(to) = self.to {
-                let b = self.b;
-                assert!(b.set_block(self, ticks, pos, to, self.flags));
-            }
-            *handled = self.handle;
-            if !*handled && self.revision != revision {
-                *state = self.block_state(pos);
-            }
-        }
-    }
-    let Some(f) = fixture() else { return };
-    let b = &f.behaviours;
-    let wheat = f.registry.default_state("minecraft:wheat").unwrap();
-    let grown = b.table.set_int(wheat, b.props.age, 3);
-    let next = b.table.set_int(wheat, b.props.age, 4);
-    let mut level = Grower {
-        inner: TestLevel::new(b),
-        b,
-        to: Some(grown),
-        flags: flags::UPDATE_CLIENTS,
-        handle: true,
-        notified: Cell::new(0),
-        seen: Vec::new(),
-        revision: 0,
-    };
-    let mut ticks = Ticks::new(0);
-    let stone = f.registry.default_state("minecraft:stone").unwrap();
-    let (low, high) = (BlockPos::new(0, 1, 0), BlockPos::new(4, 1, 0));
-    level.set_raw(low, stone);
-    level.set_raw(high, wheat);
-    let draw = |level: &Grower| level.inner.random.clone().next_long();
-    let before = draw(&level);
-    b.random_tick(&mut level, &mut ticks, low);
-    assert!(level.seen.is_empty());
-    b.random_tick(&mut level, &mut ticks, high);
-    assert_eq!(level.seen, [(high, wheat)]);
-    assert_eq!(level.block_state(high), grown);
-    // The crop's own tick never ran: it would have drawn from the random.
-    assert_eq!(draw(&level), before);
-    // Grown with flag 2, as `CropBlock.randomTick` grows a crop, no
-    // neighbour hears of it; with `UPDATE_ALL` the six do.
-    assert_eq!(level.notified.get(), 0);
-    level.flags = flags::UPDATE_ALL;
-    level.set_raw(high, wheat);
-    b.random_tick(&mut level, &mut ticks, high);
-    assert_eq!(level.block_state(high), grown);
-    assert_eq!(level.notified.get(), 6);
-    level.flags = flags::UPDATE_CLIENTS;
-    // Unhandled and unchanged, the crop ticks as before.
-    (level.to, level.handle) = (None, false);
-    level.set_raw(high, wheat);
-    b.random_tick(&mut level, &mut ticks, high);
-    assert_eq!(level.seen.len(), 3);
-    assert_ne!(draw(&level), before);
-    // Changed but unhandled, the crop ticks as the hook left it: it stays at
-    // the hook's age or grows from there, never from the age it had.
-    level.to = Some(grown);
-    let mut grew = false;
-    for _ in 0..1000 {
-        level.set_raw(high, wheat);
-        b.random_tick(&mut level, &mut ticks, high);
-        let now = level.block_state(high);
-        assert!(now == grown || now == next, "{now:?}");
-        grew |= now == next;
-    }
-    assert!(grew);
-    // Changed into a block that doesn't tick randomly, nothing more runs.
-    level.to = Some(stone);
-    level.set_raw(high, wheat);
-    let before = draw(&level);
-    b.random_tick(&mut level, &mut ticks, high);
-    assert_eq!(level.block_state(high), stone);
-    assert_eq!(draw(&level), before);
-}
-
-#[test]
-fn tick_block_hook_can_change_the_block_and_skip_its_own_tick() {
-    use horizon_core::ticks::TickPriority;
-
-    struct Ticked {
-        inner: TestLevel,
-        b: &'static Behaviours,
-        /// The state the hook sets, if any, and the `setBlock` flags it sets
-        /// it with.
-        to: Option<BlockStateId>,
-        flags: i32,
-        handle: bool,
-        seen: Vec<(BlockPos, BlockStateId)>,
-        /// Moves on with every write, as `World::revision` does.
-        revision: u64,
-    }
-    impl LevelAccess for Ticked {
-        fn block_state(&self, pos: BlockPos) -> BlockStateId {
-            self.inner.block_state(pos)
-        }
-        fn set_raw(&mut self, pos: BlockPos, state: BlockStateId) -> Option<BlockStateId> {
-            self.revision += 1;
-            self.inner.set_raw(pos, state)
-        }
-        fn is_loaded(&self, pos: BlockPos) -> bool {
-            self.inner.is_loaded(pos)
-        }
-        fn random(&mut self) -> &mut LegacyRandom {
-            self.inner.random()
-        }
-        fn game_time(&self) -> i64 {
-            self.inner.game_time()
-        }
-        fn before_tick_block(
-            &mut self,
-            ticks: &mut Ticks,
-            pos: BlockPos,
-            state: &mut BlockStateId,
-            handled: &mut bool,
-        ) {
-            assert_eq!(self.block_state(pos), *state);
-            self.seen.push((pos, *state));
-            // The hook, then the level's part of the contract as `GameLevel`
-            // keeps it: re-read the block if the hook wrote.
-            let revision = self.revision;
-            if let Some(to) = self.to {
-                let b = self.b;
-                assert!(b.set_block(self, ticks, pos, to, self.flags));
-            }
-            *handled = self.handle;
-            if !*handled && self.revision != revision {
-                *state = self.block_state(pos);
-            }
-        }
-    }
-    let Some(f) = fixture() else { return };
-    let b = &f.behaviours;
-    let target = f.registry.default_state("minecraft:target").unwrap();
-    let powered = b.table.set_int(target, b.props.power, 15);
-    let to = b.table.set_int(target, b.props.power, 7);
-    let mut level = Ticked {
-        inner: TestLevel::new(b),
-        b,
-        to: Some(to),
-        // A target's own tick writes with `setBlockAndUpdate`.
-        flags: flags::UPDATE_ALL,
-        handle: true,
-        seen: Vec::new(),
-        revision: 0,
-    };
-    let mut ticks = Ticks::new(0);
-    ticks.add_empty_chunk(ChunkPos::new(0, 0)).unwrap();
-    let pos = BlockPos::new(1, 1, 1);
-    // The due ticks run as the game runs them, stepped (scheduled_begin,
-    // scheduled_step, scheduled_finish), or as tests do, through
-    // tick_scheduled.
-    let run = |level: &mut Ticked, ticks: &mut Ticks, stepped: bool| {
-        if stepped {
-            assert!(b.scheduled_begin(level, ticks, false));
-            while b.scheduled_step(level, ticks, false) {}
-            b.scheduled_finish(ticks, false);
-        } else {
-            b.tick_scheduled(level, ticks);
-        }
-    };
-    // One tick of the block at `pos` falls due.
-    let due = |level: &mut Ticked, ticks: &mut Ticks, stepped: bool| {
-        let (time, block) = (level.inner.time, b.block(level.block_state(pos)));
-        ticks.schedule_block(time, pos, block, 1, TickPriority::Normal);
-        level.inner.time += 1;
-        run(level, ticks, stepped);
-    };
-    let rod = |facing: &str, powered: &str| {
-        let lightning_rod = f.registry.default_state("minecraft:lightning_rod").unwrap();
-        let mut s = f.registry.state(lightning_rod).unwrap().clone();
-        s.properties.insert("facing".into(), facing.into());
-        s.properties.insert("powered".into(), powered.into());
-        f.registry.resolve(&s).unwrap()
-    };
-    for stepped in [false, true] {
-        level.seen.clear();
-        (level.to, level.handle) = (Some(to), true);
-        level.set_raw(pos, powered);
-        due(&mut level, &mut ticks, stepped);
-        assert_eq!(level.seen, [(pos, powered)]);
-        assert_eq!(level.block_state(pos), to);
-        // Unhandled, the target's own tick turns it off.
-        (level.to, level.handle) = (None, false);
-        level.set_raw(pos, powered);
-        due(&mut level, &mut ticks, stepped);
-        assert_eq!(level.block_state(pos), target);
-        // A tick whose block was replaced runs nothing.
-        let stone = f.registry.default_state("minecraft:stone").unwrap();
-        level.set_raw(pos, powered);
-        let block = b.block(powered);
-        ticks.schedule_block(level.inner.time, pos, block, 1, TickPriority::Normal);
-        level.inner.time += 1;
-        level.set_raw(pos, stone);
-        run(&mut level, &mut ticks, stepped);
-        assert_eq!(level.seen.len(), 2);
-        // Changed into another block and unhandled, nothing more runs.
-        level.to = Some(stone);
-        level.set_raw(pos, powered);
-        due(&mut level, &mut ticks, stepped);
-        assert_eq!(level.seen.len(), 3);
-        assert_eq!(level.block_state(pos), stone);
-        // Changed but unhandled, the block ticks as the hook left it: the
-        // rod's tick unpowers it facing where the hook turned it.
-        (level.to, level.handle) = (Some(rod("north", "true")), false);
-        level.set_raw(pos, rod("up", "true"));
-        due(&mut level, &mut ticks, stepped);
-        assert_eq!(level.block_state(pos), rod("north", "false"));
-    }
 }
 
 #[test]
@@ -1126,22 +718,6 @@ fn water_keeps_spreading_over_waterlogged_scaffolding() {
         let pos = BlockPos::new(d, 1, 0);
         assert_eq!(w.prop(pos, "level"), d.to_string(), "flow at {d}");
     }
-}
-
-#[test]
-fn refused_spread_keeps_water_out_of_a_guarded_block() {
-    let mut w = world!();
-    w.floor(0, 10, "stone");
-    w.level.guarded.insert(BlockPos::new(3, 1, 0));
-    let water = w.id("water", &[]);
-    w.set(BlockPos::new(0, 1, 0), water);
-    for _ in 0..60 {
-        w.tick();
-    }
-    assert_eq!(w.prop(BlockPos::new(2, 1, 0), "level"), "2");
-    assert_eq!(w.get(BlockPos::new(3, 1, 0)), w.b().air());
-    // Water still reaches (4, 1, 0) around the guarded block.
-    assert_eq!(w.prop(BlockPos::new(4, 1, 0), "level"), "6");
 }
 
 #[test]
@@ -1827,122 +1403,6 @@ fn pistons_push_and_sticky_pistons_pull() {
 }
 
 #[test]
-fn refused_spread_keeps_fire_off_a_guarded_block() {
-    let mut w = world!();
-    w.floor(0, 10, "stone");
-    w.set(BlockPos::new(0, 0, 0), w.id("netherrack", &[]));
-    let planks = w.id("oak_planks", &[]);
-    w.set(BlockPos::new(1, 1, 0), planks);
-    w.set(BlockPos::new(-1, 1, 0), planks);
-    w.level.guarded.insert(BlockPos::new(1, 1, 0));
-    w.set(BlockPos::new(0, 1, 0), w.id("fire", &[]));
-    for _ in 0..4000 {
-        w.tick();
-    }
-    assert_eq!(
-        w.get(BlockPos::new(1, 1, 0)),
-        planks,
-        "the guarded planks never burn"
-    );
-    assert_ne!(
-        w.get(BlockPos::new(-1, 1, 0)),
-        planks,
-        "the other planks burned"
-    );
-}
-
-#[test]
-fn refused_piston_move_leaves_the_piston_retracted() {
-    let mut w = world!();
-    w.floor(0, 10, "stone");
-    let piston = w.id("piston", &[("facing", "east")]);
-    let block = w.id("redstone_block", &[]);
-    let dirt = w.id("dirt", &[]);
-    w.level.guarded.insert(BlockPos::new(2, 1, 0));
-    w.set(BlockPos::new(0, 1, 0), piston);
-    w.set(BlockPos::new(1, 1, 0), dirt);
-    w.set(BlockPos::new(-1, 1, 0), block);
-    for _ in 0..4 {
-        w.full_tick();
-    }
-    assert_eq!(w.prop(BlockPos::new(0, 1, 0), "extended"), "false");
-    assert_eq!(w.get(BlockPos::new(1, 1, 0)), dirt);
-    assert_eq!(w.get(BlockPos::new(2, 1, 0)), w.b().air());
-    assert!(w.ticks.moving_pistons.is_empty());
-}
-
-#[test]
-fn refused_sticky_pull_keeps_the_block_and_sends_no_event() {
-    let mut w = world!();
-    w.floor(0, 10, "stone");
-    let piston = w.id("sticky_piston", &[("facing", "east")]);
-    let block = w.id("redstone_block", &[]);
-    let dirt = w.id("dirt", &[]);
-    let air = w.b().air();
-    w.set(BlockPos::new(0, 1, 0), piston);
-    w.set(BlockPos::new(1, 1, 0), dirt);
-    w.set(BlockPos::new(-1, 1, 0), block);
-    for _ in 0..4 {
-        w.full_tick();
-    }
-    assert_eq!(w.get(BlockPos::new(2, 1, 0)), dirt);
-    w.level.guarded.insert(BlockPos::new(2, 1, 0));
-    w.level.events.clear();
-    w.set(BlockPos::new(-1, 1, 0), air);
-    for _ in 0..4 {
-        w.full_tick();
-    }
-    assert_eq!(w.prop(BlockPos::new(0, 1, 0), "extended"), "false");
-    assert_eq!(w.get(BlockPos::new(1, 1, 0)), air);
-    assert_eq!(w.get(BlockPos::new(2, 1, 0)), dirt, "the pull was refused");
-    // Clients would replay a retraction event and pull the block anyway.
-    let sent = w.level.events.iter().any(
-        |e| matches!(e, LevelEvent::BlockEntityEvent { pos, .. } if *pos == BlockPos::new(0, 1, 0)),
-    );
-    assert!(!sent, "no retraction event for a refused pull");
-}
-
-/// TntBlock.prime returns false on a client: neither the entity, the removal,
-/// nor its random push may be predicted while replaying a piston update.
-#[test]
-fn tnt_duper_3856_client_neighbor_does_not_prime_or_remove_tnt() {
-    let mut w = world!();
-    let f = w.f;
-    w.level.client_side = true;
-    let pos = BlockPos::new(0, 1, 0);
-    let tnt = w.id("tnt", &[]);
-    let power = w.id("redstone_block", &[]);
-    w.put(pos, tnt);
-    w.put(pos.offset(1, 0, 0), power);
-    let mut random = w.level.random.clone();
-    f.behaviours.handle_neighbor_changed(
-        &mut w.level,
-        &mut w.ticks,
-        pos,
-        f.behaviours.block(power),
-    );
-    assert_eq!(w.get(pos), tnt, "client must wait for server block changes");
-    assert!(
-        w.level.events.is_empty(),
-        "client must not emit TNT effects"
-    );
-    assert_eq!(w.level.random.next_long(), random.next_long());
-}
-
-#[test]
-fn tnt_duper_3856_client_placement_does_not_prime_tnt() {
-    let mut w = world!();
-    w.level.client_side = true;
-    let pos = BlockPos::new(0, 1, 0);
-    let tnt = w.id("tnt", &[]);
-    let power = w.id("redstone_block", &[]);
-    w.put(pos.offset(1, 0, 0), power);
-    w.set(pos, tnt);
-    assert_eq!(w.get(pos), tnt);
-    assert!(w.level.events.is_empty());
-}
-
-#[test]
 fn tnt_duper_3856_server_still_primes_each_powered_tnt() {
     let mut w = world!();
     let tnt = w.id("tnt", &[]);
@@ -1964,79 +1424,60 @@ fn tnt_duper_3856_server_still_primes_each_powered_tnt() {
 
 /// Breaking a wall torch next to a BUD-powered TNT updates the old block while
 /// the piston already holds its saved state. This vanilla duplication must
-/// continue to work on the server, without a second TNT from the client.
+/// continue to work on the server.
 #[test]
 fn tnt_duper_3856_piston_keeps_original_and_primes_one_tnt() {
     let Some(f) = fixture() else {
         return;
     };
-    for client in [false, true] {
-        let mut w = World::new(f);
-        w.level.client_side = client;
-        let base = BlockPos::new(0, 2, 0);
-        let piston = w.id("sticky_piston", &[("facing", "east")]);
-        let slime = w.id("slime_block", &[]);
-        let tnt = w.id("tnt", &[]);
-        let torch = w.id("wall_torch", &[("facing", "north")]);
-        let power = w.id("redstone_block", &[]);
-        w.put(base, piston);
-        w.put(base.offset(1, 0, 0), slime);
-        w.put(base.offset(2, 0, 0), slime);
-        w.put(base.offset(2, -1, 0), slime);
-        w.put(base.offset(2, -1, -1), tnt);
-        w.put(base.offset(2, 0, -1), torch);
-        // Raw writes model a powered TNT that has not received an update yet.
-        w.put(base.offset(2, -1, -2), power);
-        w.put(base.offset(-1, 0, 0), power);
-        if client {
-            assert!(f.behaviours.client_block_event(
-                &mut w.level,
-                &mut w.ticks,
-                base,
-                0,
-                Direction::East as i32
-            ));
-        } else {
-            f.behaviours.handle_neighbor_changed(
-                &mut w.level,
-                &mut w.ticks,
-                base,
-                f.behaviours.block(power),
-            );
-            f.behaviours.run_block_events(&mut w.level, &mut w.ticks);
-        }
-        let primed = w
-            .level
+    let mut w = World::new(f);
+    let base = BlockPos::new(0, 2, 0);
+    let piston = w.id("sticky_piston", &[("facing", "east")]);
+    let slime = w.id("slime_block", &[]);
+    let tnt = w.id("tnt", &[]);
+    let torch = w.id("wall_torch", &[("facing", "north")]);
+    let power = w.id("redstone_block", &[]);
+    w.put(base, piston);
+    w.put(base.offset(1, 0, 0), slime);
+    w.put(base.offset(2, 0, 0), slime);
+    w.put(base.offset(2, -1, 0), slime);
+    w.put(base.offset(2, -1, -1), tnt);
+    w.put(base.offset(2, 0, -1), torch);
+    // Raw writes model a powered TNT that has not received an update yet.
+    w.put(base.offset(2, -1, -2), power);
+    w.put(base.offset(-1, 0, 0), power);
+    f.behaviours.handle_neighbor_changed(
+        &mut w.level,
+        &mut w.ticks,
+        base,
+        f.behaviours.block(power),
+    );
+    f.behaviours.run_block_events(&mut w.level, &mut w.ticks);
+    let primed = w
+        .level
+        .events
+        .iter()
+        .filter(|e| matches!(e, LevelEvent::PrimeTnt { .. }))
+        .count();
+    assert_eq!(primed, 1);
+    for _ in 0..10 {
+        w.level.time += 1;
+        f.behaviours.tick_block_entities(&mut w.level, &mut w.ticks);
+    }
+    assert_eq!(
+        w.get(base.offset(3, -1, -1)),
+        tnt,
+        "original must survive on the server"
+    );
+    assert_eq!(
+        w.level
             .events
             .iter()
             .filter(|e| matches!(e, LevelEvent::PrimeTnt { .. }))
-            .count();
-        assert_eq!(primed, usize::from(!client), "client={client}");
-        for _ in 0..10 {
-            w.level.time += 1;
-            if client {
-                f.behaviours
-                    .client_tick_block_entities(&mut w.level, &mut w.ticks);
-            } else {
-                f.behaviours.tick_block_entities(&mut w.level, &mut w.ticks);
-            }
-        }
-        assert_eq!(
-            w.get(base.offset(3, -1, -1)),
-            tnt,
-            "original must survive, client={client}"
-        );
-        assert_eq!(
-            w.level
-                .events
-                .iter()
-                .filter(|e| matches!(e, LevelEvent::PrimeTnt { .. }))
-                .count(),
-            usize::from(!client)
-        );
-    }
+            .count(),
+        1
+    );
 }
-
 /// `ServerLevel.runBlockEvents` reports a handled event for the clients
 /// (`ClientboundBlockEventPacket`), carrying the block the event named.
 #[test]
@@ -2058,77 +1499,6 @@ fn a_handled_block_event_reaches_the_clients() {
             ..
         } if *pos == BlockPos::new(0, 1, 0) && *state == piston
     )));
-}
-
-/// `ClientLevel.blockEvent`: the client re-runs `triggerEvent` on its own
-/// level, which builds the moving block entities a piston's `moveBlocks`
-/// makes, and ticks them to the placed block.
-#[test]
-fn a_client_replays_a_pistons_block_event() {
-    let mut w = world!();
-    w.floor(0, 10, "stone");
-    let piston = w.id("sticky_piston", &[("facing", "east")]);
-    let dirt = w.id("dirt", &[]);
-    let block = w.id("redstone_block", &[]);
-    w.put(BlockPos::new(0, 1, 0), piston);
-    w.put(BlockPos::new(1, 1, 0), dirt);
-    w.put(BlockPos::new(-1, 1, 0), block);
-    w.f.behaviours.client_block_event(
-        &mut w.level,
-        &mut w.ticks,
-        BlockPos::new(0, 1, 0),
-        0,
-        Direction::East as i32,
-    );
-    assert!(
-        w.ticks
-            .moving_pistons
-            .iter()
-            .any(|(p, _)| *p == BlockPos::new(2, 1, 0))
-    );
-    for _ in 0..3 {
-        w.level.time += 1;
-        w.f.behaviours
-            .client_tick_block_entities(&mut w.level, &mut w.ticks);
-    }
-    assert_eq!(w.get(BlockPos::new(2, 1, 0)), dirt);
-    assert_eq!(
-        w.name(BlockPos::new(1, 1, 0)),
-        "piston_head[facing=east,short=false,type=sticky]"
-    );
-    assert!(w.ticks.moving_pistons.is_empty());
-}
-
-/// A client's copy of a move doesn't start the pistons the moved block
-/// powers (`checkIfExtend` is server-only): their own block events come from
-/// the server.
-#[test]
-fn a_client_replay_starts_no_other_piston() {
-    let mut w = world!();
-    w.floor(0, 10, "stone");
-    w.level.client_side = true;
-    let piston = w.id("piston", &[("facing", "east")]);
-    let block = w.id("redstone_block", &[]);
-    let up = w.id("piston", &[("facing", "up")]);
-    w.put(BlockPos::new(0, 1, 0), piston);
-    w.put(BlockPos::new(1, 1, 0), block);
-    w.put(BlockPos::new(2, 2, 0), up);
-    w.f.behaviours.client_block_event(
-        &mut w.level,
-        &mut w.ticks,
-        BlockPos::new(0, 1, 0),
-        0,
-        Direction::East as i32,
-    );
-    for _ in 0..10 {
-        w.level.time += 1;
-        w.f.behaviours
-            .client_tick_block_entities(&mut w.level, &mut w.ticks);
-    }
-    assert_eq!(w.get(BlockPos::new(2, 1, 0)), block);
-    assert_eq!(w.get(BlockPos::new(2, 2, 0)), up);
-    assert!(w.ticks.moving_pistons.is_empty());
-    assert!(w.ticks.block_events.is_empty());
 }
 
 #[test]
@@ -2153,90 +1523,6 @@ fn dripstone_fills_cauldrons() {
         w.tick();
     }
     assert_eq!(w.name(BlockPos::new(0, 5, 0)), "water_cauldron[level=1]");
-}
-
-#[test]
-fn a_level_can_answer_for_a_blocks_signal() {
-    let mut w = world!();
-    let source = BlockPos::new(0, 1, 0);
-    let beside = BlockPos::new(-1, 1, 0);
-    let above = BlockPos::new(0, 2, 0);
-    let conductor = BlockPos::new(1, 1, 0);
-    let past_it = BlockPos::new(2, 1, 0);
-    let gold = w.id("gold_block", &[]);
-    let stone = w.id("stone", &[]);
-    w.set(source, gold);
-    w.set(conductor, stone);
-    let read = |w: &mut World, pos| {
-        w.f.behaviours
-            .best_neighbor_signal(&mut w.level, &mut w.ticks, pos)
-    };
-    assert_eq!(read(&mut w, beside), 0, "gold gives nothing by itself");
-
-    // A weak signal reaches what touches it, and stops at a conductor.
-    w.level.signals.insert(source, (7, 0, None));
-    assert_eq!(read(&mut w, beside), 7);
-    assert_eq!(read(&mut w, past_it), 0);
-
-    // A direct signal passes through the conductor.
-    w.level.signals.insert(source, (7, 15, None));
-    assert_eq!(read(&mut w, past_it), 15);
-
-    // One side only: `Down` is the direction read by the block above.
-    w.level
-        .signals
-        .insert(source, (9, 0, Some(Direction::Down)));
-    assert_eq!(read(&mut w, above), 9);
-    assert_eq!(read(&mut w, beside), 0);
-
-    // Vanilla's sources go through the same answer untouched.
-    w.level.signals.clear();
-    let redstone = w.id("redstone_block", &[]);
-    w.set(source, redstone);
-    assert_eq!(read(&mut w, beside), 15);
-}
-
-#[test]
-fn a_level_can_answer_for_a_blocks_comparator_output() {
-    let mut w = world!();
-    w.floor(0, 4, "stone");
-    let block = BlockPos::new(0, 1, 0);
-    let comparator = BlockPos::new(1, 1, 0);
-    let after = BlockPos::new(2, 1, 0);
-    // A comparator facing west reads the block west of it.
-    let facing_west = w.id("comparator", &[("facing", "west")]);
-    w.set(comparator, facing_west);
-    let read = |w: &mut World| {
-        for _ in 0..4 {
-            w.full_tick();
-        }
-        w.f.behaviours
-            .best_neighbor_signal(&mut w.level, &mut w.ticks, after)
-    };
-    let gold = w.id("gold_block", &[]);
-    w.level.analog.insert(block, 9);
-    w.set(block, gold);
-    assert_eq!(read(&mut w), 0, "gold has no output of its own");
-
-    // Placing a block that says it has one tells the comparator, as Level.setBlock does.
-    w.level.analog_states.insert(gold);
-    w.set(block, w.id("stone", &[]));
-    w.set(block, gold);
-    assert_eq!(read(&mut w), 9);
-
-    // An output that changes without the block: updateNeighbourForOutputSignal.
-    w.level.analog.insert(block, 4);
-    assert_eq!(read(&mut w), 9, "nothing told the comparator yet");
-    w.f.behaviours
-        .update_neighbour_for_output_signal(&mut w.level, &mut w.ticks, block);
-    assert_eq!(read(&mut w), 4);
-
-    // Behind a conductor, and out of range answers are clamped.
-    let further = BlockPos::new(-1, 1, 0);
-    w.set(block, w.id("stone", &[]));
-    w.level.analog.insert(further, 40);
-    w.set(further, gold);
-    assert_eq!(read(&mut w), 15);
 }
 
 #[test]
@@ -3289,588 +2575,25 @@ fn flowers_and_saplings_can_be_placed_in_flower_pots() {
 }
 
 #[test]
-fn update_shape_hook_can_answer_for_the_block() {
-    use horizon_core::ticks::TickPriority;
-    use std::cell::RefCell;
-
-    struct Shaper {
-        inner: TestLevel,
-        b: &'static Behaviours,
-        fence: BlockId,
-        /// The state the hook answers for a fence, if any.
-        answer: Option<BlockStateId>,
-        seen: RefCell<Vec<(BlockPos, Direction)>>,
-        /// The `state` each call was given.
-        states: RefCell<Vec<BlockStateId>>,
-    }
-    impl LevelAccess for Shaper {
-        fn block_state(&self, pos: BlockPos) -> BlockStateId {
-            self.inner.block_state(pos)
-        }
-        fn set_raw(&mut self, pos: BlockPos, state: BlockStateId) -> Option<BlockStateId> {
-            self.inner.set_raw(pos, state)
-        }
-        fn is_loaded(&self, pos: BlockPos) -> bool {
-            self.inner.is_loaded(pos)
-        }
-        fn random(&mut self) -> &mut LegacyRandom {
-            self.inner.random()
-        }
-        fn game_time(&self) -> i64 {
-            self.inner.game_time()
-        }
-        fn emit(&mut self, event: LevelEvent) {
-            self.inner.emit(event);
-        }
-        fn before_update_shape(
-            &self,
-            ticks: &mut Ticks,
-            pos: BlockPos,
-            state: BlockStateId,
-            direction: Direction,
-            neighbour_pos: BlockPos,
-            neighbour: BlockStateId,
-            new: &mut Option<BlockStateId>,
-        ) {
-            // A piston landing a block asks before the block is in the world.
-            assert_eq!(self.block_state(neighbour_pos), neighbour);
-            self.seen.borrow_mut().push((pos, direction));
-            self.states.borrow_mut().push(state);
-            if let Some(answer) = self.answer
-                && self.b.block(state) == self.fence
-            {
-                *new = Some(answer);
-                let time = self.game_time();
-                ticks.schedule_block(time, pos, self.fence, 2, TickPriority::Normal);
-            }
-        }
-    }
-    let Some(f) = fixture() else { return };
-    let b = &f.behaviours;
-    let fence = f.registry.default_state("minecraft:oak_fence").unwrap();
-    let with = |key: &str| {
-        let mut s = f.registry.state(fence).unwrap().clone();
-        s.properties.insert(key.into(), "true".into());
-        f.registry.resolve(&s).unwrap()
-    };
-    let stone = f.registry.default_state("minecraft:stone").unwrap();
-    let mut level = Shaper {
-        inner: TestLevel::new(b),
-        b,
-        fence: b.block(fence),
-        answer: Some(with("west")),
-        seen: RefCell::new(Vec::new()),
-        states: RefCell::new(Vec::new()),
-    };
-    let mut ticks = Ticks::new(0);
-    ticks.add_empty_chunk(ChunkPos::new(0, 0)).unwrap();
-    let pos = BlockPos::new(1, 1, 1);
-    level.set_raw(pos, fence);
-    // Stone placed east of the fence: the hook's state, not the fence's own,
-    // and the tick the hook scheduled.
-    b.set_block(
-        &mut level,
-        &mut ticks,
-        BlockPos::new(2, 1, 1),
-        stone,
-        flags::UPDATE_ALL,
-    );
-    assert!(level.seen.borrow().contains(&(pos, Direction::East)));
-    assert_eq!(level.block_state(pos), with("west"));
-    assert!(ticks.has_block_tick(pos, b.block(fence)));
-    // Fitted to all its neighbours (as post-processing or a piston does), the
-    // fence is asked once per direction.
-    level.seen.borrow_mut().clear();
-    assert_eq!(
-        b.update_from_neighbour_shapes(&mut level, &mut ticks, pos, with("west")),
-        with("west")
-    );
-    assert_eq!(level.seen.borrow().len(), 6);
-    // Fitted into an empty spot (a piston landing it), every call still got
-    // the incoming state first, not the air at `pos`.
-    level.seen.borrow_mut().clear();
-    level.states.borrow_mut().clear();
-    level.set_raw(pos, b.air());
-    assert_eq!(
-        b.update_from_neighbour_shapes(&mut level, &mut ticks, pos, fence),
-        with("west")
-    );
-    assert_eq!(level.seen.borrow().len(), 6);
-    assert_eq!(level.states.borrow()[0], fence);
-    // A made-up id is ignored, not trusted.
-    level.answer = Some(BlockStateId(u32::MAX));
-    level.set_raw(pos, fence);
-    b.set_block(
-        &mut level,
-        &mut ticks,
-        BlockPos::new(2, 1, 1),
-        stone,
-        flags::UPDATE_ALL,
-    );
-    assert_ne!(level.block_state(pos), BlockStateId(u32::MAX));
-    level.answer = Some(with("west"));
-    // Without an answer the fence connects as vanilla's does.
-    level.answer = None;
-    level.set_raw(pos, fence);
-    b.set_block(
-        &mut level,
-        &mut ticks,
-        BlockPos::new(1, 1, 2),
-        stone,
-        flags::UPDATE_ALL,
-    );
-    assert_eq!(level.block_state(pos), with("south"));
-    // Air breaks the fence, with its drops.
-    level.answer = Some(b.air());
-    level.set_raw(pos, fence);
-    b.set_block(
-        &mut level,
-        &mut ticks,
-        BlockPos::new(1, 1, 0),
-        stone,
-        flags::UPDATE_ALL,
-    );
-    assert_eq!(level.block_state(pos), b.air());
-    assert!(level.inner.events.iter().any(
-        |e| matches!(e, LevelEvent::DropResources { pos: p, state } if *p == pos && *state == fence)
-    ));
-}
-
-#[test]
-fn the_level_chooses_the_state_a_block_is_placed_in() {
-    use crate::fluid::{FluidKind, FluidState};
-    use horizon_core::geometry::Vec3;
-    use std::cell::RefCell;
-
-    /// What one call of the hook was asked.
-    struct Asked {
-        state: BlockStateId,
-        pos: BlockPos,
-        clicked: BlockPos,
-        face: Direction,
-        item: String,
-        sneaking: bool,
-        replace_clicked: bool,
-        fluid: FluidState,
-    }
-    struct Placer {
-        inner: TestLevel,
-        b: &'static Behaviours,
-        /// The block the hook answers for.
-        block: BlockId,
-        /// What it answers for that block.
-        answer: Option<Option<BlockStateId>>,
-        asked: RefCell<Vec<Asked>>,
-    }
-    impl LevelAccess for Placer {
-        fn block_state(&self, pos: BlockPos) -> BlockStateId {
-            self.inner.block_state(pos)
-        }
-        fn set_raw(&mut self, pos: BlockPos, state: BlockStateId) -> Option<BlockStateId> {
-            self.inner.set_raw(pos, state)
-        }
-        fn is_loaded(&self, pos: BlockPos) -> bool {
-            self.inner.is_loaded(pos)
-        }
-        fn random(&mut self) -> &mut LegacyRandom {
-            self.inner.random()
-        }
-        fn game_time(&self) -> i64 {
-            self.inner.game_time()
-        }
-        fn emit(&mut self, event: LevelEvent) {
-            self.inner.emit(event);
-        }
-        fn before_state_for_placement(
-            &self,
-            state: BlockStateId,
-            context: &PlacementContext,
-            fluid: FluidState,
-            answer: &mut Option<Option<BlockStateId>>,
-        ) {
-            self.asked.borrow_mut().push(Asked {
-                state,
-                pos: context.pos,
-                clicked: context.hit_pos,
-                face: context.face,
-                item: context.item.clone(),
-                sneaking: context.sneaking,
-                replace_clicked: context.replace_clicked,
-                fluid,
-            });
-            if self.b.block(state) == self.block {
-                *answer = self.answer;
-            }
-        }
-    }
-    /// One call of the hook, as owned values (the level is mutable again after).
-    fn asked(
-        level: &Placer,
-    ) -> (
-        BlockStateId,
-        BlockPos,
-        BlockPos,
-        Direction,
-        String,
-        bool,
-        bool,
-        FluidState,
-    ) {
-        let asked = level.asked.borrow();
-        let first = &asked[0];
-        (
-            first.state,
-            first.pos,
-            first.clicked,
-            first.face,
-            first.item.clone(),
-            first.sneaking,
-            first.replace_clicked,
-            first.fluid,
-        )
-    }
-    let Some(f) = fixture() else { return };
-    let b = &f.behaviours;
-    let stone = f.registry.default_state("minecraft:stone").unwrap();
-    let furnace = f.registry.default_state("minecraft:furnace").unwrap();
-    let furnace_block = b.block(furnace);
-    // The same block facing another way: what a mod block's hook answers.
-    let facing = |direction: &str| {
-        let mut s = f.registry.state(furnace).unwrap().clone();
-        s.properties.insert("facing".into(), direction.into());
-        f.registry.resolve(&s).unwrap()
-    };
-    let mut level = Placer {
-        inner: TestLevel::new(b),
-        b,
-        block: furnace_block,
-        answer: Some(Some(facing("east"))),
-        asked: RefCell::new(Vec::new()),
-    };
-    let mut ticks = Ticks::new(0);
-    ticks.add_empty_chunk(ChunkPos::new(0, 0)).unwrap();
-    let ground = BlockPos::new(0, 0, 0);
-    level.set_raw(ground, stone);
-    // Looking south (yaw 0) at the top of the floor, holding a furnace.
-    let mut ctx = PlaceContext {
-        clicked_pos: ground,
-        face: Direction::Up,
-        hit: Vec3::new(0.5, 1.0, 0.5),
-        inside: false,
-        yaw: 0.0,
-        pitch: 0.0,
-        sneaking: false,
-        item: "minecraft:furnace".into(),
-        can_use_game_master_blocks: false,
-    };
-    // The hook's state, not the one vanilla's furnace placement computes.
-    assert_eq!(
-        b.state_for_placement(&mut level, &mut ticks, furnace_block, &ctx),
-        Some(facing("east"))
-    );
-    // It was asked with the block it decides for, where the block would go
-    // (above the stone), the block clicked, the face clicked, the item in
-    // hand, and the fluid of the position it goes in (none: dry stone).
-    let (state, pos, clicked, face, item, sneaking, replace_clicked, fluid) = asked(&level);
-    assert_eq!(state, furnace);
-    assert_eq!(pos, BlockPos::new(0, 1, 0));
-    assert_eq!(clicked, ground);
-    assert_eq!(face, Direction::Up);
-    assert_eq!(item, "minecraft:furnace");
-    assert!(!replace_clicked);
-    assert!(!sneaking);
-    assert_eq!(fluid, FluidState::EMPTY);
-    // Clicking a block that can be replaced: the block goes into it, and the
-    // fluid already there (water) reaches the hook, which a waterlogged block
-    // reads. Sneaking reaches it too, as `isSecondaryUseActive`.
-    level.asked.borrow_mut().clear();
-    let water = f.registry.default_state("minecraft:water").unwrap();
-    level.set_raw(BlockPos::new(0, 1, 0), water);
-    ctx.clicked_pos = BlockPos::new(0, 1, 0);
-    ctx.sneaking = true;
-    assert_eq!(
-        b.state_for_placement(&mut level, &mut ticks, furnace_block, &ctx),
-        Some(facing("east"))
-    );
-    let (_, pos, _, _, _, sneaking, replace_clicked, fluid) = asked(&level);
-    assert_eq!(pos, BlockPos::new(0, 1, 0));
-    assert!(replace_clicked);
-    assert!(sneaking);
-    assert_eq!(fluid.kind(), FluidKind::Water);
-    // Refused (vanilla's `null` return): there is no state, so the placement
-    // fails and the stack is kept.
-    level.answer = Some(None);
-    assert_eq!(
-        b.state_for_placement(&mut level, &mut ticks, furnace_block, &ctx),
-        None
-    );
-    // Without an answer the block's own `getStateForPlacement` runs: a furnace
-    // placed with yaw 0 faces north, which is its default state.
-    level.answer = None;
-    assert_eq!(
-        b.state_for_placement(&mut level, &mut ticks, furnace_block, &ctx),
-        Some(furnace)
-    );
-    // And a block the hook does not answer for is unaffected.
-    let stairs = b.block(f.registry.default_state("minecraft:oak_stairs").unwrap());
-    let vanilla = b.state_for_placement(&mut level, &mut ticks, stairs, &ctx);
-    level.answer = Some(Some(facing("west")));
-    assert_eq!(
-        b.state_for_placement(&mut level, &mut ticks, stairs, &ctx),
-        vanilla
-    );
-    // A dispenser places through the same state computation
-    // (`ShulkerBoxDispenseBehavior`'s `DirectionalPlaceContext`): it places
-    // the hook's state too, with the dispenser's own view of the click.
-    level.answer = Some(Some(facing("east")));
-    level.asked.borrow_mut().clear();
-    let front = BlockPos::new(3, 1, 1);
-    let dispenser = PlaceContext {
-        clicked_pos: front,
-        face: Direction::East,
-        hit: Vec3::new(3.0, 1.0, 1.5),
-        inside: false,
-        yaw: 270.0,
-        pitch: 0.0,
-        sneaking: false,
-        item: "minecraft:furnace".into(),
-        can_use_game_master_blocks: false,
-    };
-    assert!(b.directional_can_place(&mut level, &mut ticks, &dispenser));
-    let outcome = b.place_block(&mut level, &mut ticks, &dispenser);
-    assert_eq!(
-        outcome,
-        PlaceOutcome::Placed {
-            pos: front,
-            state: facing("east")
-        }
-    );
-    assert_eq!(level.block_state(front), facing("east"));
-    let (state, pos, _, _, item, _, replace_clicked, _) = asked(&level);
-    assert_eq!(state, furnace);
-    assert_eq!(pos, front);
-    assert_eq!(item, "minecraft:furnace");
-    assert!(replace_clicked, "the front block is air: it is replaced");
-    // A made-up id is not trusted, nor is another block's state: the block
-    // places as vanilla's would.
-    level.answer = Some(Some(BlockStateId(u32::MAX)));
-    assert_eq!(
-        b.state_for_placement(&mut level, &mut ticks, furnace_block, &ctx),
-        Some(furnace)
-    );
-    level.answer = Some(Some(b.default_of(stairs)));
-    assert_eq!(
-        b.state_for_placement(&mut level, &mut ticks, furnace_block, &ctx),
-        Some(furnace)
-    );
-}
-
-#[test]
-fn survive_hooks_answer_for_the_block() {
-    use std::cell::Cell;
-
-    struct Rules {
-        inner: TestLevel,
-        b: &'static Behaviours,
-        /// A plant and the one block it may stand on, by `mayPlaceOn`.
-        ground: Option<(BlockId, BlockId)>,
-        /// A block and its `canSurvive` answer.
-        survive: Option<(BlockId, bool)>,
-        asked: Cell<usize>,
-    }
-    impl LevelAccess for Rules {
-        fn block_state(&self, pos: BlockPos) -> BlockStateId {
-            self.inner.block_state(pos)
-        }
-        fn set_raw(&mut self, pos: BlockPos, state: BlockStateId) -> Option<BlockStateId> {
-            self.inner.set_raw(pos, state)
-        }
-        fn is_loaded(&self, pos: BlockPos) -> bool {
-            self.inner.is_loaded(pos)
-        }
-        fn random(&mut self) -> &mut LegacyRandom {
-            self.inner.random()
-        }
-        fn game_time(&self) -> i64 {
-            self.inner.game_time()
-        }
-        fn emit(&mut self, event: LevelEvent) {
-            self.inner.emit(event);
-        }
-        fn before_can_survive(
-            &self,
-            _pos: BlockPos,
-            state: BlockStateId,
-            survives: &mut Option<bool>,
-        ) {
-            self.asked.set(self.asked.get() + 1);
-            if let Some((block, answer)) = self.survive
-                && self.b.block(state) == block
-            {
-                *survives = Some(answer);
-            }
-        }
-        fn before_may_place_on(
-            &self,
-            state: BlockStateId,
-            ground: BlockStateId,
-            _ground_pos: BlockPos,
-            may: &mut Option<bool>,
-        ) {
-            if let Some((plant, on)) = self.ground
-                && self.b.block(state) == plant
-            {
-                *may = Some(self.b.block(ground) == on);
-            }
-        }
-    }
-    let Some(f) = fixture() else { return };
-    let b = &f.behaviours;
-    let state = |name: &str| f.registry.default_state(name).unwrap();
-    let (dandelion, stone, cobblestone) = (
-        state("minecraft:dandelion"),
-        state("minecraft:stone"),
-        state("minecraft:cobblestone"),
-    );
-    let mut level = Rules {
-        inner: TestLevel::new(b),
-        b,
-        ground: None,
-        survive: None,
-        asked: Cell::new(0),
-    };
-    let mut ticks = Ticks::new(0);
-    ticks.add_empty_chunk(ChunkPos::new(0, 0)).unwrap();
-    let ground = BlockPos::new(1, 1, 1);
-    let pos = BlockPos::new(1, 2, 1);
-    let place = |level: &mut Rules, ticks: &mut Ticks, item: &str| {
-        let ctx = PlaceContext {
-            clicked_pos: ground,
-            face: Direction::Up,
-            hit: horizon_core::geometry::Vec3::new(1.5, 2.0, 1.5),
-            inside: false,
-            yaw: 0.0,
-            pitch: 0.0,
-            sneaking: false,
-            item: item.into(),
-            can_use_game_master_blocks: false,
-        };
-        b.place_block(level, ticks, &ctx)
-    };
-    level.set_raw(ground, stone);
-
-    // A dandelion doesn't stand on stone in vanilla, so it can't be placed there.
-    assert!(!b.can_survive(&mut level, &mut ticks, pos, dandelion));
-    assert_eq!(
-        place(&mut level, &mut ticks, "minecraft:dandelion"),
-        PlaceOutcome::Failed
-    );
-    // A mod's mayPlaceOn names stone: placed, through the dandelion's own canSurvive.
-    level.ground = Some((b.block(dandelion), b.block(stone)));
-    assert!(matches!(
-        place(&mut level, &mut ticks, "minecraft:dandelion"),
-        PlaceOutcome::Placed { pos: p, .. } if p == pos
-    ));
-    assert_eq!(level.block_state(pos), dandelion);
-    // Its ground turns to cobblestone: its shape update asks again and it pops off, with its drops.
-    b.set_block(
-        &mut level,
-        &mut ticks,
-        ground,
-        cobblestone,
-        flags::UPDATE_ALL,
-    );
-    assert_eq!(level.block_state(pos), b.air());
-    assert!(level.inner.events.iter().any(
-        |e| matches!(e, LevelEvent::DropResources { pos: p, state } if *p == pos && *state == dandelion)
-    ));
-
-    // canSurvive answered for the block itself wins over its own rule, either way.
-    level.survive = Some((b.block(dandelion), true));
-    assert!(b.can_survive(&mut level, &mut ticks, pos, dandelion));
-    level.set_raw(ground, stone);
-    level.survive = Some((b.block(stone), false));
-    assert_eq!(
-        place(&mut level, &mut ticks, "minecraft:stone"),
-        PlaceOutcome::Failed
-    );
-    assert_eq!(level.block_state(pos), b.air());
-    // Without an answer the block's own rule runs: stone survives anywhere.
-    level.survive = None;
-    let asked = level.asked.get();
-    assert!(matches!(
-        place(&mut level, &mut ticks, "minecraft:stone"),
-        PlaceOutcome::Placed { .. }
-    ));
-    assert!(level.asked.get() > asked);
-}
-
-#[test]
-fn a_level_can_answer_how_a_block_burns() {
+fn vanilla_flammability_table_keeps_glass_safe_and_burns_planks() {
     let mut w = world!();
     w.floor(0, 10, "stone");
     let glass = w.id("glass", &[]);
     let planks = w.id("oak_planks", &[]);
-    let burn = |w: &mut World, fire: BlockPos| {
-        w.set(fire.offset(0, -1, 0), w.id("netherrack", &[]));
-        w.set(fire.offset(1, 0, 0), glass);
-        w.set(fire.offset(-1, 0, 0), planks);
-        w.set(fire, w.id("fire", &[]));
-        for _ in 0..4000 {
-            w.tick();
-        }
-    };
-    // Vanilla's table: glass never burns, planks do.
     let fire = BlockPos::new(0, 1, 0);
-    burn(&mut w, fire);
-    assert_eq!(w.get(fire.offset(1, 0, 0)), glass, "glass doesn't burn");
-    assert_ne!(w.get(fire.offset(-1, 0, 0)), planks, "planks burn");
-
-    // The level's answer wins over the table, either way.
-    w.level.fire_odds.insert(glass, (30, 60));
-    w.level.fire_odds.insert(planks, (0, 0));
-    let fire = BlockPos::new(0, 1, 6);
-    burn(&mut w, fire);
-    assert_ne!(w.get(fire.offset(1, 0, 0)), glass, "flammable glass burns");
-    assert_eq!(
-        w.get(fire.offset(-1, 0, 0)),
-        planks,
-        "fireproof planks don't"
-    );
-
-    // Fire in the air beside a block stays only while the block's ignite
-    // odds are above zero, and burn odds of zero never destroy the block.
-    let lit_beside = |w: &mut World, at: BlockPos, ticks: usize| {
-        w.set(at.offset(1, 0, 0), glass);
-        w.set(at, w.id("fire", &[]));
-        for _ in 0..ticks {
-            w.tick();
-        }
-        w.get(at)
-    };
-    let fire = w.id("fire", &[]);
-    w.level.fire_odds.clear();
-    let at = BlockPos::new(-6, 5, 0);
-    assert_ne!(
-        w.b().block(lit_beside(&mut w, at, 45)),
-        w.b().block(fire),
-        "fire beside plain glass goes out"
-    );
-    w.level.fire_odds.insert(glass, (5, 0));
-    let at = BlockPos::new(-6, 5, 6);
-    assert_eq!(
-        w.b().block(lit_beside(&mut w, at, 45)),
-        w.b().block(fire),
-        "fire stands beside glass that ignites"
-    );
+    w.set(fire.offset(0, -1, 0), w.id("netherrack", &[]));
+    w.set(fire.offset(1, 0, 0), glass);
+    w.set(fire.offset(-1, 0, 0), planks);
+    w.set(fire, w.id("fire", &[]));
     for _ in 0..4000 {
         w.tick();
     }
-    assert_eq!(w.get(at.offset(1, 0, 0)), glass, "and never burns it away");
+    assert_eq!(w.get(fire.offset(1, 0, 0)), glass, "glass doesn't burn");
+    assert_ne!(w.get(fire.offset(-1, 0, 0)), planks, "planks burn");
 }
 
 #[test]
-fn a_level_can_answer_what_makes_a_campfire_signal() {
+fn vanilla_hay_bale_makes_a_campfire_a_signal_fire() {
     let mut w = world!();
     let (stone, hay) = (w.id("stone", &[]), w.id("hay_block", &[]));
     let ground = BlockPos::new(0, 0, 0);
@@ -3899,19 +2622,12 @@ fn a_level_can_answer_what_makes_a_campfire_signal() {
     assert_eq!(place(&mut w), "false");
     w.put(ground, hay);
     assert_eq!(place(&mut w), "true", "vanilla's hay bale");
-
-    // The level makes stone a smoke source and hay not: placed, and as the ground changes.
-    w.level.smoke_sources.insert(stone, true);
-    w.level.smoke_sources.insert(hay, false);
-    assert_eq!(place(&mut w), "false");
     w.set(ground, stone);
-    assert_eq!(w.prop(campfire, "signal_fire"), "true");
-    w.set(ground, hay);
     assert_eq!(w.prop(campfire, "signal_fire"), "false");
+    w.set(ground, hay);
+    assert_eq!(w.prop(campfire, "signal_fire"), "true");
 }
 
-/// #8490 carpet duplication machine: four slime blocks, a sticky piston, a dead
-/// wall coral fan and three carpets on the slime column's far side.
 #[test]
 fn carpet_duplication_machine_8490() {
     let mut w = world!();

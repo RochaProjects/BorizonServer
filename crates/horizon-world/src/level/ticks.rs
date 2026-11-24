@@ -359,7 +359,6 @@ mod tests {
             progress,
             progress_o: 0.0,
             last_ticked: 0,
-            death_ticks: 0,
             id: 0,
         }
     }

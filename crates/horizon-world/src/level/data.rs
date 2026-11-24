@@ -196,8 +196,7 @@ pub struct BlockData {
     pub link: Option<BlockId>,
     /// Second block link: attached stem (stems) or stem (attached stems).
     pub link2: Option<BlockId>,
-    /// Support blocks (stems, plants); a content mod's connecting block's
-    /// `connects_to` (a `PipeBlock` alone in its chain).
+    /// Vanilla support blocks (stems and plants).
     pub support_tag: Option<Arc<BlockSet>>,
     pub support_tag2: Option<Arc<BlockSet>>,
     pub feature: Option<Arc<str>>,
@@ -627,9 +626,6 @@ pub fn load_registry(root: &Path) -> io::Result<BlockRegistry> {
 
 /// [`load_registry`] with each state's `(air, fluid)` columns.
 pub fn load_registry_with_flags(root: &Path) -> io::Result<(BlockRegistry, Vec<(bool, bool)>)> {
-    // The root's mod fluids join the fluid table first: every fluid state
-    // read from this registry (cached or not) may name one.
-    crate::fluid::load_mod_fluids(root)?;
     if let Some(cached) = cache::load_registry(root) {
         return Ok(cached);
     }
@@ -861,18 +857,11 @@ fn build_with_gameplay<G: GameplayStateSource>(
         }
         let fluid_kind =
             FluidKind::from_index(int(2) as usize).ok_or_else(|| fail("invalid exported fluid"))?;
-        let mut fluid = FluidState::new(
+        let fluid = FluidState::new(
             fluid_kind,
             int(3) as u8,
             row.get(4).and_then(Value::as_bool).unwrap_or(false),
         );
-        // A mod's liquid block copies its template's row (vanilla water or
-        // lava): it holds its own fluid.
-        if let Some(state) = registry.state(BlockStateId(id as u32))
-            && FluidKind::of_liquid_block(&state.name).is_some()
-        {
-            fluid = FluidState::from_block(state)?;
-        }
         facts.push(StateFacts {
             flags,
             sturdy: int(0) as u32,
@@ -974,7 +963,7 @@ fn build_with_gameplay<G: GameplayStateSource>(
             (state < table.state_count() as u64).then(|| table.block(BlockStateId(state as u32)))
         });
         let link2 = ["attachedStem", "stem"].into_iter().find_map(block_field);
-        let support_tag = ["stemSupportBlocks", "supportBlocks", "connectsTo"]
+        let support_tag = ["stemSupportBlocks", "supportBlocks"]
             .into_iter()
             .find_map(|k| field(k).and_then(Value::as_str))
             .and_then(tag);

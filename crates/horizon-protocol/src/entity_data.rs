@@ -163,14 +163,7 @@ pub enum ParticleData {
     GeyserBase(i32, f32),
     /// Vibration: where it travels to, then its arrival time in ticks.
     Vibration { source: PositionSource, ticks: i32 },
-    /// Horizon extension: a native mod's own particle type, by its namespaced
-    /// name (`mymod:spark`). Vanilla has no id for it; see `MOD_PARTICLE_ID`.
-    Mod(String),
 }
-/// Horizon extension for a native mod's particle type. Vanilla's
-/// `minecraft:particle_type` ids are registry ids and never negative, so this
-/// one cannot collide with a vanilla type.
-pub const MOD_PARTICLE_ID: i32 = -1;
 /// Adapter markers: pre-1.20.5 spell providers take their RGB from the spawn velocity.
 pub const LEGACY_ENTITY_EFFECT_PARTICLE_ID: i32 = -2;
 pub const LEGACY_AMBIENT_ENTITY_EFFECT_PARTICLE_ID: i32 = -3;
@@ -186,9 +179,7 @@ impl Particle {
         let id = r.varint()?;
         let id = if matches!(
             id,
-            MOD_PARTICLE_ID
-                | LEGACY_ENTITY_EFFECT_PARTICLE_ID
-                | LEGACY_AMBIENT_ENTITY_EFFECT_PARTICLE_ID
+            LEGACY_ENTITY_EFFECT_PARTICLE_ID | LEGACY_AMBIENT_ENTITY_EFFECT_PARTICLE_ID
         ) {
             id
         } else if ids::quirks().legacy_item_nbt && matches!(id, 0 | 21) {
@@ -200,13 +191,6 @@ impl Particle {
         } else {
             ids::particle(id)
         };
-        // A native mod's type: the namespaced name follows the sentinel id.
-        if id == MOD_PARTICLE_ID {
-            return Ok(Particle {
-                id,
-                data: Some(ParticleData::Mod(r.string(32767)?)),
-            });
-        }
         // `minecraft:particle_type` registry order as of 26.3.
         let data = match id {
             1 | 2 | 36 | 121 | 125 => Some(ParticleData::State(ids::block_state(r.varint()?))),
@@ -331,7 +315,6 @@ impl Particle {
                 w.varint(*d);
             }
             ParticleData::Item(s) => Template::write(s, w),
-            ParticleData::Mod(name) => w.string(name),
             ParticleData::Vibration { source, ticks } => {
                 match source {
                     PositionSource::Block(pos) => {
@@ -961,11 +944,6 @@ mod tests {
                     removed: vec![7],
                     wire: Default::default(),
                 })),
-            ),
-            // A native mod's type: the sentinel id, then the namespaced name.
-            (
-                MOD_PARTICLE_ID,
-                Some(ParticleData::Mod("mymod:spark".to_owned())),
             ),
             (
                 58,

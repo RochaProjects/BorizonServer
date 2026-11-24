@@ -9,8 +9,6 @@ use crate::{
 use horizon_world::nbt::Tag;
 use std::sync::Arc;
 
-#[doc(hidden)]
-pub mod custom;
 mod hash;
 mod skip;
 mod trim;
@@ -572,7 +570,6 @@ impl Component {
                     None => Self::Raw(bytes.to_vec()),
                 }
             }
-            other if custom::contains(other) => Self::Nbt(r.nbt()?),
             other => {
                 let start = r.position();
                 skip::component(other, r)?;
@@ -1272,13 +1269,6 @@ fn read_stack(r: &mut Reader, delimited: bool) -> Result<Option<Stack>> {
             let len = r.count(r.remaining())?;
             let mut component_reader = Reader::new(r.bytes(len)?);
             let read = read_added(raw, &mut component_reader)?;
-            if read
-                .as_ref()
-                .is_some_and(|(kind, ..)| custom::contains(*kind))
-                && component_reader.remaining() != 0
-            {
-                return Err(crate::Error::new("trailing custom component data"));
-            }
             read
         } else {
             read_added(raw, r)?

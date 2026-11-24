@@ -24,14 +24,12 @@ const POSSIBLE_FLOW_DIRECTIONS: [Direction; 5] = [
     Direction::West,
 ];
 
-/// Whether a fluid behaves as water: its template, so a fluid copying water
-/// meets lava, waterlogs and drips as water does.
+/// Whether the vanilla fluid is water or flowing water.
 fn is_water(kind: FluidKind) -> bool {
     kind.template() == FluidTemplate::Water
 }
 /// Vanilla's lava, flowing or not: only it is `LavaFluid`, with lava's
-/// overrides (water to stone, the random slowdown, fizzing). A mod fluid
-/// copying lava is a `BaseFlowingFluid` with lava's numbers, not lava.
+/// overrides (water to stone, the random slowdown, fizzing).
 fn is_vanilla_lava(kind: FluidKind) -> bool {
     kind.source() == FluidKind::Lava
 }
@@ -107,12 +105,8 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     fn fast_lava(&self) -> bool {
         self.level.dimension_type().fast_lava
     }
-    /// `Fluid.getTickDelay`: the fluid's own number, else its template's
-    /// (lava's is faster in an ultrawarm dimension).
+    /// `Fluid.getTickDelay`: water 5 ticks; lava 10 (ultrawarm) or 30.
     pub(crate) fn fluid_tick_delay(&self, kind: FluidKind) -> i32 {
-        if let Some(delay) = kind.numbers().tick_delay {
-            return delay;
-        }
         match kind.template() {
             FluidTemplate::Empty => 0,
             FluidTemplate::Water => 5,
@@ -127,9 +121,6 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     }
     /// `FlowingFluid.getDropOff`.
     fn drop_off(&self, kind: FluidKind) -> i32 {
-        if let Some(drop) = kind.numbers().drop_off {
-            return drop;
-        }
         if is_water(kind) || self.fast_lava() {
             1
         } else {
@@ -138,20 +129,14 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     }
     /// `FlowingFluid.getSlopeFindDistance`.
     fn slope_find_distance(&self, kind: FluidKind) -> i32 {
-        if let Some(distance) = kind.numbers().slope_find_distance {
-            return distance;
-        }
         if is_water(kind) || self.fast_lava() {
             4
         } else {
             2
         }
     }
-    /// `FlowingFluid.canConvertToSource`: the template's game rule.
+    /// `FlowingFluid.canConvertToSource`: the corresponding game rule.
     fn can_convert_to_source(&self, kind: FluidKind) -> bool {
-        if let Some(convert) = kind.numbers().convert_to_source {
-            return convert;
-        }
         let rules = self.level.game_rules();
         if is_water(kind) {
             rules.water_source_conversion
@@ -184,7 +169,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         match kind.source() {
             FluidKind::Water => direction == Direction::Down && !is_water(other),
             FluidKind::Lava => self.fluid_height(fluid, pos) >= 0.444_444_45 && is_water(other),
-            // `BaseFlowingFluid.canBeReplacedWith`: a mod fluid is never replaced by another.
+            // No other vanilla fluid replaces this one.
             _ => false,
         }
     }
@@ -580,8 +565,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             self.place_liquid(pos, state, target, false);
         } else {
             if !b.is_air(state) {
-                // `beforeDestroyingBlock`: lava fizzes; water and mod fluids
-                // (`BaseFlowingFluid`) drop the block's resources.
+                // `beforeDestroyingBlock`: lava fizzes; water drops resources.
                 if is_vanilla_lava(kind) {
                     self.level_event(1501, pos, 0);
                 } else {
@@ -646,23 +630,6 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         if !fluid.is_source() {
             let new_fluid = self.new_liquid(kind, pos, state);
             let delay = self.spread_delay(kind, pos, fluid, new_fluid);
-            if new_fluid != fluid {
-                // Vanilla's by their short names, a mod fluid by its id.
-                let name = match kind.source() {
-                    FluidKind::Water => "water",
-                    FluidKind::Lava => "lava",
-                    FluidKind::Empty => return,
-                    source => source.name(),
-                };
-                if !self.level.allow_fluid_level_change(
-                    pos,
-                    name,
-                    i32::from(fluid.amount()),
-                    i32::from(new_fluid.amount()),
-                ) {
-                    return;
-                }
-            }
             if new_fluid.kind() == FluidKind::Empty {
                 fluid = new_fluid;
                 state = self.b.air();
@@ -765,9 +732,6 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                         .into_iter()
                         .any(|d| self.lava_flammable(rel(test, d)))
                     {
-                        if !self.level.allow_block_ignite(test, "lava") {
-                            return;
-                        }
                         let fire = self.fire_state_for(test);
                         self.set_block_and_update(test, fire);
                         return;
@@ -789,9 +753,6 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                     return;
                 }
                 if self.is_empty_block(above(test)) && self.lava_flammable(test) {
-                    if !self.level.allow_block_ignite(above(test), "lava") {
-                        continue;
-                    }
                     let fire = self.fire_state_for(test);
                     self.set_block_and_update(above(test), fire);
                 }

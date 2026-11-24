@@ -164,24 +164,12 @@ impl LivingAirWorld for World<'_> {
         self.query("levitation")?;
         Ok(self.f["levitation"].as_i64().map(|v| v as i32))
     }
-    fn is_client_side(&mut self) -> io::Result<bool> {
-        self.query("client")?;
-        Ok(self.flag("client"))
-    }
-    fn has_chunk_at(&mut self, p: BlockPos) -> io::Result<bool> {
-        self.query(format!("chunk {} {} {}", p.x, p.y, p.z))?;
-        Ok(self.flag("chunk"))
-    }
     fn effective_gravity(&mut self) -> io::Result<f64> {
         self.query("gravity")?;
         Ok(number(&self.f["gravity"]))
     }
     fn y(&self) -> f64 {
         self.y
-    }
-    fn minimum_y(&mut self) -> io::Result<i32> {
-        self.query("min-y")?;
-        Ok(self.f["min_y"].as_i64().unwrap() as i32)
     }
     fn discard_friction(&mut self) -> io::Result<bool> {
         self.query("discard")?;

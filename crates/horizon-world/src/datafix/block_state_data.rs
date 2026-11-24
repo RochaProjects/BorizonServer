@@ -176,7 +176,8 @@ pub fn upgrade_block_state_tag(old: &Tag) -> Tag {
 
 /// `BlockStateData.upgradeBlockStateTag` on a state given as a `State` (its properties sorted): the 1.13 state a
 /// 1.12 one becomes, or the state itself when the table has none.
-pub fn upgrade_state(old: &State) -> State {
+#[cfg(test)]
+pub(super) fn upgrade_state(old: &State) -> State {
     let d = data();
     match d.id_by_old.get(old).copied() {
         Some(id) if (0..4096).contains(&id) => match d.map[id as usize] {

@@ -59,7 +59,6 @@ fn a_broken_moving_piston_drops_the_block_it_carries() {
             progress: 0.5,
             progress_o: 0.4,
             last_ticked: 0,
-            death_ticks: 0,
             id: 0,
         },
     ));
@@ -106,7 +105,6 @@ fn a_moving_piston_without_a_block_entity_is_removed_by_a_click() {
             progress: 0.5,
             progress_o: 0.4,
             last_ticked: 0,
-            death_ticks: 0,
             id: 0,
         },
     ));

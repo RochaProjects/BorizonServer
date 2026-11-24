@@ -48,9 +48,7 @@ pub enum PlaceOutcome {
 }
 
 /// `BlockPlaceContext` after resolving the replaced position: what
-/// `Block.getStateForPlacement` reads, and what a mod block is handed when it
-/// chooses the state it is placed in
-/// (`LevelAccess::before_state_for_placement`).
+/// `Block.getStateForPlacement` reads when choosing a vanilla placement state.
 #[derive(Clone, Debug)]
 pub struct PlacementContext {
     /// Where the block would go (`getClickedPos`): the clicked block itself
@@ -283,33 +281,12 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         }
     }
 
-    /// `Block.getStateForPlacement(context)` for `block`, after the level's
-    /// hook (`LevelAccess::before_state_for_placement`), which a mod block
-    /// answers for itself.
+    /// `Block.getStateForPlacement(context)` for vanilla `block`.
     pub(crate) fn state_for_placement(
         &mut self,
         block: BlockId,
         ctx: &PlacementContext,
     ) -> Option<BlockStateId> {
-        let default = self.b.default_of(block);
-        let fluid = self.fluid_at(ctx.pos);
-        let mut answer = None;
-        self.level
-            .before_state_for_placement(default, ctx, fluid, &mut answer);
-        match answer {
-            // A mod's answer, for a state of the block being placed, as
-            // vanilla's `getStateForPlacement` returns its own `defaultBlockState`
-            // set out. Another block's answer, or an id past the state table
-            // (which would panic the server), leaves vanilla's state as it is.
-            Some(Some(new))
-                if (new.0 as usize) < self.b.table.state_count() && self.b.block(new) == block =>
-            {
-                return Some(new);
-            }
-            // Vanilla's `null` return: the block goes nowhere.
-            Some(None) => return None,
-            _ => {}
-        }
         self.placement_at(block, 0, ctx)
     }
 
@@ -767,9 +744,6 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                 Some(self.copper_chest_least_oxidized(state, pos))
             }
             Class::ChorusPlant => Some(self.chorus_plant_with_connections(pos, default)),
-            // A content mod's connecting block (alone, PipeBlock places as
-            // Block does).
-            Class::Pipe if depth == 0 => Some(self.pipe_with_connections(pos, default)),
             Class::ConcretePowder => {
                 let replaced = self.state(pos);
                 if b.is_water_fluid(b.fluid(replaced).kind()) || self.concrete_touches_liquid(pos) {
@@ -1288,29 +1262,6 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         } else {
             None
         }
-    }
-    /// A content mod's connecting block (a `PipeBlock` alone in its chain):
-    /// joined on each side to itself and to its `connects_to` tag.
-    pub(crate) fn pipe_with_connections(&self, pos: BlockPos, state: BlockStateId) -> BlockStateId {
-        let mut result = state;
-        for direction in Direction::ALL {
-            let connect = self.pipe_connects(state, self.rel_state(pos, direction));
-            result = self
-                .b
-                .table
-                .with_bool(result, self.direction_prop(direction), connect)
-                .unwrap_or(result);
-        }
-        result
-    }
-    /// Whether connecting block `state` joins `neighbour`.
-    pub(crate) fn pipe_connects(&self, state: BlockStateId, neighbour: BlockStateId) -> bool {
-        let b = self.b;
-        b.is_block(neighbour, b.block(state))
-            || b.data(state)
-                .support_tag
-                .as_ref()
-                .is_some_and(|t| b.in_set(neighbour, t))
     }
     /// `ChorusPlantBlock.getStateWithConnections`.
     pub(crate) fn chorus_plant_with_connections(

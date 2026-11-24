@@ -111,7 +111,6 @@ classes! {
     ChiseledBookShelf = "ChiseledBookShelfBlock",
     ChorusFlower = "ChorusFlowerBlock",
     ChorusPlant = "ChorusPlantBlock",
-    Pipe = "PipeBlock",
     Cocoa = "CocoaBlock",
     FallingBlock = "FallingBlock",
     ColoredFalling = "ColoredFallingBlock",

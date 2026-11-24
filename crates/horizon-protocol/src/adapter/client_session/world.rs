@@ -118,8 +118,8 @@ fn light_update(payload: &[u8]) -> Result<Vec<u8>> {
     Ok(w.data)
 }
 
-/// A particle in 26.2's numbering, its block state too, or its stand-in; `None` when 26.2 has neither (a
-/// native mod's particle). The options stay: the stand-ins in the 26.2 tables (pinned 43..=45 as 41)
+/// A particle in 26.2's numbering, its block state too, or its stand-in; `None` when 26.2 has no
+/// matching particle or configured stand-in. The options stay: the stand-ins in the 26.2 tables (pinned 43..=45 as 41)
 /// carry none, as the particles they stand for; a stand-in with other options would need them rebuilt.
 fn particle_down(ids: &Ids, p: &Particle) -> Option<Particle> {
     let mut p = p.clone();
@@ -541,27 +541,15 @@ mod tests {
                 data: Some(ParticleData::Color(-1)),
             },
             sound: (sound, None),
-            block_particles: vec![
-                play::ExplosionParticle {
-                    particle: Particle {
-                        id: 28,
-                        data: Some(ParticleData::Color(7)),
-                    },
-                    scaling: 1.0,
-                    speed: 0.5,
-                    weight: 3,
+            block_particles: vec![play::ExplosionParticle {
+                particle: Particle {
+                    id: 28,
+                    data: Some(ParticleData::Color(7)),
                 },
-                // A native mod's particle: 26.2 has nothing for it.
-                play::ExplosionParticle {
-                    particle: Particle {
-                        id: crate::entity_data::MOD_PARTICLE_ID,
-                        data: Some(ParticleData::Mod("mymod:spark".into())),
-                    },
-                    scaling: 1.0,
-                    speed: 0.5,
-                    weight: 1,
-                },
-            ],
+                scaling: 1.0,
+                speed: 0.5,
+                weight: 3,
+            }],
             play_sound,
         }
     }

@@ -32,22 +32,6 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         neighbour_pos: BlockPos,
         neighbour: BlockStateId,
     ) -> BlockStateId {
-        let mut new = None;
-        self.level.before_update_shape(
-            self.ticks,
-            pos,
-            state,
-            direction,
-            neighbour_pos,
-            neighbour,
-            &mut new,
-        );
-        // A mod's answer: an id past the state table would panic the server.
-        if let Some(new) = new
-            && (new.0 as usize) < self.b.table.state_count()
-        {
-            return new;
-        }
         self.update_shape_at(0, state, pos, direction, neighbour_pos, neighbour)
     }
 
@@ -348,13 +332,6 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                     table.set_bool(state, self.direction_prop(dir), connect)
                 }
             }
-            // A content mod's connecting block; the chorus plant's PipeBlock
-            // keeps its state (vanilla's has no updateShape).
-            Class::Pipe if b.data(state).class == Class::Pipe => table.set_bool(
-                state,
-                self.direction_prop(dir),
-                self.pipe_connects(state, nstate),
-            ),
             Class::Cocoa => survive_or_air!(dir == b.facing(state)),
             Class::Comparator => {
                 if dir == Direction::Down && !self.can_support_rigid_block_on(npos, nstate) {

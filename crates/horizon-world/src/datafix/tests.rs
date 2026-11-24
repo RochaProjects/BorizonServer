@@ -87,11 +87,11 @@ fn block_states_from_the_flattening_on_are_not_renamed() {
     }
     let props = [("facing".to_owned(), "north".to_owned())];
     assert_eq!(
-        native_upgrade_block_state("minecraft:oak_stairs", &props, FLATTENING),
+        upgrade_block_state("minecraft:oak_stairs", &props, FLATTENING),
         ("minecraft:oak_stairs".to_owned(), props.to_vec())
     );
     assert_eq!(
-        native_upgrade_block_state("minecraft:no_such_block", &[], 1400),
+        upgrade_block_state("minecraft:no_such_block", &[], 1400),
         ("minecraft:no_such_block".to_owned(), Vec::new())
     );
 }
@@ -104,12 +104,12 @@ fn block_states_from_before_the_flattening_take_their_new_names() {
     }
     let granite = [("variant".to_owned(), "granite".to_owned())];
     assert_eq!(
-        native_upgrade_block_state("minecraft:stone", &granite, 1400),
+        upgrade_block_state("minecraft:stone", &granite, 1400),
         ("minecraft:granite".to_owned(), Vec::new())
     );
     // The same state written after the flattening is not upgraded.
     assert_eq!(
-        native_upgrade_block_state("minecraft:stone", &granite, FLATTENING),
+        upgrade_block_state("minecraft:stone", &granite, FLATTENING),
         ("minecraft:stone".to_owned(), granite.to_vec())
     );
 }

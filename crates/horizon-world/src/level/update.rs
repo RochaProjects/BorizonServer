@@ -351,8 +351,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             // player-break path calls (player_destroy).
             self.remove_moving_piston(pos);
         } else if block_changed
-            && (self.b.has_flag(old, super::data::state_flags::BLOCK_ENTITY)
-                || self.level.has_native_block_entity(old))
+            && self.b.has_flag(old, super::data::state_flags::BLOCK_ENTITY)
             && !self.keeps_block_entity(state, old)
         {
             // BlockEntity.preRemoveSideEffects (unless UPDATE_SKIP_BLOCK_ENTITY_SIDEEFFECTS)

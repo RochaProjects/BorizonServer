@@ -56,10 +56,6 @@ pub trait LivingFallWorld {
     ) -> Result<(), Self::Error>;
     fn safe_fall_distance(&mut self) -> Result<f64, Self::Error>;
     fn fall_damage_multiplier(&mut self) -> Result<f64, Self::Error>;
-    /// A host may adjust a mod block's landing damage before sounds and hurt.
-    fn modify_fall_damage(&mut self, _distance: f64, damage: f32) -> Result<f32, Self::Error> {
-        Ok(damage)
-    }
     /// Select the entity type's small/big fall sound. Big applies above four.
     fn fall_sound(&mut self, big: bool) -> Result<Self::Sound, Self::Error>;
     fn play_fall_sound(&mut self, sound: Self::Sound) -> Result<(), Self::Error>;
@@ -113,7 +109,7 @@ pub fn cause_living_fall_damage<W: LivingFallWorld>(
         world.propagate_fall_to_passengers(distance, multiplier)?;
     }
     let damage = calculate_fall_damage(world, distance, multiplier)?;
-    let damage = world.modify_fall_damage(distance, damage as f32)?;
+    let damage = damage as f32;
     if damage > 0.0 {
         world.reset_impulse()?;
         let sound = world.fall_sound(damage > 4.0)?;
@@ -132,7 +128,6 @@ mod tests {
     use horizon_core::geometry::Vec3;
 
     struct Landing {
-        replacement: Option<f32>,
         damage: f32,
         sounds: usize,
     }
@@ -163,11 +158,6 @@ mod tests {
         fn fall_damage_multiplier(&mut self) -> Result<f64, ()> {
             Ok(1.0)
         }
-        fn modify_fall_damage(&mut self, distance: f64, damage: f32) -> Result<f32, ()> {
-            assert_eq!((distance, damage), (13.0, 10.0));
-            assert_eq!((self.sounds, self.damage), (0, 0.0));
-            Ok(self.replacement.unwrap_or(damage))
-        }
         fn fall_sound(&mut self, big: bool) -> Result<bool, ()> {
             Ok(big)
         }
@@ -185,20 +175,14 @@ mod tests {
         }
     }
     #[test]
-    fn landing_damage_is_changed_before_sounds_and_hurt() {
-        for (replacement, expected) in [(None, 10.0), (Some(2.0), 2.0), (Some(0.0), 0.0)] {
-            let mut w = Landing {
-                replacement,
-                damage: 0.0,
-                sounds: 0,
-            };
-            assert_eq!(
-                cause_living_fall_damage(&mut w, 13.0, 1.0),
-                Ok(expected > 0.0)
-            );
-            assert_eq!(w.damage, expected);
-            assert_eq!(w.sounds, if expected > 0.0 { 2 } else { 0 });
-        }
+    fn landing_damage_and_sounds_follow_vanilla_order() {
+        let mut w = Landing {
+            damage: 0.0,
+            sounds: 0,
+        };
+        assert_eq!(cause_living_fall_damage(&mut w, 13.0, 1.0), Ok(true));
+        assert_eq!(w.damage, 10.0);
+        assert_eq!(w.sounds, 2);
     }
 
     /// A wind charge's or mace's impact position with no grace time left.

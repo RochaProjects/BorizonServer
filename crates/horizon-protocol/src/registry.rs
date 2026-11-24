@@ -53,11 +53,6 @@ impl crate::item::Names for SyncedNames<'_> {
             .get(registry)
             .and_then(|ids| ids.name(id))
             .or_else(|| self.dynamic.name(registry, id))
-            .or_else(|| {
-                (self.dynamic.custom_components && registry == "minecraft:data_component_type")
-                    .then(|| crate::item::custom::name(id))
-                    .flatten()
-            })
             .map(str::to_owned)
     }
 }
@@ -126,8 +121,6 @@ pub struct Dynamic {
     pub registries: HashMap<String, Vec<(String, Option<Tag>)>>,
     /// The tags the server sent, by registry: each tag's entries by id.
     pub tags: HashMap<String, HashMap<String, Vec<i32>>>,
-    /// The peer confirmed the native component registry identity.
-    pub custom_components: bool,
 }
 impl Dynamic {
     /// The tags of a `ClientboundUpdateTagsPacket`, every registry's: a

@@ -291,15 +291,6 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut result = format!("case {index}\n");
         let origin = pos_of(&case["pos"]);
         match case["mode"].as_str().unwrap() {
-            "piston_event" => {
-                behaviours.client_block_event(
-                    &mut level,
-                    &mut ticks,
-                    origin,
-                    case["event"].as_i64().unwrap() as i32,
-                    case["dir"].as_i64().unwrap() as i32,
-                );
-            }
             "shape" => {
                 let dir = Direction::ALL[case["dir"].as_u64().unwrap() as usize];
                 let neighbour = BlockStateId(case["neighbor"].as_i64().unwrap() as u32);

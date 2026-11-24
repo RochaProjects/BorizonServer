@@ -235,27 +235,6 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                 }
                 Class::Note => {
                     let next = table.cycle(state, p.note);
-                    let old_note = table.int(state, p.note);
-                    let new_note = table.int(next, p.note);
-                    let instrument = table.text(state, p.instrument);
-                    let Some(note) = self
-                        .level
-                        .note_block_change(pos, instrument, old_note, new_note)
-                    else {
-                        return Success;
-                    };
-                    let next = table.set_int(
-                        next,
-                        p.note,
-                        if (0..=24).contains(&note) {
-                            note
-                        } else {
-                            new_note
-                        },
-                    );
-                    if !self.note_play_allowed(pos, next) {
-                        return Success;
-                    }
                     self.set_block_and_update(pos, next);
                     self.note_play_unchecked(pos, next);
                     Success
@@ -459,7 +438,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                 // entity is gone (`Level.getBlockEntity` null) is removed by the
                 // click on a server; one still in flight passes it on.
                 Class::MovingPiston => {
-                    if !self.level.is_client_side() && self.moving_piston(pos).is_none() {
+                    if self.moving_piston(pos).is_none() {
                         self.remove_block(pos, false);
                         // CONSUME: the action is used, the arm does not swing.
                         Consume

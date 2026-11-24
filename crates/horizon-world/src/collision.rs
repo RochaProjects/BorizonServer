@@ -14,10 +14,10 @@ use crate::{
 use horizon_core::geometry::{Axis, VoxelShape};
 use std::{collections::HashMap, io};
 
-/// `PipeBlock`'s shape for `size` pixels across (`makeShapes`): the core
-/// cube, with an arm from the centre out to each joined side (`sides` by
+/// Chorus plant's shape for `size` pixels across: the core cube, with an arm
+/// from the centre out to each joined side (`sides` by
 /// `Direction`: down, up, north, south, west, east).
-pub fn pipe_shape(size: f64, sides: [bool; 6]) -> io::Result<VoxelShape> {
+pub fn chorus_plant_shape(size: f64, sides: [bool; 6]) -> io::Result<VoxelShape> {
     use horizon_core::geometry::{Aabb, ShapeOp, Vec3};
     let (lo, hi) = ((8.0 - size / 2.0) / 16.0, (8.0 + size / 2.0) / 16.0);
     let shape = |min: [f64; 3], max: [f64; 3]| {
@@ -389,7 +389,7 @@ mod pipe_tests {
     /// `pipe_shape` at the chorus plant's 10 pixels is vanilla's own shape for
     /// each of its 64 states.
     #[test]
-    fn pipe_shapes_match_the_chorus_plant() {
+    fn chorus_plant_shapes_match_the_registry() {
         let root = std::env::var_os("HORIZON_RESOURCES")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -413,7 +413,7 @@ mod pipe_tests {
             }
             let sides = ["down", "up", "north", "south", "west", "east"]
                 .map(|k| s.properties.get(k).map(String::as_str) == Some("true"));
-            let ours = pipe_shape(10.0, sides).unwrap();
+            let ours = chorus_plant_shape(10.0, sides).unwrap();
             let theirs = cached.cached_shape(state).unwrap().unwrap();
             assert!(
                 !ours.join_is_not_empty(theirs, ShapeOp::XOR).unwrap(),

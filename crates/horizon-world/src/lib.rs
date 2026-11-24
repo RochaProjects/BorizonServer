@@ -3,7 +3,6 @@
 
 pub mod active_effect_tick;
 pub mod active_effects;
-pub mod attachments;
 pub mod attribute_health;
 pub mod attribute_map;
 pub mod attribute_updates;
@@ -30,7 +29,6 @@ pub mod combat_rules;
 pub mod component_durability;
 pub mod component_patch;
 pub mod compression;
-pub mod conditions;
 pub mod consumable;
 pub mod consume_effect;
 pub mod damage_immunity;

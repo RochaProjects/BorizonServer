@@ -319,6 +319,25 @@ mod tests {
     }
 
     #[test]
+    fn default_border_save_leaves_existing_file_unchanged_like_reference() {
+        let world = TempWorld::new();
+        let store = world.store();
+        let dimension = "minecraft:overworld";
+        let mut saved = WorldBorder::default();
+        saved.set_center([13.5, -8.25]);
+        store.save_world_border(dimension, &saved).unwrap();
+        let path = store.world_border_path(dimension).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        store
+            .save_world_border(dimension, &WorldBorder::default())
+            .unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(store.load_world_border(dimension).unwrap(), saved);
+    }
+
+    #[test]
     fn only_overworld_uses_the_legacy_root_border_file() {
         let world = TempWorld::new();
         let store = world.store();

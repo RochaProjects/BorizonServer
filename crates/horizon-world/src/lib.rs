@@ -134,6 +134,7 @@ pub mod ticket_levels;
 pub mod use_remainder;
 pub mod view_direction;
 pub mod water_splash;
+pub mod weather;
 pub mod world_border;
 pub mod world_movement;
 pub mod world_ray;

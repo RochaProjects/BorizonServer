@@ -12,7 +12,7 @@ use crate::{
     },
     gamerules::GameRules,
     identifier::Identifier,
-    nbt::{Compound, Tag},
+    nbt::{Compound, JavaString, Tag},
     scoreboard::Scoreboard,
     weather::Weather,
     world_border::WorldBorder,
@@ -48,6 +48,23 @@ impl WorldSavedData {
     /// The world-global `data/minecraft/weather.dat`.
     pub fn weather_path(&self) -> PathBuf {
         self.world_root.join("data/minecraft/weather.dat")
+    }
+
+    /// The world-global `data/minecraft/world_clocks.dat`.
+    pub fn world_clocks_path(&self) -> PathBuf {
+        self.world_root.join("data/minecraft/world_clocks.dat")
+    }
+
+    /// Load vanilla total-tick counters keyed by dimension identifier.
+    pub fn load_world_clocks(&self) -> io::Result<WorldClocks> {
+        let data = read_saved_data(&self.world_clocks_path(), Ty::SavedWorldClocks)?
+            .unwrap_or_else(empty_compound);
+        Ok(WorldClocks { data })
+    }
+
+    /// Save per-dimension counters with the current data version.
+    pub fn save_world_clocks(&self, clocks: &WorldClocks) -> io::Result<()> {
+        write_saved_data(&self.world_clocks_path(), clocks.data.clone())
     }
 
     /// Load vanilla weather timers and targets, defaulting when the file or
@@ -163,6 +180,56 @@ impl WorldSavedData {
             return Ok(());
         }
         write_saved_data(&path, border.pack())
+    }
+}
+
+/// Saved total-tick counters for dimensions in one vanilla world.
+///
+/// Unknown fields and dimension entries remain opaque and are retained when a
+/// known counter is updated, so newer SavedData survives an older server round-trip.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorldClocks {
+    data: Tag,
+}
+
+impl Default for WorldClocks {
+    fn default() -> Self {
+        Self {
+            data: empty_compound(),
+        }
+    }
+}
+
+impl WorldClocks {
+    /// The saved total ticks for a dimension, if that entry has a numeric value.
+    pub fn total_ticks(&self, dimension: &str) -> Option<i64> {
+        match self.data.get(dimension)?.get("total_ticks")? {
+            Tag::Byte(value) => Some(i64::from(*value)),
+            Tag::Short(value) => Some(i64::from(*value)),
+            Tag::Int(value) => Some(i64::from(*value)),
+            Tag::Long(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// Set one dimension's vanilla total-tick counter without discarding
+    /// unrelated dimensions or unknown fields in its entry.
+    pub fn set_total_ticks(&mut self, dimension: impl Into<String>, total_ticks: i64) {
+        let key = dimension.into();
+        if !matches!(&self.data, Tag::Compound(_)) {
+            self.data = empty_compound();
+        }
+        let Tag::Compound(data) = &mut self.data else {
+            unreachable!()
+        };
+        let entry = data
+            .entry(JavaString::from(key.as_str()))
+            .or_insert_with(empty_compound);
+        if let Tag::Compound(fields) = entry {
+            fields.insert("total_ticks".into(), Tag::Long(total_ticks));
+        } else {
+            *entry = Tag::compound([("total_ticks", Tag::Long(total_ticks))]);
+        }
     }
 }
 
@@ -351,6 +418,83 @@ mod tests {
 
         assert_eq!(store.load_weather().unwrap(), Weather::default());
         assert!(!store.weather_path().exists());
+    }
+
+    #[test]
+    fn world_clocks_round_trip_per_dimension_and_preserve_unknown_data() {
+        let world = TempWorld::new();
+        let store = world.store();
+        write_dat(
+            &store.world_clocks_path(),
+            &Tag::compound([
+                (
+                    "data",
+                    Tag::compound([
+                        (
+                            "minecraft:overworld",
+                            Tag::compound([
+                                ("total_ticks", Tag::Long(9001)),
+                                ("future_field", Tag::Byte(7)),
+                            ]),
+                        ),
+                        (
+                            "minecraft:the_end",
+                            Tag::compound([("total_ticks", Tag::Long(1234))]),
+                        ),
+                        (
+                            "example:extra/dimension",
+                            Tag::compound([("future_counter", Tag::Int(55))]),
+                        ),
+                    ]),
+                ),
+                ("DataVersion", Tag::Int(DATA_VERSION)),
+            ]),
+        )
+        .unwrap();
+
+        let mut clocks = store.load_world_clocks().unwrap();
+        assert_eq!(clocks.total_ticks("minecraft:overworld"), Some(9001));
+        assert_eq!(clocks.total_ticks("minecraft:the_end"), Some(1234));
+        assert_eq!(clocks.total_ticks("example:extra/dimension"), None);
+        clocks.set_total_ticks("minecraft:overworld", 9002);
+        clocks.set_total_ticks("minecraft:the_nether", 77);
+        store.save_world_clocks(&clocks).unwrap();
+
+        let root = read_dat(&store.world_clocks_path()).unwrap().unwrap();
+        assert_eq!(root.get("DataVersion"), Some(&Tag::Int(DATA_VERSION)));
+        let data = root.get("data").unwrap();
+        assert_eq!(clocks.total_ticks("minecraft:overworld"), Some(9002));
+        assert_eq!(
+            data.get("minecraft:overworld")
+                .and_then(|entry| entry.get("future_field")),
+            Some(&Tag::Byte(7))
+        );
+        assert_eq!(
+            data.get("minecraft:the_end")
+                .and_then(|entry| entry.get("total_ticks")),
+            Some(&Tag::Long(1234))
+        );
+        assert_eq!(
+            data.get("example:extra/dimension")
+                .and_then(|entry| entry.get("future_counter")),
+            Some(&Tag::Int(55))
+        );
+        assert_eq!(
+            store
+                .load_world_clocks()
+                .unwrap()
+                .total_ticks("minecraft:the_nether"),
+            Some(77)
+        );
+    }
+
+    #[test]
+    fn missing_world_clocks_saved_data_is_empty() {
+        let world = TempWorld::new();
+        let store = world.store();
+
+        assert_eq!(store.load_world_clocks().unwrap(), WorldClocks::default());
+        assert!(!store.world_clocks_path().exists());
     }
 
     #[test]

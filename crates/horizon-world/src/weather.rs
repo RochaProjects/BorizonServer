@@ -53,6 +53,22 @@ impl Weather {
         }
     }
 
+    /// Aplica os valores de `ServerLevel.setWeatherParameters` depois que o
+    /// chamador validar o comando e escolher a duração vanilla.
+    pub fn set_parameters(
+        &mut self,
+        clear_time: i32,
+        weather_time: i32,
+        raining: bool,
+        thundering: bool,
+    ) {
+        self.clear_time = clear_time;
+        self.rain_time = weather_time;
+        self.thunder_time = weather_time;
+        self.raining = raining;
+        self.thundering = thundering;
+    }
+
     /// Avança um passo dos níveis interpolados de chuva e trovão.
     pub fn tick_levels(&mut self) {
         self.thunder_level.0 = self.thunder_level.1;
@@ -116,6 +132,30 @@ mod tests {
         assert!((12000..=24000).contains(&weather.rain_time));
         assert!(weather.raining);
         assert!(weather.thundering);
+    }
+
+    #[test]
+    fn set_parameters_updates_vanilla_state_without_snapping_levels() {
+        let mut weather = Weather {
+            rain_level: (0.2, 0.4),
+            thunder_level: (0.1, 0.3),
+            ..Weather::default()
+        };
+
+        weather.set_parameters(20, 600, true, true);
+
+        assert_eq!(
+            (
+                weather.clear_time,
+                weather.rain_time,
+                weather.thunder_time,
+                weather.raining,
+                weather.thundering,
+            ),
+            (20, 600, 600, true, true)
+        );
+        assert_eq!(weather.rain_level, (0.2, 0.4));
+        assert_eq!(weather.thunder_level, (0.1, 0.3));
     }
 
     #[test]

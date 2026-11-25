@@ -14,6 +14,7 @@ use crate::{
     identifier::Identifier,
     nbt::{Compound, Tag},
     scoreboard::Scoreboard,
+    weather::Weather,
     world_border::WorldBorder,
 };
 use std::{
@@ -42,6 +43,51 @@ impl WorldSavedData {
     /// The world-global `data/minecraft/game_rules.dat`.
     pub fn game_rules_path(&self) -> PathBuf {
         self.world_root.join("data/minecraft/game_rules.dat")
+    }
+
+    /// The world-global `data/minecraft/weather.dat`.
+    pub fn weather_path(&self) -> PathBuf {
+        self.world_root.join("data/minecraft/weather.dat")
+    }
+
+    /// Load vanilla weather timers and targets, defaulting when the file or
+    /// `data` compound is absent. Fade levels are initialized to their targets.
+    pub fn load_weather(&self) -> io::Result<Weather> {
+        let data =
+            read_saved_data(&self.weather_path(), Ty::SavedWeather)?.unwrap_or_else(empty_compound);
+        let number = |key: &str| match data.get(key) {
+            Some(Tag::Byte(value)) => i64::from(*value),
+            Some(Tag::Short(value)) => i64::from(*value),
+            Some(Tag::Int(value)) => i64::from(*value),
+            Some(Tag::Long(value)) => *value,
+            _ => 0,
+        };
+        let raining = number("raining") != 0;
+        let thundering = number("thundering") != 0;
+        Ok(Weather {
+            clear_time: number("clear_weather_time") as i32,
+            rain_time: number("rain_time") as i32,
+            thunder_time: number("thunder_time") as i32,
+            raining,
+            thundering,
+            rain_level: if raining { (1.0, 1.0) } else { (0.0, 0.0) },
+            thunder_level: if thundering { (1.0, 1.0) } else { (0.0, 0.0) },
+        })
+    }
+
+    /// Save the world-global vanilla weather fields with the current data version.
+    /// Interpolated fade levels are runtime state and are not serialized.
+    pub fn save_weather(&self, weather: &Weather) -> io::Result<()> {
+        write_saved_data(
+            &self.weather_path(),
+            Tag::compound([
+                ("clear_weather_time", Tag::Int(weather.clear_time)),
+                ("rain_time", Tag::Int(weather.rain_time)),
+                ("thunder_time", Tag::Int(weather.thunder_time)),
+                ("raining", Tag::Byte(i8::from(weather.raining))),
+                ("thundering", Tag::Byte(i8::from(weather.thundering))),
+            ]),
+        )
     }
 
     /// Load game rules for this world's enabled feature set.
@@ -258,6 +304,53 @@ mod tests {
                 .and_then(|data| data.get("minecraft:keep_inventory")),
             Some(&Tag::Byte(1))
         );
+    }
+
+    #[test]
+    fn weather_round_trips_as_world_global_saved_data() {
+        let world = TempWorld::new();
+        let store = world.store();
+        let weather = Weather {
+            clear_time: 31,
+            rain_time: 1200,
+            thunder_time: 2400,
+            raining: true,
+            thundering: false,
+            rain_level: (0.25, 0.75),
+            thunder_level: (0.1, 0.6),
+        };
+
+        store.save_weather(&weather).unwrap();
+
+        let loaded = store.load_weather().unwrap();
+        assert_eq!(loaded.clear_time, weather.clear_time);
+        assert_eq!(loaded.rain_time, weather.rain_time);
+        assert_eq!(loaded.thunder_time, weather.thunder_time);
+        assert_eq!(loaded.raining, weather.raining);
+        assert_eq!(loaded.thundering, weather.thundering);
+        assert_eq!(loaded.rain_level, (1.0, 1.0));
+        assert_eq!(loaded.thunder_level, (0.0, 0.0));
+
+        let root = read_dat(&store.weather_path()).unwrap().unwrap();
+        assert_eq!(root.get("DataVersion"), Some(&Tag::Int(DATA_VERSION)));
+        assert_eq!(
+            root.get("data")
+                .and_then(|data| data.get("clear_weather_time")),
+            Some(&Tag::Int(31))
+        );
+        assert_eq!(
+            root.get("data").and_then(|data| data.get("raining")),
+            Some(&Tag::Byte(1))
+        );
+    }
+
+    #[test]
+    fn missing_weather_saved_data_uses_vanilla_defaults() {
+        let world = TempWorld::new();
+        let store = world.store();
+
+        assert_eq!(store.load_weather().unwrap(), Weather::default());
+        assert!(!store.weather_path().exists());
     }
 
     #[test]

@@ -10,6 +10,7 @@ use crate::{
         schema::Ty,
         update_saved_data,
     },
+    gamerules::GameRules,
     identifier::Identifier,
     nbt::{Compound, Tag},
     scoreboard::Scoreboard,
@@ -36,6 +37,26 @@ impl WorldSavedData {
     /// The world-global `data/minecraft/scoreboard.dat`.
     pub fn scoreboard_path(&self) -> PathBuf {
         self.world_root.join("data/minecraft/scoreboard.dat")
+    }
+
+    /// The world-global `data/minecraft/game_rules.dat`.
+    pub fn game_rules_path(&self) -> PathBuf {
+        self.world_root.join("data/minecraft/game_rules.dat")
+    }
+
+    /// Load game rules for this world's enabled feature set.
+    pub fn load_game_rules(&self, features: &[String]) -> io::Result<GameRules> {
+        let data = read_saved_data(&self.game_rules_path(), Ty::SavedGameRules)?
+            .unwrap_or_else(empty_compound);
+        let root = Tag::compound([("data", data)]);
+        Ok(GameRules::from_nbt_with_features(&root, features))
+    }
+
+    /// Save game rules with the current data version in vanilla SavedData form.
+    pub fn save_game_rules(&self, rules: &GameRules) -> io::Result<()> {
+        let root = rules.to_nbt().tag;
+        let data = root.get("data").cloned().unwrap_or_else(empty_compound);
+        write_saved_data(&self.game_rules_path(), data)
     }
 
     /// This dimension's `data/minecraft/world_border.dat`.
@@ -153,7 +174,11 @@ fn empty_compound() -> Tag {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{scoreboard::RenderType, world_border::MAX_SIZE};
+    use crate::{
+        gamerules::{MINECART_IMPROVEMENTS, Value},
+        scoreboard::RenderType,
+        world_border::MAX_SIZE,
+    };
     use std::{
         fs,
         sync::atomic::{AtomicUsize, Ordering},
@@ -205,6 +230,34 @@ mod tests {
         let root = read_dat(&store.scoreboard_path()).unwrap().unwrap();
         assert_eq!(root.get("DataVersion"), Some(&Tag::Int(DATA_VERSION)));
         assert!(root.get("data").is_some());
+    }
+
+    #[test]
+    fn game_rules_round_trip_as_feature_aware_world_saved_data() {
+        let world = TempWorld::new();
+        let store = world.store();
+        let features = vec![MINECART_IMPROVEMENTS.to_owned()];
+        let mut rules = GameRules::with_features(&features);
+        assert!(rules.set("keep_inventory", Value::Bool(true)));
+        assert!(rules.set("max_minecart_speed", Value::Int(24)));
+
+        store.save_game_rules(&rules).unwrap();
+        assert_eq!(store.load_game_rules(&features).unwrap(), rules);
+        assert_eq!(
+            store
+                .load_game_rules(&[])
+                .unwrap()
+                .get("max_minecart_speed"),
+            None
+        );
+
+        let root = read_dat(&store.game_rules_path()).unwrap().unwrap();
+        assert_eq!(root.get("DataVersion"), Some(&Tag::Int(DATA_VERSION)));
+        assert_eq!(
+            root.get("data")
+                .and_then(|data| data.get("minecraft:keep_inventory")),
+            Some(&Tag::Byte(1))
+        );
     }
 
     #[test]

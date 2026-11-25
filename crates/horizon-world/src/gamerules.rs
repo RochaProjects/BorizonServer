@@ -1,12 +1,12 @@
 //! Game rules (26.3 `GameRules`): the registered rules with their category,
 //! type, default and bounds, a value map, and persistence in the world's
 //! `data/minecraft/game_rules.dat` saved-data file.
+use crate::world_saved_data::WorldSavedData;
 use crate::{
     DATA_VERSION,
-    compression::Compression,
-    nbt::{self, JavaString, Limits, NamedTag, Tag},
+    nbt::{JavaString, NamedTag, Tag},
 };
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{collections::BTreeMap, path::Path};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Value {
@@ -271,33 +271,19 @@ impl GameRules {
         Self::load_with_features(world, &[])
     }
     pub fn load_with_features(world: &Path, features: &[String]) -> Self {
-        let Ok(bytes) = fs::read(world.join("data/minecraft/game_rules.dat")) else {
-            return Self::with_features(features);
-        };
-        let Ok(raw) = Compression::Gzip.decode(&bytes, 16 << 20) else {
-            return Self::with_features(features);
-        };
-        match nbt::read_named(&raw, Limits::default()) {
-            Ok((root, _)) => Self::from_nbt_with_features(&root.tag, features),
-            Err(_) => Self::with_features(features),
-        }
+        WorldSavedData::new(world)
+            .load_game_rules(features)
+            .unwrap_or_else(|_| Self::with_features(features))
     }
     pub fn save(&self, world: &Path) -> std::io::Result<()> {
-        let dir = world.join("data/minecraft");
-        fs::create_dir_all(&dir)?;
-        let bytes = nbt::write_named(&self.to_nbt(), Limits::default())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-        fs::write(
-            dir.join("game_rules.dat"),
-            Compression::Gzip.encode(&bytes)?,
-        )?;
-        Ok(())
+        WorldSavedData::new(world).save_game_rules(self)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     struct RuleLevel {
         rules: GameRules,

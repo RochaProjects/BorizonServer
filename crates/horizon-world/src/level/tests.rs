@@ -4296,6 +4296,13 @@ fn world_dimension_inserts_generated_chunk_data_as_dirty_and_rejects_duplicates(
         properties: BlockProperties::new(),
     };
     let generated = saved_test_chunk(position, -4, &state);
+    let mut generated_root = generated.into_nbt();
+    let Tag::Compound(fields) = &mut generated_root.tag else {
+        unreachable!();
+    };
+    fields.insert("Status".into(), Tag::String("minecraft:terrain".into()));
+    fields.insert("isLightOn".into(), Tag::Byte(0));
+    let generated = crate::chunk::ChunkData::new(generated_root).unwrap();
     let dimension = world.dimension_mut("minecraft:overworld").unwrap();
     assert!(
         dimension
@@ -4310,6 +4317,54 @@ fn world_dimension_inserts_generated_chunk_data_as_dirty_and_rejects_duplicates(
             .insert_generated_chunk(generated, 0, |_| None, |_| None)
             .unwrap()
     );
+    let report = world
+        .save_dirty_chunks(
+            1,
+            crate::compression::Compression::Zlib,
+            123,
+            crate::nbt::Limits::saved(),
+            |_| None,
+            |_| None,
+        )
+        .unwrap();
+    assert_eq!(report.saved, 1);
+    assert_eq!(report.remaining_dirty, 0);
+    assert_eq!(
+        world
+            .dimension("minecraft:overworld")
+            .unwrap()
+            .active_chunk_data(position)
+            .unwrap()
+            .root()
+            .tag
+            .get("Status"),
+        Some(&Tag::String("minecraft:terrain".into()))
+    );
+    world.sync_regions().unwrap();
     drop(world);
+
+    let mut reopened = crate::world_runtime::LocalWorldRuntime::open(&root, &[]).unwrap();
+    let dimension = ResidentDimension::new(
+        "minecraft:overworld",
+        ResidentLevel::new(&registry, -64, 384, 42).unwrap(),
+        Ticks::new(0),
+    );
+    assert!(reopened.add_dimension(dimension).unwrap());
+    let dimension = reopened.dimension_mut("minecraft:overworld").unwrap();
+    assert!(
+        dimension
+            .load_chunk_from_region(position, crate::nbt::Limits::saved(), 0, |_| None, |_| None,)
+            .unwrap()
+    );
+    assert_eq!(
+        dimension
+            .active_chunk_data(position)
+            .unwrap()
+            .root()
+            .tag
+            .get("Status"),
+        Some(&Tag::String("minecraft:terrain".into()))
+    );
+    drop(reopened);
     std::fs::remove_dir_all(root).unwrap();
 }

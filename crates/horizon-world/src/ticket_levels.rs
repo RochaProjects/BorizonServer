@@ -36,8 +36,10 @@ use std::sync::Arc;
 /// `ChunkLevel`'s levels.
 pub const ENTITY_TICKING: u8 = 31;
 pub const BLOCK_TICKING: u8 = 32;
-/// What a chunk with no ticket near it has (`FULL` and above count as none).
-const NONE: (u8, u8) = (BLOCK_TICKING + 1, BLOCK_TICKING + 1);
+/// `FullChunkStatus::FULL`: loaded and accessible, but not block-ticking.
+pub const FULL: u8 = BLOCK_TICKING + 1;
+/// What a chunk with no ticket near it has (`INACCESSIBLE` and above count as none).
+const NONE: (u8, u8) = (FULL + 1, FULL + 1);
 
 /// `TicketType.PORTAL`'s timeout, in ticks.
 const PORTAL_TIMEOUT: i64 = 300;
@@ -68,8 +70,8 @@ pub struct Sources {
     pub simulation_distance: i32,
 }
 
-/// Each chunk's (loading, simulation) level, for the chunks where either is
-/// block ticking or lower; `None` ticks everywhere (a game with no server and
+/// Each chunk's (loading, simulation) level, for the chunks where loading is
+/// fully loaded or lower; `None` ticks everywhere (a game with no server and
 /// no player: the headless fixtures). With them sits the box
 /// `(min_x, min_z, max_x, max_z)` that holds every chunk that can random tick,
 /// so a scan of the residents need not ask each one of them.
@@ -136,7 +138,7 @@ impl Tiled {
         for &p in &s.forced {
             map.add(
                 p,
-                1,
+                2,
                 i32::from(ENTITY_TICKING),
                 0,
                 i32::from(ENTITY_TICKING),
@@ -147,7 +149,7 @@ impl Tiled {
         }
         if let Some(arena) = s.dragon {
             // The same for the ring at the ticket's own radius.
-            map.add(arena, ARENA_RADIUS - 1, ARENA_LEVEL, 0, ARENA_LEVEL);
+            map.add(arena, ARENA_RADIUS, ARENA_LEVEL, 0, ARENA_LEVEL);
         }
         map
     }
@@ -226,6 +228,11 @@ impl Levels {
     /// ticking future can complete (its saved ticks unpack then).
     pub fn loaded_ticking(&self, x: i32, z: i32) -> bool {
         self.get(x, z).is_none_or(|(l, _)| l <= BLOCK_TICKING)
+    }
+    /// `FullChunkStatus::FULL`: loaded and accessible, even when not ticking.
+    /// No ticket source (`None`) remains the headless mode that ticks everywhere.
+    pub fn fully_loaded(&self, x: i32, z: i32) -> bool {
+        self.get(x, z).is_none_or(|(loading, _)| loading <= FULL)
     }
     /// The same as [`Self::entity_ticking`] at a block position.
     pub fn entity_ticking_at(&self, x: i32, z: i32) -> bool {
@@ -357,10 +364,10 @@ impl ChunkTickets {
     }
 }
 
-/// How far a ticket of `level` reaches with levels of `BLOCK_TICKING` or
-/// lower: one more a chunk away, and `FULL` (33) and above count as none.
+/// How far a ticket of `level` reaches with levels of `FULL` or lower: one
+/// more a chunk away, and `INACCESSIBLE` (34) and above count as none.
 fn ticket_radius(level: i32) -> i32 {
-    (i32::from(BLOCK_TICKING) - level).max(0)
+    (i32::from(FULL) - level).max(0)
 }
 
 /// The box that holds every chunk `random_ticking` can answer for: a player's
@@ -398,7 +405,7 @@ fn reach(s: &Sources) -> (i32, i32, i32) {
     // PLAYER_LOADING within the view distance, PLAYER_SIMULATION at the
     // player's chunk (`getPlayerTicketLevel`: never below 0).
     let player_sim = (i32::from(ENTITY_TICKING) - simulation).max(0);
-    let reach = (view + 1).max(i32::from(BLOCK_TICKING) - player_sim);
+    let reach = (view + 2).max(i32::from(FULL) - player_sim);
     (view, player_sim, reach)
 }
 
@@ -408,7 +415,7 @@ fn compute(s: &Sources) -> Map {
         .players
         .iter()
         .map(|&p| (p, reach))
-        .chain(s.forced.iter().map(|&f| (f, 1)))
+        .chain(s.forced.iter().map(|&f| (f, 2)))
         .chain(s.portal.iter().map(|&(p, level)| (p, ticket_radius(level))))
         .chain(s.dragon.map(|arena| (arena, ARENA_RADIUS)));
     let Some((x0, z0, x1, z1)) = boxes.fold(None, |b, ((x, z), r)| {
@@ -451,8 +458,8 @@ fn compute(s: &Sources) -> Map {
         }
     }
     for &(fx, fz) in &s.forced {
-        for dz in -1i32..=1 {
-            for dx in -1i32..=1 {
+        for dz in -2i32..=2 {
+            for dx in -2i32..=2 {
                 let level = i32::from(ENTITY_TICKING) + dx.abs().max(dz.abs());
                 lower(fx + dx, fz + dz, level, level);
             }
@@ -507,8 +514,8 @@ fn compute_sparse(s: &Sources) -> FxHashMap<(i32, i32), (u8, u8)> {
         }
     }
     for &(fx, fz) in &s.forced {
-        for dz in -1i32..=1 {
-            for dx in -1i32..=1 {
+        for dz in -2i32..=2 {
+            for dx in -2i32..=2 {
                 let level = i32::from(ENTITY_TICKING) + dx.abs().max(dz.abs());
                 lower((fx + dx, fz + dz), level, level);
             }
@@ -555,12 +562,13 @@ mod tests {
     #[test]
     fn simulation_distance_inside_the_view() {
         // view 8, simulation 4: entities and random ticks out to 4 chunks,
-        // scheduled ticks out to 5.
+        // scheduled ticks out to 5, and FULL status out to view+2.
         let l = levels(&[(0, 0)], &[], 8, 4);
         assert!(l.entity_ticking(4, -4) && !l.entity_ticking(5, 0));
         assert!(l.random_ticking(-4, 4) && !l.random_ticking(0, 5));
         assert!(l.block_ticking(5, 5) && !l.block_ticking(6, 0));
         assert!(l.loaded_ticking(9, 9) && !l.loaded_ticking(10, 0));
+        assert!(l.fully_loaded(10, 10) && !l.fully_loaded(11, 0));
         // A command asks the loading status, not the smaller simulation area.
         assert!(l.loaded_entity_ticking(8, 8));
         assert!(!l.loaded_entity_ticking(9, 0));
@@ -586,9 +594,11 @@ mod tests {
         let l = levels(&[(0, 0), (40, 0)], &[(-100, 7)], 4, 4);
         assert!(l.entity_ticking(44, 0) && l.entity_ticking(0, -4));
         assert!(!l.entity_ticking(20, 0));
-        // A forced chunk entity ticks, its neighbours only block tick.
+        // A forced chunk entity ticks; neighbours only block tick, and the
+        // next ring remains loaded at FULL without ticking.
         assert!(l.entity_ticking(-100, 7) && !l.entity_ticking(-101, 7));
         assert!(l.block_ticking(-101, 8) && !l.block_ticking(-102, 7));
+        assert!(l.fully_loaded(-102, 7) && !l.fully_loaded(-103, 7));
         assert!(!l.random_ticking(-101, 7));
         assert!(l.entity_ticking_at(-1600, 112) && !l.block_ticking_at(-1617, 112));
     }
@@ -597,8 +607,10 @@ mod tests {
     fn no_tickets_tick_nothing_and_no_sources_everything() {
         let none = levels(&[], &[], 10, 10);
         assert!(!none.block_ticking(0, 0) && !none.entity_ticking(0, 0));
+        assert!(!none.fully_loaded(0, 0));
         let everywhere = ChunkTickets::default().levels();
         assert!(everywhere.random_ticking(1000, -1000));
+        assert!(everywhere.fully_loaded(1000, -1000));
     }
 
     /// `EnderDragonFight.tick` holds the arena's `TicketType.DRAGON` ticket

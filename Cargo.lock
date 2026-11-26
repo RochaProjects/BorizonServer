@@ -193,7 +193,11 @@ dependencies = [
 name = "horizon-engine"
 version = "0.1.0"
 dependencies = [
+ "horizon-core",
+ "horizon-protocol",
  "horizon-server-files",
+ "horizon-world",
+ "serde_json",
 ]
 
 [[package]]

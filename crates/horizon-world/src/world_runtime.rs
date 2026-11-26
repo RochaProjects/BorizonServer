@@ -684,6 +684,48 @@ impl<'registry> LocalWorldRuntime<'registry> {
         Ok(true)
     }
 
+    /// Save at most `budget` dirty chunks across registered dimensions. The
+    /// `BTreeMap` dimension order is stable, followed by each dimension's
+    /// coordinate order; this is a caller-triggered sweep, not autosave.
+    /// Earlier dimensions may already be durable if a later save returns an
+    /// error, while unsaved chunks remain dirty for a retry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_dirty_chunks(
+        &mut self,
+        budget: usize,
+        compression: Compression,
+        timestamp: u32,
+        limits: Limits,
+        mut block_name: impl FnMut(TickTypeId) -> Option<String>,
+        mut fluid_name: impl FnMut(TickTypeId) -> Option<String>,
+    ) -> io::Result<DirtyChunkSaveReport> {
+        let game_time = self.game_time;
+        let mut remaining_budget = budget;
+        let mut saved = 0;
+        for dimension in self.dimensions.values_mut() {
+            let report = dimension.save_dirty_chunks(
+                remaining_budget,
+                compression,
+                timestamp,
+                limits,
+                game_time,
+                &mut block_name,
+                &mut fluid_name,
+            )?;
+            saved += report.saved;
+            remaining_budget = remaining_budget.saturating_sub(report.saved);
+        }
+        let remaining_dirty = self
+            .dimensions
+            .values()
+            .map(|dimension| dimension.resident().dirty_chunks().len())
+            .sum();
+        Ok(DirtyChunkSaveReport {
+            saved,
+            remaining_dirty,
+        })
+    }
+
     /// Persist world-global SavedData and the borders/clocks of registered
     /// dimensions. Dirty chunks use the explicit chunk-level save contract and
     /// `sync_regions` provides an aggregate shutdown flush.

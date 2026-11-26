@@ -1,5 +1,5 @@
 //! Version-specific noise, density registry and terrain-router JSON decoding.
-//! Complete terrain generation remains pending.
+//! Terrain stages exist; integration with saved chunk lifecycle/finalization remains pending.
 pub mod anchor;
 pub mod aquifer;
 pub mod bamboo;

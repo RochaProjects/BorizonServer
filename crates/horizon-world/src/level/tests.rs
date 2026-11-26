@@ -1109,6 +1109,10 @@ fn local_world_runtime_owns_region_chunk_load_save_and_reopen() {
         dimension.resident_mut().level_mut().set_raw(block, stone),
         Some(registry.default_state("minecraft:air").unwrap())
     );
+    dimension.resident_mut().update_chunk_tickets(None);
+    let headless_owned = dimension.lifecycle_candidates(1).unwrap();
+    assert!(headless_owned.headless_unbounded);
+    assert_eq!(headless_owned.candidates, vec![chunk]);
     dimension
         .resident_mut()
         .update_chunk_tickets(Some(crate::ticket_levels::Sources::default()));
@@ -1199,6 +1203,10 @@ fn local_world_runtime_owns_region_chunk_load_save_and_reopen() {
         dimension.lifecycle_candidates(1).unwrap().candidates,
         vec![chunk]
     );
+    dimension.resident_mut().update_chunk_tickets(None);
+    let headless_parked = dimension.lifecycle_candidates(1).unwrap();
+    assert!(headless_parked.headless_unbounded);
+    assert_eq!(headless_parked.candidates, vec![chunk]);
     assert!(dimension.resident().chunk_save_revision(chunk).is_none());
     assert!(!dimension.park_chunk(chunk));
     assert_eq!(dimension.parked_chunk_count(), 1);
@@ -1480,6 +1488,126 @@ fn world_dimension_saves_dirty_chunks_in_budgeted_durable_sweeps() {
             crate::chunk::ChunkData::new(record.nbt(crate::nbt::Limits::saved()).unwrap()).unwrap();
         assert_eq!(data.block(block).unwrap().unwrap().name, "minecraft:stone");
     }
+    world.sync_regions().unwrap();
+    drop(world);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn local_world_runtime_saves_dirty_chunks_in_a_shared_dimension_budget() {
+    let registry = tiny_block_registry();
+    let root = std::env::temp_dir().join(format!(
+        "horizon-world-dirty-save-budget-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let chunk = ChunkPos::new(0, 0);
+    let air = BlockState {
+        name: "minecraft:air".to_owned(),
+        properties: BlockProperties::new(),
+    };
+    for (directory, section_y) in [
+        (root.join("region"), 0),
+        (root.join("dimensions/minecraft/the_nether/region"), 0),
+    ] {
+        std::fs::create_dir_all(&directory).unwrap();
+        let data = saved_test_chunk(chunk, section_y, &air);
+        let record = crate::region::ChunkRecord::from_nbt(
+            data.root(),
+            crate::compression::Compression::Zlib,
+            1,
+            crate::nbt::Limits::saved(),
+        )
+        .unwrap();
+        let mut region =
+            crate::region::RegionFile::open_writable(directory.join("r.0.0.mca"), true).unwrap();
+        region.write(chunk, &record).unwrap();
+        region.sync().unwrap();
+    }
+
+    let mut world = crate::world_runtime::LocalWorldRuntime::open(&root, &[]).unwrap();
+    assert!(
+        world
+            .add_dimension(ResidentDimension::new(
+                "minecraft:overworld",
+                ResidentLevel::new(&registry, -64, 384, 42).unwrap(),
+                Ticks::new(0),
+            ))
+            .unwrap()
+    );
+    assert!(
+        world
+            .add_dimension(ResidentDimension::new(
+                "minecraft:the_nether",
+                ResidentLevel::new(&registry, 0, 256, 43).unwrap(),
+                Ticks::new(0),
+            ))
+            .unwrap()
+    );
+    for key in ["minecraft:overworld", "minecraft:the_nether"] {
+        assert!(
+            world
+                .dimension_mut(key)
+                .unwrap()
+                .load_chunk_from_region(chunk, crate::nbt::Limits::saved(), 0, |_| None, |_| None)
+                .unwrap()
+        );
+    }
+    let stone = registry.default_state("minecraft:stone").unwrap();
+    for (key, block) in [
+        ("minecraft:overworld", BlockPos::new(0, -64, 0)),
+        ("minecraft:the_nether", BlockPos::new(0, 0, 0)),
+    ] {
+        assert_eq!(
+            world
+                .dimension_mut(key)
+                .unwrap()
+                .resident_mut()
+                .level_mut()
+                .set_raw(block, stone),
+            Some(registry.default_state("minecraft:air").unwrap())
+        );
+    }
+
+    let first = world
+        .save_dirty_chunks(
+            1,
+            crate::compression::Compression::Zlib,
+            10,
+            crate::nbt::Limits::saved(),
+            |_| None,
+            |_| None,
+        )
+        .unwrap();
+    assert_eq!(first.saved, 1);
+    assert_eq!(first.remaining_dirty, 1);
+    assert!(
+        !world
+            .dimension("minecraft:overworld")
+            .unwrap()
+            .resident()
+            .is_chunk_dirty(chunk)
+    );
+    assert!(
+        world
+            .dimension("minecraft:the_nether")
+            .unwrap()
+            .resident()
+            .is_chunk_dirty(chunk)
+    );
+
+    let second = world
+        .save_dirty_chunks(
+            1,
+            crate::compression::Compression::Zlib,
+            11,
+            crate::nbt::Limits::saved(),
+            |_| None,
+            |_| None,
+        )
+        .unwrap();
+    assert_eq!(second.saved, 1);
+    assert_eq!(second.remaining_dirty, 0);
     world.sync_regions().unwrap();
     drop(world);
     std::fs::remove_dir_all(root).unwrap();

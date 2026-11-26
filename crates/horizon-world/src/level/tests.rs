@@ -1052,16 +1052,24 @@ fn local_world_runtime_owns_region_chunk_load_save_and_reopen() {
             .unwrap()
     );
     let dimension = world.dimension_mut("minecraft:overworld").unwrap();
-    data = dimension
-        .load_chunk_from_region(
-            chunk,
+    dimension
+        .resident_mut()
+        .update_chunk_tickets(Some(crate::ticket_levels::Sources {
+            forced: vec![(chunk.x, chunk.z)],
+            ..Default::default()
+        }));
+    let missing_chunk = ChunkPos::new(chunk.x - 1, chunk.z);
+    let loaded = dimension
+        .reconcile_ticketed_chunks(
+            [chunk, chunk, missing_chunk],
             crate::nbt::Limits::saved(),
             100,
             |name| (name == "minecraft:stone").then_some(TickTypeId(7)),
             |name| (name == "minecraft:water").then_some(TickTypeId(3)),
         )
-        .unwrap()
         .unwrap();
+    assert_eq!(loaded.loaded, 1);
+    assert_eq!(loaded.missing, 1);
     assert_eq!(
         dimension
             .resident()
@@ -1086,13 +1094,24 @@ fn local_world_runtime_owns_region_chunk_load_save_and_reopen() {
         dimension.resident_mut().level_mut().set_raw(block, stone),
         Some(registry.default_state("minecraft:air").unwrap())
     );
-    let mut dirty_payload = Some(data.clone());
-    assert!(!dimension.park_chunk(chunk, &mut dirty_payload));
-    assert!(dirty_payload.is_some());
+    dimension
+        .resident_mut()
+        .update_chunk_tickets(Some(crate::ticket_levels::Sources::default()));
+    let deferred = dimension
+        .reconcile_ticketed_chunks(
+            [chunk],
+            crate::nbt::Limits::saved(),
+            100,
+            |_| None,
+            |_| None,
+        )
+        .unwrap();
+    assert_eq!(deferred.deferred_dirty, 1);
+    assert!(!dimension.park_chunk(chunk));
     assert!(dimension.resident().is_chunk_dirty(chunk));
     let failed_save = dimension
         .save_chunk_to_region(
-            &mut data,
+            chunk,
             crate::compression::Compression::Zlib,
             123,
             crate::nbt::Limits::saved(),
@@ -1103,9 +1122,10 @@ fn local_world_runtime_owns_region_chunk_load_save_and_reopen() {
         .unwrap_err();
     assert_eq!(failed_save.kind(), std::io::ErrorKind::InvalidData);
     assert!(dimension.resident().is_chunk_dirty(chunk));
+    assert!(dimension.active_chunk_data(chunk).is_some());
     let failed_sync = dimension
         .save_chunk_to_region_with_sync_for_test(
-            &mut data,
+            chunk,
             crate::compression::Compression::Zlib,
             123,
             crate::nbt::Limits::saved(),
@@ -1117,13 +1137,12 @@ fn local_world_runtime_owns_region_chunk_load_save_and_reopen() {
         .unwrap_err();
     assert_eq!(failed_sync.kind(), std::io::ErrorKind::Other);
     assert!(dimension.resident().is_chunk_dirty(chunk));
-    let mut unsynced_payload = Some(data.clone());
-    assert!(!dimension.park_chunk(chunk, &mut unsynced_payload));
-    assert!(unsynced_payload.is_some());
+    assert!(dimension.active_chunk_data(chunk).is_some());
+    assert!(!dimension.park_chunk(chunk));
     assert!(
         dimension
             .save_chunk_to_region(
-                &mut data,
+                chunk,
                 crate::compression::Compression::Zlib,
                 123,
                 crate::nbt::Limits::saved(),
@@ -1135,21 +1154,30 @@ fn local_world_runtime_owns_region_chunk_load_save_and_reopen() {
     );
     assert!(!dimension.resident().is_chunk_dirty(chunk));
     let wrong_position = ChunkPos::new(chunk.x + 1, chunk.z);
-    let mut wrong_payload = Some(saved_test_chunk(wrong_position, -4, &chunk_state));
-    assert!(!dimension.park_chunk(chunk, &mut wrong_payload));
-    assert_eq!(wrong_payload.as_ref().unwrap().position(), wrong_position);
+    assert!(!dimension.park_chunk(wrong_position));
     assert!(dimension.resident().chunk_save_revision(chunk).is_some());
 
-    let preserved_nbt = data.root().tag.clone();
-    let mut parked_payload = Some(data);
-    assert!(dimension.park_chunk(chunk, &mut parked_payload));
-    assert!(parked_payload.is_none());
+    let preserved_nbt = dimension
+        .active_chunk_data(chunk)
+        .unwrap()
+        .root()
+        .tag
+        .clone();
+    let parked = dimension
+        .reconcile_ticketed_chunks(
+            [chunk, chunk],
+            crate::nbt::Limits::saved(),
+            100,
+            |_| None,
+            |_| None,
+        )
+        .unwrap();
+    assert_eq!(parked.parked, 1);
+    assert!(dimension.active_chunk_data(chunk).is_none());
     assert!(dimension.is_chunk_parked(chunk));
     assert_eq!(dimension.parked_chunk_count(), 1);
     assert!(dimension.resident().chunk_save_revision(chunk).is_none());
-    let mut duplicate_payload = Some(saved_test_chunk(chunk, -4, &chunk_state));
-    assert!(!dimension.park_chunk(chunk, &mut duplicate_payload));
-    assert!(duplicate_payload.is_some());
+    assert!(!dimension.park_chunk(chunk));
     assert_eq!(dimension.parked_chunk_count(), 1);
 
     let activation_error = dimension
@@ -1161,17 +1189,25 @@ fn local_world_runtime_owns_region_chunk_load_save_and_reopen() {
     assert!(dimension.resident().chunk_save_revision(chunk).is_none());
     assert!(!dimension.resident().has_chunk_ticks(chunk));
 
-    let data = dimension
-        .activate_parked_chunk(
-            chunk,
+    dimension
+        .resident_mut()
+        .update_chunk_tickets(Some(crate::ticket_levels::Sources {
+            forced: vec![(chunk.x, chunk.z)],
+            ..Default::default()
+        }));
+    let activated = dimension
+        .reconcile_ticketed_chunks(
+            [chunk, chunk],
+            crate::nbt::Limits::saved(),
             100,
             |name| (name == "minecraft:stone").then_some(TickTypeId(7)),
             |name| (name == "minecraft:water").then_some(TickTypeId(3)),
         )
-        .unwrap()
         .unwrap();
+    assert_eq!(activated.activated, 1);
     assert!(!dimension.is_chunk_parked(chunk));
     assert_eq!(dimension.parked_chunk_count(), 0);
+    let data = dimension.active_chunk_data(chunk).unwrap();
     assert_eq!(&data.root().tag, &preserved_nbt);
     assert_eq!(
         data.root().tag.get("unknown_root_field"),
@@ -1209,7 +1245,7 @@ fn local_world_runtime_owns_region_chunk_load_save_and_reopen() {
         1
     );
     assert!(
-        dimension
+        !dimension
             .activate_parked_chunk(
                 chunk,
                 100,
@@ -1217,7 +1253,6 @@ fn local_world_runtime_owns_region_chunk_load_save_and_reopen() {
                 |name| (name == "minecraft:water").then_some(TickTypeId(3)),
             )
             .unwrap()
-            .is_none()
     );
     drop(world);
 
@@ -1232,16 +1267,18 @@ fn local_world_runtime_owns_region_chunk_load_save_and_reopen() {
             .unwrap()
     );
     let dimension = restored.dimension_mut("minecraft:overworld").unwrap();
-    let reopened = dimension
-        .load_chunk_from_region(
-            chunk,
-            crate::nbt::Limits::saved(),
-            100,
-            |name| (name == "minecraft:stone").then_some(TickTypeId(7)),
-            |name| (name == "minecraft:water").then_some(TickTypeId(3)),
-        )
-        .unwrap()
-        .unwrap();
+    assert!(
+        dimension
+            .load_chunk_from_region(
+                chunk,
+                crate::nbt::Limits::saved(),
+                100,
+                |name| (name == "minecraft:stone").then_some(TickTypeId(7)),
+                |name| (name == "minecraft:water").then_some(TickTypeId(3)),
+            )
+            .unwrap()
+    );
+    let reopened = dimension.active_chunk_data(chunk).unwrap();
     assert_eq!(reopened.position(), chunk);
     assert_eq!(
         reopened.root().tag.get("unknown_root_field"),

@@ -1,8 +1,10 @@
 //! Local vanilla world owner joining world-global SavedData to resident dimensions.
 //!
 //! This is not the dedicated server engine: callers still drive simulation ticks
-//! and choose chunk lifecycle/readiness. Active chunks' opaque NBT remains caller-
-//! owned; a manually parked chunk's full payload is retained by its dimension.
+//! and choose chunk lifecycle/readiness. Each dimension owns the complete opaque
+//! NBT payloads for active and manually parked chunks; periodic candidate
+//! discovery, generation, tick scheduling and automatic persistence remain
+//! future engine responsibilities.
 //! The owner centralizes local SavedData, per-dimension borders/clocks and cached
 //! region files without carrying client or remote-world state.
 use crate::{
@@ -19,7 +21,7 @@ use crate::{
 };
 use horizon_core::{position::ChunkPos, ticks::TickTypeId};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
 };
@@ -69,11 +71,24 @@ pub struct WorldDimension<'registry> {
     resident: ResidentDimension<'registry>,
     border: WorldBorder,
     regions: DimensionRegionStore,
+    /// Opaque NBT payloads for chunks whose block/tick state is resident.
+    active: HashMap<ChunkPos, ChunkData>,
     /// Complete opaque NBT payloads retained while their block/tick state is parked.
     parked: HashMap<ChunkPos, ChunkData>,
     /// The per-dimension day clock persisted in `world_clocks.dat`.
     total_ticks: i64,
 }
+
+/// Counts the per-candidate actions performed by a caller-driven ticket sweep.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TicketLifecycleReport {
+    pub loaded: usize,
+    pub activated: usize,
+    pub parked: usize,
+    pub missing: usize,
+    pub deferred_dirty: usize,
+}
+
 impl<'registry> WorldDimension<'registry> {
     pub fn resident(&self) -> &ResidentDimension<'registry> {
         &self.resident
@@ -114,14 +129,10 @@ impl<'registry> WorldDimension<'registry> {
         self.set_day_time(ticks);
     }
 
-    /// Park one clean resident chunk, transferring its complete NBT payload from
-    /// the caller only after coordinated unload succeeds. A `false` result leaves
-    /// `data` untouched; the caller must save and sync dirty snapshots first.
-    pub fn park_chunk(&mut self, position: ChunkPos, data: &mut Option<ChunkData>) -> bool {
-        let Some(chunk_data) = data.as_ref() else {
-            return false;
-        };
-        if chunk_data.position() != position
+    /// Park one clean resident chunk after coordinated unload succeeds. Dirty
+    /// snapshots must be saved and synced first; the dimension retains its NBT.
+    pub fn park_chunk(&mut self, position: ChunkPos) -> bool {
+        if !self.active.contains_key(&position)
             || self.parked.contains_key(&position)
             || self.resident.chunk_save_revision(position).is_none()
             || self.resident.is_chunk_dirty(position)
@@ -129,35 +140,45 @@ impl<'registry> WorldDimension<'registry> {
         {
             return false;
         }
-        let chunk_data = data.take().expect("validated parked chunk data");
+        let chunk_data = self
+            .active
+            .remove(&position)
+            .expect("validated active chunk payload");
         let replaced = self.parked.insert(position, chunk_data);
         debug_assert!(replaced.is_none(), "duplicate parked chunk was rejected");
         true
     }
 
-    /// Restore a parked payload to the resident block/tick owners. The opaque NBT
-    /// is returned to the caller only after both owners load successfully; missing
-    /// or already-resident chunks return `None` without consuming parked data.
+    /// Restore a parked payload to the resident block/tick owners. The complete
+    /// NBT moves back to active ownership only after both owners load successfully.
     pub fn activate_parked_chunk(
         &mut self,
         position: ChunkPos,
         game_time: i64,
         resolve_block: impl FnMut(&str) -> Option<TickTypeId>,
         resolve_fluid: impl FnMut(&str) -> Option<TickTypeId>,
-    ) -> io::Result<Option<ChunkData>> {
+    ) -> io::Result<bool> {
         let Some(data) = self.parked.get(&position) else {
-            return Ok(None);
+            return Ok(false);
         };
-        if self.resident.chunk_save_revision(position).is_some() {
-            return Ok(None);
+        if self.active.contains_key(&position)
+            || self.resident.chunk_save_revision(position).is_some()
+        {
+            return Ok(false);
         }
         if !self
             .resident
             .load_chunk_data(data, game_time, resolve_block, resolve_fluid)?
         {
-            return Ok(None);
+            return Ok(false);
         }
-        Ok(self.parked.remove(&position))
+        let data = self
+            .parked
+            .remove(&position)
+            .expect("loaded parked chunk payload remains present");
+        let replaced = self.active.insert(position, data);
+        debug_assert!(replaced.is_none(), "active chunk payload was checked");
+        Ok(true)
     }
 
     pub fn is_chunk_parked(&self, position: ChunkPos) -> bool {
@@ -168,8 +189,14 @@ impl<'registry> WorldDimension<'registry> {
         self.parked.len()
     }
 
-    /// Load one region chunk and return its original NBT-backed data for the
-    /// caller to retain and later pass back to `save_chunk_to_region`.
+    /// Read-only access to a chunk's complete opaque NBT while active.
+    pub fn active_chunk_data(&self, position: ChunkPos) -> Option<&ChunkData> {
+        self.active.get(&position)
+    }
+
+    /// Load one region chunk into resident block/tick state and retain its full
+    /// NBT payload in this dimension. Returns false if the region record is absent
+    /// or the chunk is already active/parked.
     pub fn load_chunk_from_region(
         &mut self,
         position: ChunkPos,
@@ -177,12 +204,15 @@ impl<'registry> WorldDimension<'registry> {
         game_time: i64,
         resolve_block: impl FnMut(&str) -> Option<TickTypeId>,
         resolve_fluid: impl FnMut(&str) -> Option<TickTypeId>,
-    ) -> io::Result<Option<ChunkData>> {
+    ) -> io::Result<bool> {
+        if self.active.contains_key(&position) || self.parked.contains_key(&position) {
+            return Ok(false);
+        }
         let Some(region) = self.regions.region_mut(position.region(), false)? else {
-            return Ok(None);
+            return Ok(false);
         };
         let Some(record) = region.read(position)? else {
-            return Ok(None);
+            return Ok(false);
         };
         let data = ChunkData::new(record.nbt(limits)?)?;
         if data.position() != position {
@@ -191,17 +221,79 @@ impl<'registry> WorldDimension<'registry> {
                 "chunk coordinates do not match the region slot",
             ));
         }
-        self.resident
-            .load_chunk_data(&data, game_time, resolve_block, resolve_fluid)?;
-        Ok(Some(data))
+        if !self
+            .resident
+            .load_chunk_data(&data, game_time, resolve_block, resolve_fluid)?
+        {
+            return Ok(false);
+        }
+        let replaced = self.active.insert(position, data);
+        debug_assert!(replaced.is_none(), "active chunk payload was checked");
+        Ok(true)
     }
 
-    /// Write one complete chunk snapshot and acknowledge it only after the
-    /// owning region has synced successfully. The supplied `ChunkData` remains
-    /// the caller's preservation boundary for unrelated vanilla NBT fields.
+    /// Reconcile only caller-supplied candidates against the current `FULL`
+    /// ticket status. Persisted records are loaded, parked records reactivated,
+    /// and clean active chunks outside the ticketed set parked. Missing records
+    /// are reported but never generated; dirty active chunks stay resident.
+    /// Work completed for earlier candidates is not rolled back after an error.
+    pub fn reconcile_ticketed_chunks(
+        &mut self,
+        candidates: impl IntoIterator<Item = ChunkPos>,
+        limits: Limits,
+        game_time: i64,
+        mut resolve_block: impl FnMut(&str) -> Option<TickTypeId>,
+        mut resolve_fluid: impl FnMut(&str) -> Option<TickTypeId>,
+    ) -> io::Result<TicketLifecycleReport> {
+        let levels = self.resident.chunk_tickets().levels();
+        let mut seen = HashSet::new();
+        let mut report = TicketLifecycleReport::default();
+        for position in candidates {
+            if !seen.insert(position) {
+                continue;
+            }
+            if levels.fully_loaded(position.x, position.z) {
+                if self.parked.contains_key(&position) {
+                    if self.activate_parked_chunk(
+                        position,
+                        game_time,
+                        &mut resolve_block,
+                        &mut resolve_fluid,
+                    )? {
+                        report.activated += 1;
+                    }
+                } else if self.active.contains_key(&position)
+                    || self.resident.chunk_save_revision(position).is_some()
+                {
+                    continue;
+                } else if self.load_chunk_from_region(
+                    position,
+                    limits,
+                    game_time,
+                    &mut resolve_block,
+                    &mut resolve_fluid,
+                )? {
+                    report.loaded += 1;
+                } else {
+                    report.missing += 1;
+                }
+            } else if self.active.contains_key(&position) {
+                if self.resident.is_chunk_dirty(position) {
+                    report.deferred_dirty += 1;
+                } else if self.park_chunk(position) {
+                    report.parked += 1;
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Write one complete active chunk snapshot and acknowledge it only after
+    /// the owning region has synced successfully. The dimension retains its
+    /// opaque NBT fields across saves.
     pub fn save_chunk_to_region(
         &mut self,
-        data: &mut ChunkData,
+        position: ChunkPos,
         compression: Compression,
         timestamp: u32,
         limits: Limits,
@@ -209,8 +301,8 @@ impl<'registry> WorldDimension<'registry> {
         block_name: impl FnMut(TickTypeId) -> Option<String>,
         fluid_name: impl FnMut(TickTypeId) -> Option<String>,
     ) -> io::Result<bool> {
-        self.save_chunk_to_region_inner(
-            data,
+        self.save_owned_chunk_to_region_inner(
+            position,
             compression,
             timestamp,
             limits,
@@ -224,7 +316,7 @@ impl<'registry> WorldDimension<'registry> {
     #[cfg(test)]
     pub(crate) fn save_chunk_to_region_with_sync_for_test(
         &mut self,
-        data: &mut ChunkData,
+        position: ChunkPos,
         compression: Compression,
         timestamp: u32,
         limits: Limits,
@@ -233,8 +325,8 @@ impl<'registry> WorldDimension<'registry> {
         fluid_name: impl FnMut(TickTypeId) -> Option<String>,
         sync: impl FnOnce(&RegionFile) -> io::Result<()>,
     ) -> io::Result<bool> {
-        self.save_chunk_to_region_inner(
-            data,
+        self.save_owned_chunk_to_region_inner(
+            position,
             compression,
             timestamp,
             limits,
@@ -246,7 +338,41 @@ impl<'registry> WorldDimension<'registry> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn save_chunk_to_region_inner(
+    fn save_owned_chunk_to_region_inner(
+        &mut self,
+        position: ChunkPos,
+        compression: Compression,
+        timestamp: u32,
+        limits: Limits,
+        game_time: i64,
+        block_name: impl FnMut(TickTypeId) -> Option<String>,
+        fluid_name: impl FnMut(TickTypeId) -> Option<String>,
+        sync: impl FnOnce(&RegionFile) -> io::Result<()>,
+    ) -> io::Result<bool> {
+        let mut data = self
+            .active
+            .remove(&position)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "chunk is not active"))?;
+        let result = self.save_chunk_data_to_region_inner(
+            &mut data,
+            compression,
+            timestamp,
+            limits,
+            game_time,
+            block_name,
+            fluid_name,
+            sync,
+        );
+        let replaced = self.active.insert(position, data);
+        debug_assert!(
+            replaced.is_none(),
+            "active payload was removed before saving"
+        );
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn save_chunk_data_to_region_inner(
         &mut self,
         data: &mut ChunkData,
         compression: Compression,
@@ -407,6 +533,7 @@ impl<'registry> LocalWorldRuntime<'registry> {
                 resident,
                 border,
                 regions: DimensionRegionStore::new(region_directory),
+                active: HashMap::new(),
                 parked: HashMap::new(),
                 total_ticks,
             },

@@ -321,6 +321,66 @@ impl ChunkData {
         &self.root
     }
 
+    /// Read the block-state palettes attached to each saved section. A section
+    /// with no `block_states` compound is returned as `None` and is interpreted
+    /// by the resident level as all air. Other section fields remain opaque.
+    pub fn section_block_states(&self) -> io::Result<Vec<(i32, Option<&Tag>)>> {
+        let Some(Tag::List(sections)) = self.root.tag.get("sections") else {
+            return Err(invalid("chunk sections are not a list"));
+        };
+        sections
+            .iter()
+            .map(|section| {
+                let Some(Tag::Byte(y)) = section.get("Y") else {
+                    return Err(invalid("section is missing byte Y"));
+                };
+                Ok((i32::from(*y), section.get("block_states")))
+            })
+            .collect()
+    }
+
+    /// Replace only each named section's block-state palette, preserving
+    /// biome/light/unknown fields and all unrelated chunk NBT. Missing sections
+    /// are created with the supplied palette; duplicate Y values are rejected
+    /// before any mutation.
+    pub fn set_section_block_states(
+        &mut self,
+        updates: impl IntoIterator<Item = (i32, Tag)>,
+    ) -> io::Result<()> {
+        let mut updates = updates.into_iter().collect::<Vec<_>>();
+        updates.sort_by_key(|(y, _)| *y);
+        if updates.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(invalid("duplicate section Y update"));
+        }
+        for (y, states) in &updates {
+            i8::try_from(*y).map_err(|_| invalid("section Y outside saved byte range"))?;
+            if !matches!(states, Tag::Compound(_)) {
+                return Err(invalid("block_states is not a compound"));
+            }
+        }
+        let Some(Tag::List(sections)) = self.root.tag.get_mut("sections") else {
+            return Err(invalid("chunk sections are not a list"));
+        };
+        for (y, states) in updates {
+            let y_byte = i8::try_from(y).expect("validated section Y");
+            if let Some(section) = sections
+                .iter_mut()
+                .find(|section| section.get("Y") == Some(&Tag::Byte(y_byte)))
+            {
+                let Tag::Compound(fields) = section else {
+                    return Err(invalid("section is not a compound"));
+                };
+                fields.insert(key("block_states"), states);
+            } else {
+                sections.push(Tag::compound([
+                    ("Y", Tag::Byte(y_byte)),
+                    ("block_states", states),
+                ]));
+            }
+        }
+        Ok(())
+    }
+
     pub fn saved_ticks(
         &self,
         kind: TickKind,
@@ -348,6 +408,32 @@ impl ChunkData {
             unreachable!()
         };
         map.insert(key(kind.field()), tag);
+        Ok(())
+    }
+
+    /// Persist both tick queues atomically with respect to encoding errors.
+    /// This avoids replacing `block_ticks` if serializing `fluid_ticks` fails.
+    pub fn set_saved_tick_pair(
+        &mut self,
+        block_ticks: &[SavedTick],
+        fluid_ticks: &[SavedTick],
+        block_name: impl FnMut(TickTypeId) -> Option<String>,
+        fluid_name: impl FnMut(TickTypeId) -> Option<String>,
+    ) -> io::Result<()> {
+        if block_ticks
+            .iter()
+            .chain(fluid_ticks)
+            .any(|tick| tick.pos.chunk() != self.position)
+        {
+            return Err(invalid("saved tick is outside this chunk"));
+        }
+        let block_tag = tick_data::write_list(block_ticks, block_name)?;
+        let fluid_tag = tick_data::write_list(fluid_ticks, fluid_name)?;
+        let Tag::Compound(map) = &mut self.root.tag else {
+            unreachable!("ChunkData validates a compound root")
+        };
+        map.insert(key(TickKind::Block.field()), block_tag);
+        map.insert(key(TickKind::Fluid.field()), fluid_tag);
         Ok(())
     }
 

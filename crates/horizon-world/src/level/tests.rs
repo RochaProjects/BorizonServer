@@ -3,8 +3,11 @@
 //! repository root) and are skipped when those are absent.
 use super::*;
 use crate::chunk::{BlockProperties, BlockSection, BlockState};
-use crate::nbt::Tag;
-use horizon_core::random::RandomSource;
+use crate::nbt::{NamedTag, Tag};
+use horizon_core::{
+    random::RandomSource,
+    ticks::{SavedTick, TickPriority, TickTypeId},
+};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -359,6 +362,7 @@ fn resident_level_reads_writes_and_unloads_loaded_columns() {
     assert!(!level.load_empty_chunk(pos.chunk()));
     assert!(level.is_loaded(pos));
     assert_eq!(level.block_state(pos), air);
+    assert!(level.is_chunk_dirty(pos.chunk()));
     assert_eq!(level.set_raw(pos, stone), Some(air));
     assert_eq!(level.block_state(pos), stone);
     assert_eq!(level.set_raw(pos, air), Some(stone));
@@ -368,7 +372,9 @@ fn resident_level_reads_writes_and_unloads_loaded_columns() {
     assert_eq!(level.block_state(above), air);
     assert_eq!(level.set_raw(above, stone), None);
     assert_eq!(level.loaded_chunk_count(), 1);
-    assert!(level.unload_chunk(pos.chunk()));
+    assert_eq!(level.dirty_chunks(), vec![pos.chunk()]);
+    assert!(!level.unload_chunk(pos.chunk()));
+    assert!(level.discard_chunk(pos.chunk()));
     assert!(!level.is_loaded(pos));
     assert_eq!(level.block_state(pos), air);
     assert_eq!(level.set_raw(pos, stone), None);
@@ -393,6 +399,541 @@ fn resident_level_accepts_decoded_sections_and_keeps_world_clocks() {
     level.set_times(120, 2400);
     assert_eq!(level.game_time(), 120);
     assert_eq!(level.day_time(), 2400);
+}
+
+fn saved_test_chunk(
+    position: ChunkPos,
+    section_y: i8,
+    state: &BlockState,
+) -> crate::chunk::ChunkData {
+    let section = Tag::compound([
+        (
+            "block_states",
+            Tag::compound([("palette", Tag::List(vec![state.to_nbt()]))]),
+        ),
+        ("biomes", Tag::String("opaque-biome-payload".into())),
+        ("Y", Tag::Byte(section_y)),
+    ]);
+    crate::chunk::ChunkData::new(NamedTag {
+        name: Default::default(),
+        tag: Tag::compound([
+            ("DataVersion", Tag::Int(crate::DATA_VERSION)),
+            ("xPos", Tag::Int(position.x)),
+            ("zPos", Tag::Int(position.z)),
+            ("sections", Tag::List(vec![section])),
+            (
+                "entities",
+                Tag::List(vec![Tag::compound([(
+                    "id",
+                    Tag::String("test:entity".into()),
+                )])]),
+            ),
+            ("unknown_root_field", Tag::Long(77)),
+        ]),
+    })
+    .unwrap()
+}
+
+#[test]
+fn resident_level_loads_and_saves_chunk_palettes_preserving_other_nbt() {
+    let registry = tiny_block_registry();
+    let air = registry.default_state("minecraft:air").unwrap();
+    let stone = registry.default_state("minecraft:stone").unwrap();
+    let chunk = ChunkPos::new(-2, 3);
+    let mut data = saved_test_chunk(
+        chunk,
+        -4,
+        &BlockState {
+            name: "minecraft:air".to_owned(),
+            properties: BlockProperties::new(),
+        },
+    );
+    let mut level = ResidentLevel::new(&registry, -64, 384, 42).unwrap();
+    assert!(level.load_chunk_data(&data).unwrap());
+    assert!(!level.load_chunk_data(&data).unwrap());
+    assert!(!level.is_chunk_dirty(chunk));
+    let block = BlockPos::new(-32, -64, 48);
+    assert_eq!(level.block_state(block), air);
+    assert_eq!(level.set_raw(block, stone), Some(air));
+    assert!(level.is_chunk_dirty(chunk));
+    level.save_chunk_data(&mut data).unwrap();
+    assert!(level.is_chunk_dirty(chunk));
+
+    assert_eq!(
+        data.block(block).unwrap(),
+        Some(BlockState {
+            name: "minecraft:stone".to_owned(),
+            properties: BlockProperties::new(),
+        })
+    );
+    let root = &data.root().tag;
+    assert_eq!(root.get("unknown_root_field"), Some(&Tag::Long(77)));
+    assert_eq!(
+        root.get("entities"),
+        Some(&Tag::List(vec![Tag::compound([(
+            "id",
+            Tag::String("test:entity".into())
+        )])]))
+    );
+    let Tag::List(sections) = root.get("sections").unwrap() else {
+        panic!("sections")
+    };
+    assert_eq!(
+        sections[0].get("biomes"),
+        Some(&Tag::String("opaque-biome-payload".into()))
+    );
+
+    let region_dir = std::env::temp_dir().join(format!(
+        "horizon-resident-level-region-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&region_dir);
+    std::fs::create_dir_all(&region_dir).unwrap();
+    let region_path = region_dir.join("r.-1.0.mca");
+    let save_revision = level.chunk_revision(chunk).unwrap();
+    {
+        let mut region = crate::region::RegionFile::open_writable(&region_path, true).unwrap();
+        level
+            .save_region_chunk(
+                &mut region,
+                &mut data,
+                crate::compression::Compression::Zlib,
+                123,
+                crate::nbt::Limits::saved(),
+            )
+            .unwrap();
+        assert!(level.is_chunk_dirty(chunk));
+        region.sync().unwrap();
+    }
+    assert!(level.mark_chunk_saved(chunk, save_revision));
+    assert!(!level.is_chunk_dirty(chunk));
+    {
+        let mut region = crate::region::RegionFile::open(&region_path).unwrap();
+        assert_eq!(region.read(chunk).unwrap().unwrap().timestamp, 123);
+    }
+    {
+        let mut region = crate::region::RegionFile::open(&region_path).unwrap();
+        let mut reloaded = ResidentLevel::new(&registry, -64, 384, 42).unwrap();
+        assert!(
+            reloaded
+                .load_region_chunk(&mut region, chunk, crate::nbt::Limits::saved())
+                .unwrap()
+        );
+        assert_eq!(reloaded.block_state(block), stone);
+    }
+    std::fs::remove_dir_all(region_dir).unwrap();
+}
+
+#[test]
+fn resident_level_rejects_region_chunk_coordinate_mismatch() {
+    let registry = tiny_block_registry();
+    let requested = ChunkPos::new(0, 0);
+    let embedded = ChunkPos::new(1, 0);
+    let data = saved_test_chunk(
+        embedded,
+        -4,
+        &BlockState {
+            name: "minecraft:air".to_owned(),
+            properties: BlockProperties::new(),
+        },
+    );
+    let record = crate::region::ChunkRecord::from_nbt(
+        data.root(),
+        crate::compression::Compression::Zlib,
+        1,
+        crate::nbt::Limits::saved(),
+    )
+    .unwrap();
+    let region_dir = std::env::temp_dir().join(format!(
+        "horizon-resident-level-mismatch-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&region_dir);
+    std::fs::create_dir_all(&region_dir).unwrap();
+    let region_path = region_dir.join("r.0.0.mca");
+    {
+        let mut region = crate::region::RegionFile::open_writable(&region_path, true).unwrap();
+        region.write(requested, &record).unwrap();
+        region.sync().unwrap();
+    }
+
+    let mut region = crate::region::RegionFile::open(&region_path).unwrap();
+    let mut level = ResidentLevel::new(&registry, -64, 384, 42).unwrap();
+    let error = level
+        .load_region_chunk(&mut region, requested, crate::nbt::Limits::saved())
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(level.loaded_chunk_count(), 0);
+    assert!(!level.is_loaded(BlockPos::new(16, -64, 0)));
+    drop(region);
+    std::fs::remove_dir_all(region_dir).unwrap();
+}
+
+#[test]
+fn resident_level_does_not_acknowledge_a_stale_save_revision() {
+    let registry = tiny_block_registry();
+    let air = registry.default_state("minecraft:air").unwrap();
+    let stone = registry.default_state("minecraft:stone").unwrap();
+    let chunk = ChunkPos::new(0, 0);
+    let block = BlockPos::new(0, -64, 0);
+    let mut level = ResidentLevel::new(&registry, -64, 384, 42).unwrap();
+    assert!(level.load_empty_chunk(chunk));
+    assert_eq!(level.set_raw(block, stone), Some(air));
+    let saved_revision = level.chunk_revision(chunk).unwrap();
+    assert_eq!(level.set_raw(block, air), Some(stone));
+
+    assert!(!level.mark_chunk_saved(chunk, saved_revision));
+    assert!(level.is_chunk_dirty(chunk));
+    let current_revision = level.chunk_revision(chunk).unwrap();
+    assert!(level.mark_chunk_saved(chunk, current_revision));
+    assert!(!level.is_chunk_dirty(chunk));
+}
+
+#[test]
+fn resident_level_revision_tokens_do_not_repeat_after_unload_and_reload() {
+    let registry = tiny_block_registry();
+    let chunk = ChunkPos::new(0, 0);
+    let mut level = ResidentLevel::new(&registry, -64, 384, 42).unwrap();
+    assert!(level.load_empty_chunk(chunk));
+    let old_revision = level.chunk_revision(chunk).unwrap();
+    assert!(level.discard_chunk(chunk));
+    assert!(level.load_empty_chunk(chunk));
+    let new_revision = level.chunk_revision(chunk).unwrap();
+
+    assert_ne!(old_revision, new_revision);
+    assert!(!level.mark_chunk_saved(chunk, old_revision));
+    assert!(level.is_chunk_dirty(chunk));
+}
+
+#[test]
+fn resident_level_rejects_saved_sections_outside_bounds_without_loading_column() {
+    let registry = tiny_block_registry();
+    let air = BlockState {
+        name: "minecraft:air".to_owned(),
+        properties: BlockProperties::new(),
+    };
+    let chunk = ChunkPos::new(0, 0);
+    let data = saved_test_chunk(chunk, 20, &air);
+    let mut level = ResidentLevel::new(&registry, -64, 384, 42).unwrap();
+    assert!(level.load_chunk_data(&data).is_err());
+    assert_eq!(level.loaded_chunk_count(), 0);
+}
+
+#[test]
+fn scheduled_tick_owner_loads_and_atomically_saves_chunk_tick_lists() {
+    let chunk = ChunkPos::new(4, -3);
+    let block_tick = SavedTick {
+        kind: TickTypeId(7),
+        pos: BlockPos::new(64, 20, -48),
+        delay: 12,
+        priority: TickPriority::High,
+    };
+    let fluid_tick = SavedTick {
+        kind: TickTypeId(3),
+        pos: BlockPos::new(65, 21, -47),
+        delay: 25,
+        priority: TickPriority::Low,
+    };
+    let mut data = saved_test_chunk(
+        chunk,
+        1,
+        &BlockState {
+            name: "minecraft:air".to_owned(),
+            properties: BlockProperties::new(),
+        },
+    );
+    data.set_saved_ticks(crate::tick_data::TickKind::Block, &[block_tick], |id| {
+        (id == TickTypeId(7)).then(|| "minecraft:stone".to_owned())
+    })
+    .unwrap();
+    data.set_saved_ticks(crate::tick_data::TickKind::Fluid, &[fluid_tick], |id| {
+        (id == TickTypeId(3)).then(|| "minecraft:water".to_owned())
+    })
+    .unwrap();
+
+    let mut ticks = Ticks::new(0);
+    let mut malformed = Ticks::new(0);
+    assert!(
+        malformed
+            .load_saved_chunk_ticks(
+                chunk,
+                &data,
+                100,
+                |name| (name == "minecraft:stone").then_some(TickTypeId(7)),
+                |_| None,
+            )
+            .is_err()
+    );
+    assert!(malformed.blocks.chunk(chunk).is_none());
+    assert!(malformed.fluids.chunk(chunk).is_none());
+    ticks
+        .load_saved_chunk_ticks(
+            chunk,
+            &data,
+            100,
+            |name| (name == "minecraft:stone").then_some(TickTypeId(7)),
+            |name| (name == "minecraft:water").then_some(TickTypeId(3)),
+        )
+        .unwrap();
+    assert_eq!(ticks.blocks.chunk(chunk).unwrap().count(), 1);
+    assert_eq!(ticks.fluids.chunk(chunk).unwrap().count(), 1);
+    assert!(
+        ticks
+            .load_saved_chunk_ticks(
+                chunk,
+                &data,
+                100,
+                |name| (name == "minecraft:stone").then_some(TickTypeId(7)),
+                |name| (name == "minecraft:water").then_some(TickTypeId(3)),
+            )
+            .is_err()
+    );
+
+    let old_block_list = data.root().tag.get("block_ticks").unwrap().clone();
+    assert!(
+        ticks
+            .save_chunk_ticks(
+                chunk,
+                &mut data,
+                100,
+                |id| (id == TickTypeId(7)).then(|| "minecraft:stone".to_owned()),
+                |_| None,
+            )
+            .is_err()
+    );
+    assert_eq!(data.root().tag.get("block_ticks"), Some(&old_block_list));
+
+    ticks
+        .save_chunk_ticks(
+            chunk,
+            &mut data,
+            100,
+            |id| (id == TickTypeId(7)).then(|| "minecraft:stone".to_owned()),
+            |id| (id == TickTypeId(3)).then(|| "minecraft:water".to_owned()),
+        )
+        .unwrap();
+    let restored_blocks = data
+        .saved_ticks(crate::tick_data::TickKind::Block, |name| {
+            (name == "minecraft:stone").then_some(TickTypeId(7))
+        })
+        .unwrap()
+        .pack(100);
+    let restored_fluids = data
+        .saved_ticks(crate::tick_data::TickKind::Fluid, |name| {
+            (name == "minecraft:water").then_some(TickTypeId(3))
+        })
+        .unwrap()
+        .pack(100);
+    assert_eq!(restored_blocks, vec![block_tick]);
+    assert_eq!(restored_fluids, vec![fluid_tick]);
+}
+
+#[test]
+fn resident_dimension_coordinates_region_block_and_tick_lifecycle() {
+    let registry = tiny_block_registry();
+    let air = registry.default_state("minecraft:air").unwrap();
+    let stone = registry.default_state("minecraft:stone").unwrap();
+    let chunk = ChunkPos::new(-2, 3);
+    let block = BlockPos::new(-32, -64, 48);
+    let block_tick = SavedTick {
+        kind: TickTypeId(7),
+        pos: BlockPos::new(-31, -63, 49),
+        delay: 17,
+        priority: TickPriority::Normal,
+    };
+    let fluid_tick = SavedTick {
+        kind: TickTypeId(3),
+        pos: BlockPos::new(-30, -62, 50),
+        delay: 29,
+        priority: TickPriority::Low,
+    };
+    let mut data = saved_test_chunk(
+        chunk,
+        -4,
+        &BlockState {
+            name: "minecraft:air".to_owned(),
+            properties: BlockProperties::new(),
+        },
+    );
+    data.set_saved_ticks(crate::tick_data::TickKind::Block, &[block_tick], |id| {
+        (id == TickTypeId(7)).then(|| "minecraft:stone".to_owned())
+    })
+    .unwrap();
+    data.set_saved_ticks(crate::tick_data::TickKind::Fluid, &[fluid_tick], |id| {
+        (id == TickTypeId(3)).then(|| "minecraft:water".to_owned())
+    })
+    .unwrap();
+
+    let mut malformed = ResidentDimension::new(
+        "minecraft:overworld",
+        ResidentLevel::new(&registry, -64, 384, 42).unwrap(),
+        Ticks::new(0),
+    );
+    assert!(
+        malformed
+            .load_chunk_data(
+                &data,
+                100,
+                |name| (name == "minecraft:stone").then_some(TickTypeId(7)),
+                |_| None,
+            )
+            .is_err()
+    );
+    assert_eq!(malformed.level().loaded_chunk_count(), 0);
+    assert!(!malformed.has_chunk_ticks(chunk));
+
+    let mut dimension = ResidentDimension::new(
+        "minecraft:overworld",
+        ResidentLevel::new(&registry, -64, 384, 42).unwrap(),
+        Ticks::new(0),
+    );
+    assert_eq!(dimension.key(), "minecraft:overworld");
+    dimension.set_times(100, 2400);
+    assert_eq!(dimension.level().game_time(), 100);
+    assert_eq!(dimension.level().day_time(), 2400);
+    assert!(
+        dimension
+            .load_chunk_data(
+                &data,
+                100,
+                |name| (name == "minecraft:stone").then_some(TickTypeId(7)),
+                |name| (name == "minecraft:water").then_some(TickTypeId(3)),
+            )
+            .unwrap()
+    );
+    assert!(dimension.has_chunk_ticks(chunk));
+    assert_eq!(dimension.ticks().blocks.chunk(chunk).unwrap().count(), 1);
+    assert_eq!(dimension.ticks().fluids.chunk(chunk).unwrap().count(), 1);
+    assert_eq!(dimension.level_mut().set_raw(block, stone), Some(air));
+    let revision = dimension.level().chunk_revision(chunk).unwrap();
+    let original_nbt = data.root().tag.clone();
+    assert!(
+        dimension
+            .save_chunk_data(
+                &mut data,
+                100,
+                |id| (id == TickTypeId(7)).then(|| "minecraft:stone".to_owned()),
+                |_| None,
+            )
+            .is_err()
+    );
+    assert_eq!(data.root().tag, original_nbt);
+
+    let region_dir =
+        std::env::temp_dir().join(format!("horizon-resident-dimension-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&region_dir);
+    std::fs::create_dir_all(&region_dir).unwrap();
+    let region_path = region_dir.join("r.-1.0.mca");
+    {
+        let mut region = crate::region::RegionFile::open_writable(&region_path, true).unwrap();
+        dimension
+            .save_region_chunk(
+                &mut region,
+                &mut data,
+                crate::compression::Compression::Zlib,
+                123,
+                crate::nbt::Limits::saved(),
+                100,
+                |id| (id == TickTypeId(7)).then(|| "minecraft:stone".to_owned()),
+                |id| (id == TickTypeId(3)).then(|| "minecraft:water".to_owned()),
+            )
+            .unwrap();
+        assert!(dimension.level().is_chunk_dirty(chunk));
+        region.sync().unwrap();
+    }
+    assert!(dimension.mark_chunk_saved(chunk, revision));
+    assert!(!dimension.level().is_chunk_dirty(chunk));
+    assert!(dimension.unload_chunk(chunk));
+    assert!(!dimension.has_chunk_ticks(chunk));
+
+    let mut restored = ResidentDimension::new(
+        "minecraft:overworld",
+        ResidentLevel::new(&registry, -64, 384, 42).unwrap(),
+        Ticks::new(0),
+    );
+    {
+        let mut region = crate::region::RegionFile::open(&region_path).unwrap();
+        assert!(
+            restored
+                .load_region_chunk(
+                    &mut region,
+                    chunk,
+                    crate::nbt::Limits::saved(),
+                    100,
+                    |name| (name == "minecraft:stone").then_some(TickTypeId(7)),
+                    |name| (name == "minecraft:water").then_some(TickTypeId(3)),
+                )
+                .unwrap()
+        );
+        assert_eq!(region.read(chunk).unwrap().unwrap().timestamp, 123);
+    }
+    assert_eq!(restored.level().block_state(block), stone);
+    assert_eq!(restored.ticks().blocks.chunk(chunk).unwrap().count(), 1);
+    assert_eq!(restored.ticks().fluids.chunk(chunk).unwrap().count(), 1);
+    std::fs::remove_dir_all(region_dir).unwrap();
+}
+
+#[test]
+fn local_world_runtime_owns_dimension_clock_and_global_saved_data() {
+    let registry = tiny_block_registry();
+    let root = std::env::temp_dir().join(format!(
+        "horizon-local-world-runtime-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let features = Vec::new();
+    let mut world = crate::world_runtime::LocalWorldRuntime::open(&root, &features).unwrap();
+    let mut preloaded = ResidentDimension::new(
+        "test:preloaded",
+        ResidentLevel::new(&registry, -64, 384, 42).unwrap(),
+        Ticks::new(0),
+    );
+    assert!(preloaded.level_mut().load_empty_chunk(ChunkPos::new(0, 0)));
+    assert!(world.add_dimension(preloaded).is_err());
+    assert!(world.dimension("test:preloaded").is_none());
+    let resident = ResidentDimension::new(
+        "minecraft:overworld",
+        ResidentLevel::new(&registry, -64, 384, 42).unwrap(),
+        Ticks::new(0),
+    );
+    assert!(world.add_dimension(resident).unwrap());
+    assert!(
+        !world
+            .add_dimension(ResidentDimension::new(
+                "minecraft:overworld",
+                ResidentLevel::new(&registry, -64, 384, 42).unwrap(),
+                Ticks::new(0),
+            ))
+            .unwrap()
+    );
+    let dimension = world.dimension_mut("minecraft:overworld").unwrap();
+    assert_eq!(dimension.advance_time(false), (1, 0));
+    assert_eq!(dimension.advance_time(true), (2, 1));
+    dimension.set_total_ticks(24_000);
+    assert_eq!(dimension.resident().level().game_time(), 24_000);
+    dimension.border_mut().set_size(512.0);
+    world.weather_mut().set_parameters(0, 600, true, false);
+    assert!(world.game_rules_mut().set_string("advance_time", "false"));
+    world.save_world_data().unwrap();
+    drop(world);
+
+    let mut restored = crate::world_runtime::LocalWorldRuntime::open(&root, &features).unwrap();
+    let resident = ResidentDimension::new(
+        "minecraft:overworld",
+        ResidentLevel::new(&registry, -64, 384, 42).unwrap(),
+        Ticks::new(0),
+    );
+    assert!(restored.add_dimension(resident).unwrap());
+    let dimension = restored.dimension("minecraft:overworld").unwrap();
+    assert_eq!(dimension.total_ticks(), 24_000);
+    assert_eq!(dimension.resident().level().game_time(), 24_000);
+    assert_eq!(dimension.border().size(), 512.0);
+    assert!(restored.weather().raining);
+    assert_eq!(restored.weather().rain_time, 600);
+    assert!(!restored.game_rules().bool("advance_time"));
+    drop(restored);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

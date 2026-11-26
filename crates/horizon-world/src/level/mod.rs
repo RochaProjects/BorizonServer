@@ -100,6 +100,7 @@ use std::{collections::HashMap, io, path::Path, sync::Arc, sync::RwLock};
 
 pub mod classes;
 pub mod data;
+pub mod dimension;
 pub mod states;
 pub mod ticks;
 
@@ -141,6 +142,7 @@ mod tests;
 pub use bonemeal::TemplateSettings;
 pub use buckets::{BucketContent, is_lava_bucket};
 pub use data::{BlockData, ItemBinding, ItemKind, Named, Props, PushReaction, StateFacts, Tags};
+pub use dimension::ResidentDimension;
 pub use falling::Landing;
 pub use interact::{InteractionResult, PlayerContext, PlayerEffect, UseBranch, hit_slot};
 pub use pistons::{BlockEventData, MovingPiston};
@@ -625,6 +627,7 @@ pub struct ResidentLevel<'registry> {
     min_y: i32,
     max_y: i32,
     columns: HashMap<ChunkPos, ResidentColumn<'registry>>,
+    next_revision: u128,
     random: LegacyRandom,
     game_time: i64,
     day_time: i64,
@@ -632,6 +635,8 @@ pub struct ResidentLevel<'registry> {
 
 struct ResidentColumn<'registry> {
     sections: HashMap<i32, BlockSection<'registry>>,
+    dirty: bool,
+    revision: u128,
 }
 
 impl<'registry> ResidentLevel<'registry> {
@@ -663,6 +668,7 @@ impl<'registry> ResidentLevel<'registry> {
             min_y,
             max_y,
             columns: HashMap::new(),
+            next_revision: 1,
             random: LegacyRandom::new(seed),
             game_time: 0,
             day_time: 0,
@@ -684,6 +690,8 @@ impl<'registry> ResidentLevel<'registry> {
         let max_section = self.max_y >> 4;
         let mut resident = ResidentColumn {
             sections: HashMap::new(),
+            dirty: false,
+            revision: 0,
         };
         for (section_y, section) in sections {
             if !(min_section..max_section).contains(&section_y) {
@@ -705,24 +713,202 @@ impl<'registry> ResidentLevel<'registry> {
                 ));
             }
         }
+        resident.revision = self.allocate_revision();
         self.columns.insert(position, resident);
         Ok(true)
+    }
+
+    fn allocate_revision(&mut self) -> u128 {
+        let revision = self.next_revision;
+        self.next_revision = self
+            .next_revision
+            .checked_add(1)
+            .expect("resident level revision exhausted");
+        revision
+    }
+
+    /// Decode a saved chunk's block-state palettes into resident sections.
+    /// All other chunk/section data remains in `ChunkData` for its owner to
+    /// preserve and save; loading is transactional on malformed or out-of-range
+    /// sections. Returns false without changing the existing column if loaded.
+    pub fn load_chunk_data(&mut self, data: &crate::chunk::ChunkData) -> io::Result<bool> {
+        let mut sections = Vec::new();
+        for (section_y, block_states) in data.section_block_states()? {
+            let section = match block_states {
+                Some(tag) => BlockSection::from_nbt(tag, self.registry)?,
+                None => BlockSection::uniform(self.air, self.registry)?,
+            };
+            sections.push((section_y, section));
+        }
+        self.load_chunk(data.position(), sections)
+    }
+
+    /// Decode a compressed Anvil record and load its resident block sections.
+    pub fn load_chunk_record(
+        &mut self,
+        record: &crate::region::ChunkRecord,
+        limits: crate::nbt::Limits,
+    ) -> io::Result<bool> {
+        let data = crate::chunk::ChunkData::new(record.nbt(limits)?)?;
+        self.load_chunk_data(&data)
+    }
+
+    /// Read one chunk from an already-open region file and load its resident
+    /// block sections. Returns false when the region has no record for it.
+    pub fn load_region_chunk(
+        &mut self,
+        region: &mut crate::region::RegionFile,
+        position: ChunkPos,
+        limits: crate::nbt::Limits,
+    ) -> io::Result<bool> {
+        let Some(record) = region.read(position)? else {
+            return Ok(false);
+        };
+        let data = crate::chunk::ChunkData::new(record.nbt(limits)?)?;
+        if data.position() != position {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk coordinates do not match the region slot",
+            ));
+        }
+        self.load_chunk_data(&data)
+    }
+
+    /// Write resident block-state palettes back to the matching saved chunk.
+    /// The chunk's other NBT, including section biomes, light, heightmaps,
+    /// entities and scheduled ticks, is left untouched by `ChunkData`.
+    pub fn save_chunk_data(&self, data: &mut crate::chunk::ChunkData) -> io::Result<()> {
+        let position = data.position();
+        let column = self
+            .columns
+            .get(&position)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "chunk is not resident"))?;
+        let mut updates = column
+            .sections
+            .iter()
+            .map(|(&y, section)| Ok((y, section.to_nbt()?)))
+            .collect::<io::Result<Vec<_>>>()?;
+        updates.sort_by_key(|(y, _)| *y);
+        data.set_section_block_states(updates)
+    }
+
+    /// Encode the current resident block palettes into a compressed Anvil
+    /// record while retaining the supplied chunk's compression and timestamp.
+    pub fn save_chunk_record(
+        &self,
+        data: &mut crate::chunk::ChunkData,
+        compression: crate::compression::Compression,
+        timestamp: u32,
+        limits: crate::nbt::Limits,
+    ) -> io::Result<crate::region::ChunkRecord> {
+        self.save_chunk_data(data)?;
+        crate::region::ChunkRecord::from_nbt(data.root(), compression, timestamp, limits)
+    }
+
+    /// Persist the resident palette state into an already-open region file.
+    /// File sync, unload/eviction and dirty-state policy remain the caller's
+    /// responsibility so a runtime can batch writes and acknowledge them only
+    /// after its chosen durability boundary via [`Self::mark_chunk_saved`].
+    pub fn save_region_chunk(
+        &self,
+        region: &mut crate::region::RegionFile,
+        data: &mut crate::chunk::ChunkData,
+        compression: crate::compression::Compression,
+        timestamp: u32,
+        limits: crate::nbt::Limits,
+    ) -> io::Result<()> {
+        if data.position().region() != region.position() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "chunk does not belong to this region",
+            ));
+        }
+        let position = data.position();
+        let record = self.save_chunk_record(data, compression, timestamp, limits)?;
+        region.write(position, &record)
     }
 
     /// Add an empty loaded column. Intended for new/generated columns and tests;
     /// persisted columns must be decoded before `load_chunk`.
     pub fn load_empty_chunk(&mut self, position: ChunkPos) -> bool {
-        self.load_chunk(position, std::iter::empty())
-            .expect("an empty column has no invalid sections")
+        let loaded = self
+            .load_chunk(position, std::iter::empty())
+            .expect("an empty column has no invalid sections");
+        if loaded && let Some(column) = self.columns.get_mut(&position) {
+            column.dirty = true;
+        }
+        loaded
     }
 
-    /// Remove a resident column; block access to it then follows unloaded semantics.
+    /// Remove a clean resident column; dirty columns must be saved or explicitly
+    /// discarded first. Block access then follows unloaded semantics.
     pub fn unload_chunk(&mut self, position: ChunkPos) -> bool {
+        if self
+            .columns
+            .get(&position)
+            .is_some_and(|column| column.dirty)
+        {
+            return false;
+        }
         self.columns.remove(&position).is_some()
+    }
+
+    /// Explicitly discard a resident column, including any unsaved block edits.
+    pub fn discard_chunk(&mut self, position: ChunkPos) -> bool {
+        self.columns.remove(&position).is_some()
+    }
+
+    /// Whether this resident column has block changes not yet acknowledged as
+    /// persisted. `save_region_chunk` alone does not clear it; the caller should
+    /// capture [`Self::chunk_revision`] for the saved snapshot and pass it to
+    /// `mark_chunk_saved` only after its durability boundary succeeds.
+    pub fn is_chunk_dirty(&self, position: ChunkPos) -> bool {
+        self.columns
+            .get(&position)
+            .is_some_and(|column| column.dirty)
+    }
+
+    /// Return the currently resident columns with unsaved block changes.
+    pub fn dirty_chunks(&self) -> Vec<ChunkPos> {
+        let mut chunks = self
+            .columns
+            .iter()
+            .filter_map(|(&position, column)| column.dirty.then_some(position))
+            .collect::<Vec<_>>();
+        chunks.sort_by_key(|position| (position.x, position.z));
+        chunks
+    }
+
+    /// Revision token for a resident column's current block data. Capture it
+    /// for a save snapshot so an asynchronous save cannot acknowledge later
+    /// edits accidentally.
+    pub fn chunk_revision(&self, position: ChunkPos) -> Option<u128> {
+        self.columns.get(&position).map(|column| column.revision)
+    }
+
+    /// A caller using another durable store may acknowledge successful commit
+    /// here. Clears dirty only if `revision` still identifies the current
+    /// block-data snapshot; returns false if absent or modified since capture.
+    pub fn mark_chunk_saved(&mut self, position: ChunkPos, revision: u128) -> bool {
+        let Some(column) = self.columns.get_mut(&position) else {
+            return false;
+        };
+        if column.revision != revision {
+            return false;
+        }
+        column.dirty = false;
+        true
     }
 
     pub fn loaded_chunk_count(&self) -> usize {
         self.columns.len()
+    }
+
+    /// Currently resident chunk positions in stable x/z order.
+    pub fn loaded_chunks(&self) -> Vec<ChunkPos> {
+        let mut chunks = self.columns.keys().copied().collect::<Vec<_>>();
+        chunks.sort_by_key(|position| (position.x, position.z));
+        chunks
     }
 
     pub fn set_times(&mut self, game_time: i64, day_time: i64) {
@@ -754,6 +940,7 @@ impl LevelAccess for ResidentLevel<'_> {
         if old == state {
             return Some(old);
         }
+        let revision = self.allocate_revision();
         let air = self.air;
         let registry = self.registry;
         let column = self.columns.get_mut(&pos.chunk())?;
@@ -761,7 +948,12 @@ impl LevelAccess for ResidentLevel<'_> {
             BlockSection::uniform(air, registry)
                 .expect("the registry's air state was validated at construction")
         });
-        section.set(pos.section_index(), state).ok()
+        let previous = section.set(pos.section_index(), state).ok();
+        if previous.is_some() {
+            column.dirty = true;
+            column.revision = revision;
+        }
+        previous
     }
 
     fn is_loaded(&self, pos: BlockPos) -> bool {

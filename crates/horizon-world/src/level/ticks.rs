@@ -1,7 +1,7 @@
 //! Per-level mutable simulation state: scheduled block and fluid ticks plus the
 //! in-flight neighbour-update queue and the random-tick position generator.
 use super::{states::BlockId, update::NeighborUpdater};
-use crate::fluid::FluidKind;
+use crate::{chunk::ChunkData, fluid::FluidKind, tick_data::TickKind};
 use horizon_core::fast_hash::FxHashMap;
 use horizon_core::{
     position::{BlockPos, ChunkPos},
@@ -9,6 +9,7 @@ use horizon_core::{
         ChunkTicks, LevelTicks, ScheduleResult, ScheduledTick, TickError, TickPriority, TickTypeId,
     },
 };
+use std::io;
 
 /// Owned by the caller next to its chunk storage. Chunks must be registered
 /// with [`Ticks::add_chunk`] before ticks can be scheduled in them, mirroring
@@ -93,9 +94,87 @@ impl Ticks {
         blocks: ChunkTicks,
         fluids: ChunkTicks,
     ) -> Result<(), TickError> {
+        if self.blocks.chunk(pos).is_some() || self.fluids.chunk(pos).is_some() {
+            return Err(TickError::ChunkAlreadyAdded);
+        }
+        if blocks.pack(0).iter().any(|tick| tick.pos.chunk() != pos)
+            || fluids.pack(0).iter().any(|tick| tick.pos.chunk() != pos)
+        {
+            return Err(TickError::WrongChunk);
+        }
         self.blocks.add_chunk(pos, blocks)?;
         self.fluids.add_chunk(pos, fluids)
     }
+
+    /// Load both vanilla scheduled-tick lists from a chunk and register them
+    /// with the level queues. The type-name resolvers are supplied by the
+    /// server's block/fluid registries. Saved delays are unpacked relative to
+    /// `game_time`; an already registered chunk is rejected without mutation.
+    pub fn load_saved_chunk_ticks(
+        &mut self,
+        pos: ChunkPos,
+        data: &ChunkData,
+        game_time: i64,
+        resolve_block: impl FnMut(&str) -> Option<TickTypeId>,
+        resolve_fluid: impl FnMut(&str) -> Option<TickTypeId>,
+    ) -> io::Result<()> {
+        if data.position() != pos {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "chunk tick data belongs to a different chunk",
+            ));
+        }
+        if self.blocks.chunk(pos).is_some() || self.fluids.chunk(pos).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "chunk tick queues are already registered",
+            ));
+        }
+        let blocks = data.saved_ticks(TickKind::Block, resolve_block)?;
+        let fluids = data.saved_ticks(TickKind::Fluid, resolve_fluid)?;
+        self.add_chunk(pos, blocks, fluids)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        self.blocks.unpack_chunk(pos, game_time);
+        self.fluids.unpack_chunk(pos, game_time);
+        Ok(())
+    }
+
+    /// Pack the registered block and fluid tick queues back into a matching
+    /// chunk. Encoding for both lists is staged before either NBT field changes.
+    pub fn save_chunk_ticks(
+        &self,
+        pos: ChunkPos,
+        data: &mut ChunkData,
+        game_time: i64,
+        block_name: impl FnMut(TickTypeId) -> Option<String>,
+        fluid_name: impl FnMut(TickTypeId) -> Option<String>,
+    ) -> io::Result<()> {
+        if data.position() != pos {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "chunk tick data belongs to a different chunk",
+            ));
+        }
+        let blocks = self.blocks.chunk(pos).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "block tick queue is not registered",
+            )
+        })?;
+        let fluids = self.fluids.chunk(pos).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "fluid tick queue is not registered",
+            )
+        })?;
+        data.set_saved_tick_pair(
+            &blocks.pack(game_time),
+            &fluids.pack(game_time),
+            block_name,
+            fluid_name,
+        )
+    }
+
     /// A moving-piston block entity loaded with its chunk, as a new ticker.
     pub fn load_moving_piston(&mut self, pos: BlockPos, piston: super::pistons::MovingPiston) {
         self.add_moving_piston(pos, piston);
@@ -348,7 +427,11 @@ mod block_event_queue_tests {
 mod tests {
     use super::Ticks;
     use crate::{level::pistons::MovingPiston, registry::BlockStateId};
-    use horizon_core::{geometry::Direction, position::BlockPos};
+    use horizon_core::{
+        geometry::Direction,
+        position::{BlockPos, ChunkPos},
+        ticks::{ChunkTicks, SavedTick, TickError, TickPriority, TickTypeId},
+    };
 
     fn piston(progress: f32) -> MovingPiston {
         MovingPiston {
@@ -414,5 +497,35 @@ mod tests {
         let id = ticks.moving_pistons[scan(&ticks, at(2)).unwrap()].1.id;
         assert!(ticks.moving_piston_has(at(2), id));
         assert!(!ticks.moving_piston_has(at(2), id + 1));
+    }
+
+    #[test]
+    fn adding_block_and_fluid_tick_chunks_is_failure_atomic() {
+        let chunk = ChunkPos::new(2, -1);
+        let mut duplicate = Ticks::new(0);
+        duplicate
+            .fluids
+            .add_chunk(chunk, ChunkTicks::default())
+            .unwrap();
+        assert_eq!(
+            duplicate.add_chunk(chunk, ChunkTicks::default(), ChunkTicks::default()),
+            Err(TickError::ChunkAlreadyAdded)
+        );
+        assert!(duplicate.blocks.chunk(chunk).is_none());
+        assert!(duplicate.fluids.chunk(chunk).is_some());
+
+        let misplaced_fluid = ChunkTicks::from_saved(vec![SavedTick {
+            kind: TickTypeId(1),
+            pos: BlockPos::new(0, 0, 0),
+            delay: 1,
+            priority: TickPriority::Normal,
+        }]);
+        let mut malformed = Ticks::new(0);
+        assert_eq!(
+            malformed.add_chunk(chunk, ChunkTicks::default(), misplaced_fluid),
+            Err(TickError::WrongChunk)
+        );
+        assert!(malformed.blocks.chunk(chunk).is_none());
+        assert!(malformed.fluids.chunk(chunk).is_none());
     }
 }

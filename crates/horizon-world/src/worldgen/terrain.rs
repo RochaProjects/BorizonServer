@@ -609,6 +609,27 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
     pub fn heightmap(&self, kind: HeightmapType) -> Option<&Heightmap> {
         self.heightmaps[kind as usize].as_ref()
     }
+    /// Encode exactly the heightmaps required by this generation status. A
+    /// required-but-unprimed map is an error; callers must not persist a chunk
+    /// with an incomplete status-dependent map set.
+    pub fn heightmaps_nbt(&self) -> io::Result<crate::nbt::Tag> {
+        let mut maps = crate::nbt::Compound::new();
+        for &kind in self.stage.heightmaps() {
+            let map = self.heightmap(kind).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "required chunk heightmap is absent",
+                )
+            })?;
+            maps.insert(
+                kind.name().into(),
+                crate::nbt::Tag::LongArray(
+                    map.raw_data().iter().map(|&value| value as i64).collect(),
+                ),
+            );
+        }
+        Ok(crate::nbt::Tag::Compound(maps))
+    }
     pub fn block_ticks(&self) -> &ProtoChunkTicks {
         &self.block_ticks
     }
@@ -623,6 +644,23 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
     }
     pub fn postprocessing(&self) -> &[Vec<u16>] {
         &self.postprocessing
+    }
+    /// Encode the per-section packed local positions as vanilla's nested
+    /// `PostProcessing` list. Duplicate positions and insertion order matter.
+    pub fn postprocessing_nbt(&self) -> crate::nbt::Tag {
+        crate::nbt::Tag::List(
+            self.postprocessing
+                .iter()
+                .map(|positions| {
+                    crate::nbt::Tag::List(
+                        positions
+                            .iter()
+                            .map(|&position| crate::nbt::Tag::Short(position as i16))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        )
     }
 
     pub fn ensure_heightmap(&mut self, kind: HeightmapType) -> &mut Heightmap {
@@ -1020,6 +1058,67 @@ mod tests {
                 && crate::chunk::BlockState::from_nbt(palette.get(0).unwrap())
                     .is_ok_and(|state| state.name == "minecraft:air")
         }));
+    }
+
+    #[test]
+    fn heightmap_nbt_requires_and_writes_the_stage_map_set() {
+        let registry = test_registry();
+        let mut chunk =
+            TerrainChunk::new(ChunkPos::new(-3, 5), -64, 384, &registry, Properties).unwrap();
+        chunk.set_generation_stage(PreLightChunkStage::Terrain);
+        assert_eq!(
+            chunk.heightmaps_nbt().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        chunk
+            .set_block_raw(-48 + 3, -63, 80 + 5, BlockStateId(2))
+            .unwrap();
+        chunk
+            .prime_heightmaps(&crate::chunk_status::ChunkStatus::FINAL_HEIGHTMAPS)
+            .unwrap();
+        let crate::nbt::Tag::Compound(encoded) = chunk.heightmaps_nbt().unwrap() else {
+            panic!("heightmaps are a compound");
+        };
+        assert_eq!(encoded.len(), 4);
+        for kind in crate::chunk_status::ChunkStatus::FINAL_HEIGHTMAPS {
+            let Some(crate::nbt::Tag::LongArray(words)) = encoded.get(&kind.name().into()) else {
+                panic!("missing {}", kind.name());
+            };
+            assert_eq!(
+                words.iter().map(|&word| word as u64).collect::<Vec<_>>(),
+                chunk.heightmap(kind).unwrap().raw_data()
+            );
+        }
+    }
+
+    #[test]
+    fn postprocessing_nbt_preserves_section_order_duplicates_and_packed_positions() {
+        let registry = test_registry();
+        let mut chunk =
+            TerrainChunk::new(ChunkPos::new(-3, 5), -64, 384, &registry, Properties).unwrap();
+        chunk.mark_postprocessing(-45, -63, 85);
+        chunk.mark_postprocessing(-45, -63, 85);
+        chunk.mark_postprocessing(-47, -48, 81);
+        let crate::nbt::Tag::List(sections) = chunk.postprocessing_nbt() else {
+            panic!("postprocessing is a list by section");
+        };
+        assert_eq!(sections.len(), 24);
+        assert_eq!(
+            sections[0],
+            crate::nbt::Tag::List(vec![
+                crate::nbt::Tag::Short(0x513),
+                crate::nbt::Tag::Short(0x513),
+            ])
+        );
+        assert_eq!(
+            sections[1],
+            crate::nbt::Tag::List(vec![crate::nbt::Tag::Short(0x101),])
+        );
+        assert!(
+            sections[2..]
+                .iter()
+                .all(|section| *section == crate::nbt::Tag::List(Vec::new()))
+        );
     }
 
     #[test]

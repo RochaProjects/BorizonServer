@@ -3,8 +3,10 @@ use crate::heightmap::{Heightmap, HeightmapError, HeightmapType};
 use horizon_core::{
     biome::BiomeZoom,
     position::{BlockPos, ChunkPos},
+    storage::PackedStorage,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::io;
 
 #[derive(Clone, Debug)]
 pub struct BiomeChunk<T> {
@@ -65,6 +67,81 @@ impl<T: Clone> BiomeChunk<T> {
     pub fn quart_range(&self) -> (i32, i32) {
         let bottom = self.min_y >> 2;
         (bottom, bottom + (self.height >> 2) - 1)
+    }
+    /// Encode each 4×4×4 quart biome section as the vanilla chunk-NBT `biomes`
+    /// palette compound. This is one field adapter, not a complete chunk codec.
+    pub fn biome_sections_nbt(
+        &self,
+        mut name: impl FnMut(&T) -> Option<String>,
+    ) -> io::Result<Vec<crate::nbt::Tag>>
+    where
+        T: Eq,
+    {
+        self.sections
+            .iter()
+            .enumerate()
+            .map(|(section_index, values)| {
+                let mut palette = Vec::<(&T, String)>::new();
+                let mut cell_ids = Vec::with_capacity(64);
+                for value in values {
+                    let id = if let Some(id) = palette.iter().position(|(known, _)| *known == value)
+                    {
+                        id
+                    } else {
+                        let identifier = name(value).ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidData, "unknown biome identity")
+                        })?;
+                        palette.push((value, identifier));
+                        palette.len() - 1
+                    };
+                    cell_ids.push(id as u32);
+                }
+                let bits = if palette.len() <= 1 {
+                    0
+                } else {
+                    (usize::BITS - (palette.len() - 1).leading_zeros()).max(1) as u8
+                };
+                let mut biome_palette = crate::nbt::Tag::compound([(
+                    "palette",
+                    crate::nbt::Tag::List(
+                        palette
+                            .iter()
+                            .map(|(_, id)| crate::nbt::Tag::String(id.as_str().into()))
+                            .collect(),
+                    ),
+                )]);
+                if bits > 0 {
+                    let mut storage = PackedStorage::new(bits, 64).map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })?;
+                    for (index, id) in cell_ids.into_iter().enumerate() {
+                        storage.set(index, id).map_err(|error| {
+                            io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                        })?;
+                    }
+                    let crate::nbt::Tag::Compound(fields) = &mut biome_palette else {
+                        unreachable!()
+                    };
+                    fields.insert(
+                        "data".into(),
+                        crate::nbt::Tag::LongArray(
+                            storage.words().iter().map(|&word| word as i64).collect(),
+                        ),
+                    );
+                }
+                let section_y = self.min_y / 16 + section_index as i32;
+                let y = i8::try_from(section_y).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "biome section Y out of NBT range",
+                    )
+                })?;
+                Ok(crate::nbt::Tag::compound([
+                    ("Y", crate::nbt::Tag::Byte(y)),
+                    ("biomes", biome_palette),
+                ]))
+            })
+            .collect()
     }
     /// Fill the sections intersecting inclusive generation bounds. Sections are
     /// visited bottom to top; each resolver sees X/Y/Z loop order. A failed
@@ -128,6 +205,81 @@ impl<T: Clone> BiomeChunk<T> {
 }
 fn index(x: i32, y: i32, z: i32) -> usize {
     (((y & 3) << 4) | ((z & 3) << 2) | (x & 3)) as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nbt::Tag;
+
+    #[test]
+    fn biome_section_nbt_uses_stable_palette_and_quart_cell_order() {
+        let position = ChunkPos::new(-3, 5);
+        let mut chunk = BiomeChunk::new(position, -64, 384, 0u8).unwrap();
+        chunk
+            .fill(-64, -49, |[x, _, _]| Ok::<_, ()>((x & 1) as u8))
+            .unwrap();
+
+        let sections = chunk
+            .biome_sections_nbt(|id| {
+                Some(
+                    if *id == 0 {
+                        "minecraft:plains"
+                    } else {
+                        "minecraft:forest"
+                    }
+                    .into(),
+                )
+            })
+            .unwrap();
+        assert_eq!(sections.len(), 24);
+        assert_eq!(sections[0].get("Y"), Some(&Tag::Byte(-4)));
+        let Some(Tag::Compound(biomes)) = sections[0].get("biomes") else {
+            panic!("missing biome palette compound");
+        };
+        assert_eq!(
+            biomes.get(&"palette".into()),
+            Some(&Tag::List(vec![
+                Tag::String("minecraft:plains".into()),
+                Tag::String("minecraft:forest".into()),
+            ]))
+        );
+        let Some(Tag::LongArray(words)) = biomes.get(&"data".into()) else {
+            panic!("mixed biome palette must carry packed data");
+        };
+        let storage =
+            PackedStorage::from_words(1, 64, words.iter().map(|&word| word as u64).collect())
+                .unwrap();
+        let quart_min = -16;
+        for dy in 0..4 {
+            for dz in 0..4 {
+                for dx in 0..4 {
+                    let cell = index(dx, dy, dz);
+                    let name = if storage.get(cell).unwrap() == 0 {
+                        "minecraft:plains"
+                    } else {
+                        "minecraft:forest"
+                    };
+                    assert_eq!(
+                        name,
+                        if ((-12 + dx) & 1) == 0 {
+                            "minecraft:plains"
+                        } else {
+                            "minecraft:forest"
+                        },
+                        "quart at y {} (range begins {quart_min})",
+                        quart_min + dy
+                    );
+                }
+            }
+        }
+        assert!(sections[1..].iter().all(|section| {
+            matches!(
+                section.get("biomes"),
+                Some(Tag::Compound(map)) if map.get(&"palette".into()) == Some(&Tag::List(vec![Tag::String("minecraft:plains".into())])) && !map.contains_key(&"data".into())
+            )
+        }));
+    }
 }
 
 /// Resident biome sections shared by decoration selection and block biome zoom.

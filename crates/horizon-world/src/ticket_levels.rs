@@ -31,6 +31,7 @@
 //! Whoever the players are (the local player, LAN guests, a dedicated
 //! server's players), they count the same.
 use horizon_core::fast_hash::FxHashMap;
+use horizon_core::position::ChunkPos;
 use std::sync::Arc;
 
 /// `ChunkLevel`'s levels.
@@ -77,6 +78,20 @@ pub struct Sources {
 /// so a scan of the residents need not ask each one of them.
 #[derive(Clone, Default)]
 pub struct Levels(Option<Arc<Map>>, Option<(i32, i32, i32, i32)>);
+
+/// The finite FULL-ticket set exceeded a caller's explicit candidate budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CandidateLimitExceeded {
+    pub limit: usize,
+}
+
+impl std::fmt::Display for CandidateLimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FULL ticket candidates exceed limit {}", self.limit)
+    }
+}
+
+impl std::error::Error for CandidateLimitExceeded {}
 
 /// The levels by chunk: a grid over the tickets' bounding box while it is
 /// small (players near each other, the usual case), sparse 16×16 tiles otherwise.
@@ -233,6 +248,70 @@ impl Levels {
     /// No ticket source (`None`) remains the headless mode that ticks everywhere.
     pub fn fully_loaded(&self, x: i32, z: i32) -> bool {
         self.get(x, z).is_none_or(|(loading, _)| loading <= FULL)
+    }
+    /// A stable snapshot of finite chunks with a `FULL` loading ticket or
+    /// higher readiness. `Ok(None)` is headless mode (`Sources == None`), where
+    /// every coordinate is fully loaded and no finite candidate set exists.
+    /// The caller must provide a budget; exceeding it fails without returning a
+    /// partial set. This enumerates ticket candidates only, not active chunks
+    /// that may need parking after their tickets disappear.
+    pub fn fully_loaded_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Option<Vec<ChunkPos>>, CandidateLimitExceeded> {
+        fn push(
+            candidates: &mut Vec<ChunkPos>,
+            limit: usize,
+            x: i32,
+            z: i32,
+            loading: u8,
+        ) -> Result<(), CandidateLimitExceeded> {
+            if loading <= FULL {
+                if candidates.len() == limit {
+                    return Err(CandidateLimitExceeded { limit });
+                }
+                candidates.push(ChunkPos::new(x, z));
+            }
+            Ok(())
+        }
+
+        let Some(map) = &self.0 else {
+            return Ok(None);
+        };
+        let mut candidates = Vec::new();
+        match map.as_ref() {
+            Map::Grid {
+                x0,
+                z0,
+                width,
+                cells,
+                ..
+            } => {
+                for (index, &(loading, _)) in cells.iter().enumerate() {
+                    let x = x0.wrapping_add((index as u32 % width) as i32);
+                    let z = z0.wrapping_add((index as u32 / width) as i32);
+                    push(&mut candidates, limit, x, z, loading)?;
+                }
+            }
+            #[cfg(test)]
+            Map::Sparse(map) => {
+                for (&(x, z), &(loading, _)) in map {
+                    push(&mut candidates, limit, x, z, loading)?;
+                }
+            }
+            Map::Tiled(map) => {
+                for (&(tx, tz), tile) in &map.0 {
+                    let (base_x, base_z) = (tx * 16, tz * 16);
+                    for (index, &(loading, _)) in tile.iter().enumerate() {
+                        let x = base_x + index as i32 % 16;
+                        let z = base_z + index as i32 / 16;
+                        push(&mut candidates, limit, x, z, loading)?;
+                    }
+                }
+            }
+        }
+        candidates.sort_unstable_by_key(|position| (position.x, position.z));
+        Ok(Some(candidates))
     }
     /// The same as [`Self::entity_ticking`] at a block position.
     pub fn entity_ticking_at(&self, x: i32, z: i32) -> bool {
@@ -557,6 +636,74 @@ mod tests {
             simulation_distance: sim,
         }));
         t.levels()
+    }
+
+    #[test]
+    fn full_ticket_candidates_are_bounded_sorted_and_match_loading_levels() {
+        let mut tickets = ChunkTickets::default();
+        tickets.add_portal((-100, 7));
+        tickets.update(Some(Sources {
+            players: vec![(0, 0), (1, 1)],
+            forced: vec![(100, -4)],
+            portal: Vec::new(),
+            dragon: Some((200, 200)),
+            view_distance: 0,
+            simulation_distance: 0,
+        }));
+        let levels = tickets.levels();
+        let candidates = levels.fully_loaded_candidates(2_000).unwrap().unwrap();
+        assert!(
+            candidates
+                .windows(2)
+                .all(|pair| { (pair[0].x, pair[0].z) < (pair[1].x, pair[1].z) })
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|position| levels.fully_loaded(position.x, position.z))
+        );
+        assert!(candidates.contains(&ChunkPos::new(2, 2)));
+        assert!(candidates.contains(&ChunkPos::new(102, -4)));
+        assert!(candidates.contains(&ChunkPos::new(-103, 7)));
+        assert!(candidates.contains(&ChunkPos::new(209, 200)));
+        assert!(!candidates.contains(&ChunkPos::new(4, 0)));
+        assert_eq!(
+            levels.fully_loaded_candidates(candidates.len() - 1),
+            Err(CandidateLimitExceeded {
+                limit: candidates.len() - 1
+            })
+        );
+
+        let mut empty = ChunkTickets::default();
+        empty.update(Some(Sources::default()));
+        assert_eq!(
+            empty.levels().fully_loaded_candidates(0),
+            Ok(Some(Vec::new()))
+        );
+        assert_eq!(
+            ChunkTickets::default().levels().fully_loaded_candidates(0),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn full_ticket_candidate_enumeration_handles_tiled_maps() {
+        let mut tickets = ChunkTickets::default();
+        tickets.update(Some(Sources {
+            players: vec![(0, 0), (10_000, -10_000)],
+            view_distance: 0,
+            simulation_distance: 0,
+            ..Default::default()
+        }));
+        let levels = tickets.levels();
+        assert!(matches!(levels.0.as_deref(), Some(Map::Tiled(_))));
+        let candidates = levels.fully_loaded_candidates(100).unwrap().unwrap();
+        assert_eq!(candidates.len(), 50);
+        assert!(
+            candidates
+                .iter()
+                .all(|position| levels.fully_loaded(position.x, position.z))
+        );
     }
 
     #[test]

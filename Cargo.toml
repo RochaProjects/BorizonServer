@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/horizon-core", "crates/horizon-world", "crates/horizon-protocol", "crates/horizon-server-files"]
+members = ["crates/horizon-core", "crates/horizon-world", "crates/horizon-protocol", "crates/horizon-server-files", "crates/horizon-engine"]
 resolver = "2"
 
 [workspace.package]

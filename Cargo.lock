@@ -190,6 +190,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-engine"
+version = "0.1.0"
+dependencies = [
+ "horizon-server-files",
+]
+
+[[package]]
 name = "horizon-protocol"
 version = "0.1.0"
 dependencies = [

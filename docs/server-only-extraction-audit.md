@@ -57,18 +57,18 @@ Essa lista não afirma que cada dependência necessariamente permanecerá no man
 
 1. Fixar o commit/branch de trabalho como fonte de integração; manter `BorizonServer-main` somente como referência e o WIP como snapshot alternativo.
 2. Definir o artefato como binário **engine** sem supervisor/UI. Registrar explicitamente a lista de dependências proibidas e o conjunto mínimo de recursos preparados.
-3. Antes de portar código, levantar no branch concreto os owners, manifests, símbolos e caminhos existentes; o relatório atual não permite preencher esses detalhes que faltam.
+3. A auditoria estática das seis fronteiras foi registrada neste documento e na seção 1–6 acima; confirmou que entry/Game/dedicated/LAN/streaming não estão na árvore atual, enquanto os quatro crates-base server estão. Antes de portar cada módulo, converter o mapa em uma lista de símbolos concretos origem→destino e verificar o diff do branch contra a referência.
 
-**Saída:** mapa de origem/destino e lista de símbolos server a portar/adaptar; nenhuma alegação de build ainda.
+**Saída/evidência:** mapa arquitetural e fronteiras de extração documentados; commit atual da branch foi conferido e a `main` continua somente leitura. O mapeamento símbolo→destino está parcial e será refinado ao extrair cada corte.
 
 ### Fase 1 — Esqueleto compilável sem client
 
-1. Criar um binário/crate server engine com manifest independente, sem dependência de `horizon-client`, renderer, input, wgpu/winit, shaders, UI, audio, launcher ou plugin loader.
-2. Reutilizar inicialmente `horizon-core`, `horizon-world`, `horizon-protocol` e `horizon-server-files`, sujeito à inspeção de seu grafo transitivo.
-3. Separar inicialização, logging/configuração, recursos CPU e tratamento de erro; não instanciar `Game` agregado nem chamar fallback `horizon-client`.
-4. Construir e registrar o grafo de dependências antes de adicionar subsistemas. Falha aqui é bloqueio explícito a resolver, não motivo para esconder a dependência via feature.
+1. **Bootstrap criado:** crate/binário `horizon-engine` em `crates/horizon-engine`, com manifest sem dependência direta de `horizon-client`, renderer, input, wgpu/winit, shaders, UI, audio, launcher ou plugin loader.
+2. O bootstrap reutiliza `horizon-server-files` para EULA e `server.properties`; o workspace tem agora cinco crates. Sua dependência transitiva inclui somente os crates server do workspace, mas o runtime de gameplay ainda não está conectado.
+3. CLI inclui `--help`, `--version` e `--preflight`; a execução sem opção é recusada de forma explícita, porque ainda não existe world/Game loop no novo engine. Não instancia nem chama `Game` ou fallback client.
+4. Evidências: `cargo build -p horizon-engine --locked --offline`; `cargo test -p horizon-engine --locked --offline` (5 passaram); `cargo check --workspace --all-targets --locked --offline`; CLI `--help`/`--version`; preflight manual com EULA aceita e `server-port=25571`; `cargo tree -p horizon-engine --edges normal --locked --offline` sem nomes client/render/GPU/mod/plugin; `cargo metadata --no-deps` lista cinco packages; fmt e diff check passaram. Isso prova o bootstrap, não um servidor que aceita conexões.
 
-**Saída:** primeiro binário engine que inicializa e termina limpo, ainda sem declarar gameplay completo.
+**Saída atual:** primeiro binário engine server-only compilável para help/version/preflight. **Falta** o modo runtime que inicialize um mundo ou execute tick; só declarar essa fase concluída quando uma rota de inicialização real do dedicado for extraída/adaptada e smoke-testada.
 
 ### Fase 2 — Tick autoritativo mínimo
 

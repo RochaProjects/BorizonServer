@@ -1052,13 +1052,28 @@ fn local_world_runtime_owns_region_chunk_load_save_and_reopen() {
             .unwrap()
     );
     let dimension = world.dimension_mut("minecraft:overworld").unwrap();
+    dimension.resident_mut().update_chunk_tickets(None);
+    let headless = dimension.lifecycle_candidates(0).unwrap();
+    assert!(headless.headless_unbounded);
+    assert!(headless.candidates.is_empty());
+    let missing_chunk = ChunkPos::new(chunk.x - 1, chunk.z);
     dimension
         .resident_mut()
         .update_chunk_tickets(Some(crate::ticket_levels::Sources {
-            forced: vec![(chunk.x, chunk.z)],
+            forced: vec![(chunk.x, chunk.z), (missing_chunk.x, missing_chunk.z)],
             ..Default::default()
         }));
-    let missing_chunk = ChunkPos::new(chunk.x - 1, chunk.z);
+    let ticketed_plan = dimension.lifecycle_candidates(100_000).unwrap();
+    assert!(!ticketed_plan.headless_unbounded);
+    assert!(ticketed_plan.candidates.contains(&missing_chunk));
+    assert!(ticketed_plan.candidates.contains(&chunk));
+    assert!(
+        ticketed_plan
+            .candidates
+            .windows(2)
+            .all(|pair| (pair[0].x, pair[0].z) < (pair[1].x, pair[1].z))
+    );
+    assert!(dimension.lifecycle_candidates(1).is_err());
     let loaded = dimension
         .reconcile_ticketed_chunks(
             [chunk, chunk, missing_chunk],
@@ -1097,6 +1112,10 @@ fn local_world_runtime_owns_region_chunk_load_save_and_reopen() {
     dimension
         .resident_mut()
         .update_chunk_tickets(Some(crate::ticket_levels::Sources::default()));
+    let owned_plan = dimension.lifecycle_candidates(1).unwrap();
+    assert!(!owned_plan.headless_unbounded);
+    assert_eq!(owned_plan.candidates, vec![chunk]);
+    assert!(dimension.lifecycle_candidates(0).is_err());
     let deferred = dimension
         .reconcile_ticketed_chunks(
             [chunk],
@@ -1176,6 +1195,10 @@ fn local_world_runtime_owns_region_chunk_load_save_and_reopen() {
     assert!(dimension.active_chunk_data(chunk).is_none());
     assert!(dimension.is_chunk_parked(chunk));
     assert_eq!(dimension.parked_chunk_count(), 1);
+    assert_eq!(
+        dimension.lifecycle_candidates(1).unwrap().candidates,
+        vec![chunk]
+    );
     assert!(dimension.resident().chunk_save_revision(chunk).is_none());
     assert!(!dimension.park_chunk(chunk));
     assert_eq!(dimension.parked_chunk_count(), 1);

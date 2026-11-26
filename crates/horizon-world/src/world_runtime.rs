@@ -98,6 +98,16 @@ pub struct DirtyChunkSaveReport {
     pub remaining_dirty: usize,
 }
 
+/// Finite positions known to the dimension's ticket and payload owners.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LifecycleCandidatePlan {
+    /// Sorted, unique ticketed or already-owned chunk positions.
+    pub candidates: Vec<ChunkPos>,
+    /// `true` when no ticket sources exist and the ticket map treats every
+    /// coordinate as loaded; only active/parked coordinates can be enumerated.
+    pub headless_unbounded: bool,
+}
+
 impl<'registry> WorldDimension<'registry> {
     pub fn resident(&self) -> &ResidentDimension<'registry> {
         &self.resident
@@ -196,6 +206,45 @@ impl<'registry> WorldDimension<'registry> {
 
     pub fn parked_chunk_count(&self) -> usize {
         self.parked.len()
+    }
+
+    /// Plan a bounded reconciliation input from finite FULL ticket positions
+    /// plus all active and parked payloads this dimension already owns. This
+    /// does not schedule work or discover arbitrary region records. In headless
+    /// mode, `headless_unbounded` is set and the candidate list contains only
+    /// the finite active/parked payloads known to this owner.
+    pub fn lifecycle_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<LifecycleCandidatePlan, crate::ticket_levels::CandidateLimitExceeded> {
+        let ticketed = self
+            .resident
+            .chunk_tickets()
+            .levels()
+            .fully_loaded_candidates(limit)?;
+        let headless_unbounded = ticketed.is_none();
+        let mut unique = HashSet::new();
+        let mut insert = |position| {
+            if unique.insert(position) && unique.len() > limit {
+                Err(crate::ticket_levels::CandidateLimitExceeded { limit })
+            } else {
+                Ok(())
+            }
+        };
+        if let Some(ticketed) = ticketed {
+            for position in ticketed {
+                insert(position)?;
+            }
+        }
+        for &position in self.active.keys().chain(self.parked.keys()) {
+            insert(position)?;
+        }
+        let mut candidates: Vec<_> = unique.into_iter().collect();
+        candidates.sort_unstable_by_key(|position| (position.x, position.z));
+        Ok(LifecycleCandidatePlan {
+            candidates,
+            headless_unbounded,
+        })
     }
 
     /// Read-only access to a chunk's complete opaque NBT while active.

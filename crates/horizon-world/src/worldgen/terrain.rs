@@ -636,6 +636,17 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
     pub fn block_ticks_mut(&mut self) -> &mut ProtoChunkTicks {
         &mut self.block_ticks
     }
+    /// Encode proto block/fluid tick lists; registry names remain caller-owned.
+    pub fn tick_lists_nbt(
+        &self,
+        block_name: impl FnMut(horizon_core::ticks::TickTypeId) -> Option<String>,
+        fluid_name: impl FnMut(horizon_core::ticks::TickTypeId) -> Option<String>,
+    ) -> io::Result<(crate::nbt::Tag, crate::nbt::Tag)> {
+        Ok((
+            crate::tick_data::write_list(self.block_ticks.pack(0), block_name)?,
+            crate::tick_data::write_list(self.fluid_ticks.pack(0), fluid_name)?,
+        ))
+    }
     pub fn fluid_ticks(&self) -> &ProtoChunkTicks {
         &self.fluid_ticks
     }
@@ -1119,6 +1130,54 @@ mod tests {
                 .iter()
                 .all(|section| *section == crate::nbt::Tag::List(Vec::new()))
         );
+    }
+
+    #[test]
+    fn proto_tick_lists_nbt_uses_registry_callbacks_and_rejects_unknown_names() {
+        use horizon_core::{
+            position::BlockPos,
+            ticks::{ScheduledTick, TickPriority, TickTypeId},
+        };
+        let registry = test_registry();
+        let mut chunk =
+            TerrainChunk::new(ChunkPos::new(-3, 5), -64, 384, &registry, Properties).unwrap();
+        chunk.block_ticks_mut().schedule(ScheduledTick {
+            kind: TickTypeId(7),
+            pos: BlockPos::new(-45, -63, 85),
+            trigger_tick: 0,
+            priority: TickPriority::High,
+            sub_tick_order: 0,
+        });
+        chunk.fluid_ticks_mut().schedule(ScheduledTick {
+            kind: TickTypeId(9),
+            pos: BlockPos::new(-44, -62, 86),
+            trigger_tick: 0,
+            priority: TickPriority::Normal,
+            sub_tick_order: 0,
+        });
+        let (blocks, fluids) = chunk
+            .tick_lists_nbt(
+                |id| (id == TickTypeId(7)).then(|| "minecraft:stone".into()),
+                |id| (id == TickTypeId(9)).then(|| "minecraft:water".into()),
+            )
+            .unwrap();
+        let Tag::List(blocks) = blocks else {
+            panic!("block ticks form a list");
+        };
+        let Tag::List(fluids) = fluids else {
+            panic!("fluid ticks form a list");
+        };
+        assert_eq!(
+            blocks[0].get("i"),
+            Some(&Tag::String("minecraft:stone".into()))
+        );
+        assert_eq!(blocks[0].get("x"), Some(&Tag::Int(-45)));
+        assert_eq!(blocks[0].get("p"), Some(&Tag::Int(-1)));
+        assert_eq!(
+            fluids[0].get("i"),
+            Some(&Tag::String("minecraft:water".into()))
+        );
+        assert!(chunk.tick_lists_nbt(|_| None, |_| None).is_err());
     }
 
     #[test]

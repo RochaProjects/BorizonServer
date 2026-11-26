@@ -777,6 +777,48 @@ impl GeneratorData {
     }
 }
 
+fn merge_proto_section_fields(
+    blocks: &[crate::nbt::Tag],
+    biomes: &[crate::nbt::Tag],
+) -> io::Result<crate::nbt::Tag> {
+    if blocks.len() != biomes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "block and biome section counts differ",
+        ));
+    }
+    let sections = blocks
+        .iter()
+        .zip(biomes)
+        .map(|(block, biome)| {
+            let y = block.get("Y").cloned().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "block section has no Y")
+            })?;
+            if biome.get("Y") != Some(&y) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "block and biome section Y differ",
+                ));
+            }
+            let states = block.get("block_states").cloned().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "block section has no block_states",
+                )
+            })?;
+            let biome_data = biome.get("biomes").cloned().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "biome section has no biomes")
+            })?;
+            Ok(crate::nbt::Tag::compound([
+                ("Y", y),
+                ("block_states", states),
+                ("biomes", biome_data),
+            ]))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    Ok(crate::nbt::Tag::List(sections))
+}
+
 /// A generated chunk with its quart biomes. Blocks and heightmaps live in
 /// `terrain`; after `generate_proto` it is at the TERRAIN status with the
 /// WORLD_SURFACE(_WG), OCEAN_FLOOR(_WG) and MOTION_BLOCKING(_NO_LEAVES)
@@ -848,6 +890,15 @@ impl ProtoChunk {
     }
     pub fn biomes(&self) -> &BiomeChunk<BiomeId> {
         &self.biomes
+    }
+    /// Encode the proto's vanilla section list by joining block and biome
+    /// palettes. This remains only the `sections` field, not a complete chunk.
+    pub fn sections_nbt(&self) -> io::Result<crate::nbt::Tag> {
+        let blocks = self.terrain.block_sections_nbt()?;
+        let biomes = self
+            .biomes
+            .biome_sections_nbt(|id| Some(self.data.biome_name(*id).to_owned()))?;
+        merge_proto_section_fields(&blocks, &biomes)
     }
     pub fn data(&self) -> &Arc<GeneratorData> {
         &self.data
@@ -3386,6 +3437,38 @@ impl GeneratorWorker {
 mod tests {
     use super::super::biome_chunks::CACHE_LIMIT;
     use super::*;
+    #[test]
+    fn proto_section_merge_checks_y_and_keeps_both_palette_fields() {
+        use crate::nbt::Tag;
+        let blocks = vec![Tag::compound([
+            ("Y", Tag::Byte(-4)),
+            ("block_states", Tag::String("blocks".into())),
+        ])];
+        let biomes = vec![Tag::compound([
+            ("Y", Tag::Byte(-4)),
+            ("biomes", Tag::String("biomes".into())),
+        ])];
+        let Tag::List(merged) = merge_proto_section_fields(&blocks, &biomes).unwrap() else {
+            panic!("merged sections form a list");
+        };
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].get("Y"), Some(&Tag::Byte(-4)));
+        assert_eq!(
+            merged[0].get("block_states"),
+            Some(&Tag::String("blocks".into()))
+        );
+        assert_eq!(merged[0].get("biomes"), Some(&Tag::String("biomes".into())));
+        let shifted = vec![Tag::compound([
+            ("Y", Tag::Byte(-3)),
+            ("biomes", Tag::String("biomes".into())),
+        ])];
+        assert_eq!(
+            merge_proto_section_fields(&blocks, &shifted)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
     #[test]
     fn settings_default_states_read_the_26_3_block_state_form() {
         let facts = br#"{"states": [

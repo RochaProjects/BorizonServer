@@ -1,4 +1,4 @@
-//! Server-owned local storage for vanilla world scoreboard and per-dimension borders.
+//! Server-owned local storage for vanilla world-global and per-dimension SavedData.
 //!
 //! This adapter owns file paths and the SavedData NBT envelope only. The server
 //! runtime remains responsible for deciding when a world/level is ready to load
@@ -56,10 +56,19 @@ impl WorldSavedData {
     }
 
     /// Load vanilla total-tick counters keyed by dimension identifier.
+    /// When the Overworld entry is absent, `Data.DayTime` remains a read-only
+    /// fallback for legacy saves; other saved dimensions are preserved.
     pub fn load_world_clocks(&self) -> io::Result<WorldClocks> {
         let data = read_saved_data(&self.world_clocks_path(), Ty::SavedWorldClocks)?
             .unwrap_or_else(empty_compound);
-        Ok(WorldClocks { data })
+        let mut clocks = WorldClocks { data };
+        if clocks.total_ticks("minecraft:overworld").is_none()
+            && let Some(level) = self.read_legacy_level_data()?
+            && let Some(day_time) = integer(level.get("DayTime"))
+        {
+            clocks.set_total_ticks("minecraft:overworld", day_time);
+        }
+        Ok(clocks)
     }
 
     /// Save per-dimension counters with the current data version.
@@ -67,24 +76,36 @@ impl WorldSavedData {
         write_saved_data(&self.world_clocks_path(), clocks.data.clone())
     }
 
-    /// Load vanilla weather timers and targets, defaulting when the file or
-    /// `data` compound is absent. Fade levels are initialized to their targets.
+    /// Load vanilla weather timers and targets, falling back field-by-field to
+    /// pre-SavedData `level.dat` keys. Fade levels are initialized to targets.
     pub fn load_weather(&self) -> io::Result<Weather> {
         let data =
             read_saved_data(&self.weather_path(), Ty::SavedWeather)?.unwrap_or_else(empty_compound);
-        let number = |key: &str| match data.get(key) {
-            Some(Tag::Byte(value)) => i64::from(*value),
-            Some(Tag::Short(value)) => i64::from(*value),
-            Some(Tag::Int(value)) => i64::from(*value),
-            Some(Tag::Long(value)) => *value,
-            _ => 0,
+        let legacy = if [
+            "clear_weather_time",
+            "rain_time",
+            "thunder_time",
+            "raining",
+            "thundering",
+        ]
+        .iter()
+        .any(|key| integer(data.get(key)).is_none())
+        {
+            self.read_legacy_level_data()?
+        } else {
+            None
         };
-        let raining = number("raining") != 0;
-        let thundering = number("thundering") != 0;
+        let number = |key: &str, old_key: &str| {
+            integer(data.get(key))
+                .or_else(|| legacy.as_ref().and_then(|old| integer(old.get(old_key))))
+                .unwrap_or(0)
+        };
+        let raining = number("raining", "raining") != 0;
+        let thundering = number("thundering", "thundering") != 0;
         Ok(Weather {
-            clear_time: number("clear_weather_time") as i32,
-            rain_time: number("rain_time") as i32,
-            thunder_time: number("thunder_time") as i32,
+            clear_time: number("clear_weather_time", "clearWeatherTime") as i32,
+            rain_time: number("rain_time", "rainTime") as i32,
+            thunder_time: number("thunder_time", "thunderTime") as i32,
             raining,
             thundering,
             rain_level: if raining { (1.0, 1.0) } else { (0.0, 0.0) },
@@ -181,6 +202,13 @@ impl WorldSavedData {
         }
         write_saved_data(&path, border.pack())
     }
+
+    fn read_legacy_level_data(&self) -> io::Result<Option<Tag>> {
+        let Some(root) = read_dat(&self.world_root.join("level.dat"))? else {
+            return Ok(None);
+        };
+        Ok(root.get("Data").cloned())
+    }
 }
 
 /// Saved total-tick counters for dimensions in one vanilla world.
@@ -203,13 +231,7 @@ impl Default for WorldClocks {
 impl WorldClocks {
     /// The saved total ticks for a dimension, if that entry has a numeric value.
     pub fn total_ticks(&self, dimension: &str) -> Option<i64> {
-        match self.data.get(dimension)?.get("total_ticks")? {
-            Tag::Byte(value) => Some(i64::from(*value)),
-            Tag::Short(value) => Some(i64::from(*value)),
-            Tag::Int(value) => Some(i64::from(*value)),
-            Tag::Long(value) => Some(*value),
-            _ => None,
-        }
+        integer(self.data.get(dimension)?.get("total_ticks"))
     }
 
     /// Set one dimension's vanilla total-tick counter without discarding
@@ -273,6 +295,16 @@ fn read_saved_data(path: &Path, ty: Ty) -> io::Result<Option<Tag>> {
     ))
 }
 
+fn integer(tag: Option<&Tag>) -> Option<i64> {
+    match tag? {
+        Tag::Byte(value) => Some(i64::from(*value)),
+        Tag::Short(value) => Some(i64::from(*value)),
+        Tag::Int(value) => Some(i64::from(*value)),
+        Tag::Long(value) => Some(*value),
+        _ => None,
+    }
+}
+
 fn write_saved_data(path: &Path, data: Tag) -> io::Result<()> {
     write_dat(
         path,
@@ -314,6 +346,10 @@ mod tests {
 
         fn store(&self) -> WorldSavedData {
             WorldSavedData::new(&self.0)
+        }
+
+        fn write_legacy_level(&self, data: Tag) {
+            write_dat(&self.0.join("level.dat"), &Tag::compound([("Data", data)])).unwrap();
         }
     }
 
@@ -421,9 +457,77 @@ mod tests {
     }
 
     #[test]
+    fn legacy_level_data_fills_missing_weather_and_overworld_clock() {
+        let world = TempWorld::new();
+        let store = world.store();
+        world.write_legacy_level(Tag::compound([
+            ("DataVersion", Tag::Int(4000)),
+            ("DayTime", Tag::Long(34_000)),
+            ("clearWeatherTime", Tag::Int(31)),
+            ("rainTime", Tag::Int(47)),
+            ("thunderTime", Tag::Int(59)),
+            ("raining", Tag::Byte(1)),
+            ("thundering", Tag::Byte(0)),
+        ]));
+        write_saved_data(
+            &store.world_clocks_path(),
+            Tag::compound([(
+                "minecraft:the_end",
+                Tag::compound([("total_ticks", Tag::Long(1234))]),
+            )]),
+        )
+        .unwrap();
+
+        let weather = store.load_weather().unwrap();
+        assert_eq!(weather.clear_time, 31);
+        assert_eq!(weather.rain_time, 47);
+        assert_eq!(weather.thunder_time, 59);
+        assert!(weather.raining);
+        assert!(!weather.thundering);
+        assert_eq!(weather.rain_level, (1.0, 1.0));
+        assert_eq!(weather.thunder_level, (0.0, 0.0));
+
+        let clocks = store.load_world_clocks().unwrap();
+        assert_eq!(clocks.total_ticks("minecraft:overworld"), Some(34_000));
+        assert_eq!(clocks.total_ticks("minecraft:the_end"), Some(1234));
+        assert!(!store.weather_path().exists());
+    }
+
+    #[test]
+    fn saved_weather_fields_override_legacy_values_individually() {
+        let world = TempWorld::new();
+        let store = world.store();
+        world.write_legacy_level(Tag::compound([
+            ("clearWeatherTime", Tag::Int(31)),
+            ("rainTime", Tag::Int(47)),
+            ("thunderTime", Tag::Int(59)),
+            ("raining", Tag::Byte(1)),
+            ("thundering", Tag::Byte(1)),
+        ]));
+        write_saved_data(
+            &store.weather_path(),
+            Tag::compound([
+                ("clear_weather_time", Tag::Int(9)),
+                ("raining", Tag::Byte(0)),
+            ]),
+        )
+        .unwrap();
+
+        let weather = store.load_weather().unwrap();
+        assert_eq!(weather.clear_time, 9);
+        assert_eq!(weather.rain_time, 47);
+        assert_eq!(weather.thunder_time, 59);
+        assert!(!weather.raining);
+        assert!(weather.thundering);
+        assert_eq!(weather.rain_level, (0.0, 0.0));
+        assert_eq!(weather.thunder_level, (1.0, 1.0));
+    }
+
+    #[test]
     fn world_clocks_round_trip_per_dimension_and_preserve_unknown_data() {
         let world = TempWorld::new();
         let store = world.store();
+        world.write_legacy_level(Tag::compound([("DayTime", Tag::Long(7000))]));
         write_dat(
             &store.world_clocks_path(),
             &Tag::compound([

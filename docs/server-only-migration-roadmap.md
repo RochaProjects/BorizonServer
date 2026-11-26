@@ -33,6 +33,10 @@ Ordem corrigida: (1) inventário de arquivos/símbolos e grafo do caminho execut
 
 Há ainda uma referência remota `origin/wip/dedicated-server-boundary-2026-11-24` (`5f450ba163`), um protótipo separado que adiciona `horizon-server-runtime` e um binário `horizon-game` dedicado. Deve ser auditado como fonte de ideias/candidatos, não presumido pronto: esse commit também altera muitas áreas client e o seu `horizon-sim-data` ainda depende de `horizon-client-core`. Não fazer merge integral nem compilar o client para avaliá-lo.
 
+A auditoria estática detalhada das seis fronteiras está em [server-only-extraction-audit.md](server-only-extraction-audit.md). Achados centrais: a branch atual não contém `entry.rs`, `game.rs`, `game/dedicated.rs`, LAN hub nem `horizon-client-render`; o protótipo WIP diverge do HEAD e ainda alcança renderer/input/GPU/plugins; e a separação é viável em princípio, mas exige refatoração do owner `Game`, da pipeline de streaming, rede e ciclo de save — não apenas remoção de crates. Nenhuma inspeção estática demonstrou impossibilidade, mas nenhuma build/grafo/smoke server-only foi comprovada.
+
+**A ordem detalhada no relatório é a prioridade vigente e substitui os “próximos cortes” registrados anteriormente como histórico nas linhas/tabelas abaixo.** Próxima ação de código: mapear símbolos/owners ausentes da referência para destinos server-owned e criar o binário engine independente; manter os owners/encoders recentes congelados até confirmar quais conectam àquele caminho e quais duplicam a implementação existente.
+
 ## Painel de andamento da branch `BorizonV26.3`
 
 Este painel é a fonte de verdade do que já foi feito e do que falta nesta

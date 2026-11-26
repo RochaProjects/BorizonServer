@@ -4273,3 +4273,43 @@ fn a_shulker_lid_updates_the_shapes_and_redstone_of_its_neighbours() {
         );
     }
 }
+
+#[test]
+fn world_dimension_inserts_generated_chunk_data_as_dirty_and_rejects_duplicates() {
+    let registry = tiny_block_registry();
+    let root = std::env::temp_dir().join(format!(
+        "horizon-generated-chunk-insert-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let mut world = crate::world_runtime::LocalWorldRuntime::open(&root, &[]).unwrap();
+    let dimension = ResidentDimension::new(
+        "minecraft:overworld",
+        ResidentLevel::new(&registry, -64, 384, 42).unwrap(),
+        Ticks::new(0),
+    );
+    assert!(world.add_dimension(dimension).unwrap());
+    let position = ChunkPos::new(-3, 5);
+    let state = BlockState {
+        name: "minecraft:stone".to_owned(),
+        properties: BlockProperties::new(),
+    };
+    let generated = saved_test_chunk(position, -4, &state);
+    let dimension = world.dimension_mut("minecraft:overworld").unwrap();
+    assert!(
+        dimension
+            .insert_generated_chunk(generated.clone(), 0, |_| None, |_| None)
+            .unwrap()
+    );
+    assert!(dimension.resident().is_chunk_dirty(position));
+    assert_eq!(dimension.resident().dirty_chunks(), [position]);
+    assert!(dimension.active_chunk_data(position).is_some());
+    assert!(
+        !dimension
+            .insert_generated_chunk(generated, 0, |_| None, |_| None)
+            .unwrap()
+    );
+    drop(world);
+    std::fs::remove_dir_all(root).unwrap();
+}

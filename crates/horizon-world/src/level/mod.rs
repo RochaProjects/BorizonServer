@@ -871,6 +871,19 @@ impl<'registry> ResidentLevel<'registry> {
             .is_some_and(|column| column.dirty)
     }
 
+    /// Mark a newly generated or externally replaced resident column dirty.
+    /// The revision advances even when its current block palettes are unchanged.
+    pub fn mark_chunk_dirty(&mut self, position: ChunkPos) -> bool {
+        if !self.columns.contains_key(&position) {
+            return false;
+        }
+        let revision = self.allocate_revision();
+        let column = self.columns.get_mut(&position).expect("checked above");
+        column.dirty = true;
+        column.revision = revision;
+        true
+    }
+
     /// Return the currently resident columns with unsaved block changes.
     pub fn dirty_chunks(&self) -> Vec<ChunkPos> {
         let mut chunks = self

@@ -252,6 +252,32 @@ impl<'registry> WorldDimension<'registry> {
         self.active.get(&position)
     }
 
+    /// Insert a newly generated chunk into resident block/tick state and retain
+    /// its NBT record as dirty for a later caller-triggered region save.
+    pub fn insert_generated_chunk(
+        &mut self,
+        data: ChunkData,
+        game_time: i64,
+        resolve_block: impl FnMut(&str) -> Option<TickTypeId>,
+        resolve_fluid: impl FnMut(&str) -> Option<TickTypeId>,
+    ) -> io::Result<bool> {
+        let position = data.position();
+        if self.active.contains_key(&position) || self.parked.contains_key(&position) {
+            return Ok(false);
+        }
+        if !self.resident.load_generated_chunk_data(
+            &data,
+            game_time,
+            resolve_block,
+            resolve_fluid,
+        )? {
+            return Ok(false);
+        }
+        let replaced = self.active.insert(position, data);
+        debug_assert!(replaced.is_none(), "generated chunk ownership was checked");
+        Ok(true)
+    }
+
     /// Load one region chunk into resident block/tick state and retain its full
     /// NBT payload in this dimension. Returns false if the region record is absent
     /// or the chunk is already active/parked.

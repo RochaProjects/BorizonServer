@@ -137,6 +137,25 @@ impl<'registry> ResidentDimension<'registry> {
         Ok(true)
     }
 
+    /// Install a newly generated proto/full record into both resident owners.
+    /// Unlike loading disk state, its initial snapshot is dirty and eligible for
+    /// the normal save sweep. Tick decode failures retain the existing rollback.
+    pub fn load_generated_chunk_data(
+        &mut self,
+        data: &ChunkData,
+        game_time: i64,
+        resolve_block: impl FnMut(&str) -> Option<TickTypeId>,
+        resolve_fluid: impl FnMut(&str) -> Option<TickTypeId>,
+    ) -> io::Result<bool> {
+        let position = data.position();
+        if !self.load_chunk_data(data, game_time, resolve_block, resolve_fluid)? {
+            return Ok(false);
+        }
+        let marked = self.level.mark_chunk_dirty(position);
+        debug_assert!(marked, "generated chunk was just loaded into the level");
+        Ok(marked)
+    }
+
     /// Read and load one chunk from an already-open region. Region ownership and
     /// sync remain with the caller; chunk block/tick lifecycle is coordinated here.
     pub fn load_region_chunk(

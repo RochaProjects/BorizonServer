@@ -5,19 +5,70 @@
 //! owner centralizes local SavedData loading/saving and per-dimension borders and
 //! total-tick counters without carrying client or remote-world state.
 use crate::{
+    chunk::ChunkData,
+    compression::Compression,
     gamerules::GameRules,
     level::{LevelAccess, ResidentDimension},
+    nbt::Limits,
+    region::RegionFile,
     scoreboard::Scoreboard,
     weather::Weather,
     world_border::WorldBorder,
     world_saved_data::{WorldClocks, WorldSavedData},
 };
-use std::{collections::BTreeMap, io, path::Path};
+use horizon_core::{position::ChunkPos, ticks::TickTypeId};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs, io,
+    path::{Path, PathBuf},
+};
+
+struct DimensionRegionStore {
+    directory: PathBuf,
+    opened: HashMap<ChunkPos, RegionFile>,
+}
+
+impl DimensionRegionStore {
+    fn new(directory: PathBuf) -> Self {
+        Self {
+            directory,
+            opened: HashMap::new(),
+        }
+    }
+
+    fn region_mut(
+        &mut self,
+        position: ChunkPos,
+        create: bool,
+    ) -> io::Result<Option<&mut RegionFile>> {
+        if !self.opened.contains_key(&position) {
+            let path = self
+                .directory
+                .join(format!("r.{}.{}.mca", position.x, position.z));
+            if !create && !path.is_file() {
+                return Ok(None);
+            }
+            fs::create_dir_all(&self.directory)?;
+            let region = RegionFile::open_writable(&path, create)?;
+            self.opened.insert(position, region);
+        }
+        Ok(self.opened.get_mut(&position))
+    }
+
+    fn sync_all(&self) -> io::Result<()> {
+        for region in self.opened.values() {
+            region.sync()?;
+        }
+        Ok(())
+    }
+}
 
 /// Runtime state for one registered dimension in a local vanilla world.
 pub struct WorldDimension<'registry> {
     resident: ResidentDimension<'registry>,
     border: WorldBorder,
+    regions: DimensionRegionStore,
+    /// The per-dimension day clock persisted in `world_clocks.dat`.
     total_ticks: i64,
 }
 impl<'registry> WorldDimension<'registry> {
@@ -41,20 +92,92 @@ impl<'registry> WorldDimension<'registry> {
         self.total_ticks
     }
 
-    /// Update the clock tracked by `world_clocks.dat`; the server tick loop must
-    /// call this according to that dimension's vanilla tick policy.
-    pub fn set_total_ticks(&mut self, ticks: i64) {
-        self.total_ticks = ticks;
-        let day_time = self.resident.level().day_time();
-        self.resident.set_times(ticks, day_time);
+    /// The dimension's persisted vanilla clock (`world_clocks.dat`).
+    pub fn day_time(&self) -> i64 {
+        self.total_ticks
     }
 
-    /// Advance game time once and optionally advance day time, returning both
-    /// clocks. The owning server applies the vanilla `advance_time` rule here.
-    pub fn advance_time(&mut self, advance_day_time: bool) -> (i64, i64) {
-        let (game_time, day_time) = self.resident.advance_time(advance_day_time);
-        self.total_ticks = game_time;
-        (game_time, day_time)
+    /// Set this dimension's day clock without changing the shared game clock.
+    pub fn set_day_time(&mut self, day_time: i64) {
+        self.total_ticks = day_time;
+        let game_time = self.resident.level().game_time();
+        self.resident.set_times(game_time, day_time);
+    }
+
+    /// Legacy spelling for setting this dimension's saved day clock; this does
+    /// not change the world's shared game-time counter.
+    #[deprecated(note = "use set_day_time; game time is owned by LocalWorldRuntime")]
+    pub fn set_total_ticks(&mut self, ticks: i64) {
+        self.set_day_time(ticks);
+    }
+
+    /// Load one region chunk and return its original NBT-backed data for the
+    /// caller to retain and later pass back to `save_chunk_to_region`.
+    pub fn load_chunk_from_region(
+        &mut self,
+        position: ChunkPos,
+        limits: Limits,
+        game_time: i64,
+        resolve_block: impl FnMut(&str) -> Option<TickTypeId>,
+        resolve_fluid: impl FnMut(&str) -> Option<TickTypeId>,
+    ) -> io::Result<Option<ChunkData>> {
+        let Some(region) = self.regions.region_mut(position.region(), false)? else {
+            return Ok(None);
+        };
+        let Some(record) = region.read(position)? else {
+            return Ok(None);
+        };
+        let data = ChunkData::new(record.nbt(limits)?)?;
+        if data.position() != position {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk coordinates do not match the region slot",
+            ));
+        }
+        self.resident
+            .load_chunk_data(&data, game_time, resolve_block, resolve_fluid)?;
+        Ok(Some(data))
+    }
+
+    /// Write one complete chunk snapshot and acknowledge it only after the
+    /// owning region has synced successfully. The supplied `ChunkData` remains
+    /// the caller's preservation boundary for unrelated vanilla NBT fields.
+    pub fn save_chunk_to_region(
+        &mut self,
+        data: &mut ChunkData,
+        compression: Compression,
+        timestamp: u32,
+        limits: Limits,
+        game_time: i64,
+        block_name: impl FnMut(TickTypeId) -> Option<String>,
+        fluid_name: impl FnMut(TickTypeId) -> Option<String>,
+    ) -> io::Result<bool> {
+        let position = data.position();
+        let revision = self
+            .resident
+            .chunk_save_revision(position)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "chunk is not resident"))?;
+        let region = self
+            .regions
+            .region_mut(position.region(), true)?
+            .expect("created region must be open");
+        self.resident.save_region_chunk(
+            region,
+            data,
+            compression,
+            timestamp,
+            limits,
+            game_time,
+            block_name,
+            fluid_name,
+        )?;
+        region.sync()?;
+        Ok(self.resident.mark_chunk_snapshot_saved(position, &revision))
+    }
+
+    /// Flush every region file opened for this dimension.
+    pub fn sync_regions(&self) -> io::Result<()> {
+        self.regions.sync_all()
     }
 }
 
@@ -65,6 +188,7 @@ pub struct LocalWorldRuntime<'registry> {
     game_rules: GameRules,
     weather: Weather,
     clocks: WorldClocks,
+    game_time: i64,
     dimensions: BTreeMap<String, WorldDimension<'registry>>,
 }
 impl<'registry> LocalWorldRuntime<'registry> {
@@ -73,6 +197,7 @@ impl<'registry> LocalWorldRuntime<'registry> {
     pub fn open(root: impl AsRef<Path>, enabled_features: &[String]) -> io::Result<Self> {
         let saved = WorldSavedData::new(root.as_ref());
         Ok(Self {
+            game_time: saved.load_game_time()?,
             scoreboard: saved.load_scoreboard()?,
             game_rules: saved.load_game_rules(enabled_features)?,
             weather: saved.load_weather()?,
@@ -106,6 +231,38 @@ impl<'registry> LocalWorldRuntime<'registry> {
         &mut self.weather
     }
 
+    /// The shared vanilla world game-time counter (`level.dat` `Data.Time`).
+    pub fn game_time(&self) -> i64 {
+        self.game_time
+    }
+
+    /// Set the shared game clock on all current dimensions without changing
+    /// their individually restored day clocks.
+    pub fn set_game_time(&mut self, game_time: i64) {
+        self.game_time = game_time;
+        for dimension in self.dimensions.values_mut() {
+            let day_time = dimension.resident.level().day_time();
+            dimension.resident.set_times(game_time, day_time);
+        }
+    }
+
+    /// Advance the shared world game-time clock once and apply it to every
+    /// resident dimension. Dimension day clocks remain unchanged.
+    pub fn advance_game_time(&mut self) -> i64 {
+        let game_time = self.game_time().wrapping_add(1);
+        self.set_game_time(game_time);
+        game_time
+    }
+
+    /// Advance one dimension's day clock according to its owning game-rule
+    /// decision. Returns `None` if the dimension is not registered.
+    pub fn advance_dimension_day_time(&mut self, key: &str, advance: bool) -> Option<i64> {
+        let dimension = self.dimensions.get_mut(key)?;
+        let day_time = dimension.day_time().wrapping_add(i64::from(advance));
+        dimension.set_day_time(day_time);
+        Some(day_time)
+    }
+
     pub fn dimension(&self, key: &str) -> Option<&WorldDimension<'registry>> {
         self.dimensions.get(key)
     }
@@ -135,15 +292,16 @@ impl<'registry> LocalWorldRuntime<'registry> {
             ));
         }
         let border = self.saved.load_world_border(&key)?;
-        let total_ticks = self.clocks.total_ticks(&key).unwrap_or(0);
-        let day_time = resident.level().day_time();
+        let region_directory = self.saved.region_directory(&key)?;
+        let total_ticks = self.clocks.total_ticks(&key).unwrap_or(self.game_time);
         let mut resident = resident;
-        resident.set_times(total_ticks, day_time);
+        resident.set_times(self.game_time, total_ticks);
         self.dimensions.insert(
             key,
             WorldDimension {
                 resident,
                 border,
+                regions: DimensionRegionStore::new(region_directory),
                 total_ticks,
             },
         );
@@ -154,6 +312,8 @@ impl<'registry> LocalWorldRuntime<'registry> {
     /// dimensions. Dirty chunks remain the resident dimensions' responsibility;
     /// callers must save and sync those region records separately.
     pub fn save_world_data(&mut self) -> io::Result<()> {
+        let game_time = self.game_time();
+        self.saved.save_game_time(game_time)?;
         for (key, dimension) in &self.dimensions {
             self.clocks
                 .set_total_ticks(key.clone(), dimension.total_ticks);
@@ -164,6 +324,16 @@ impl<'registry> LocalWorldRuntime<'registry> {
         self.saved.save_world_clocks(&self.clocks)?;
         for (key, dimension) in &self.dimensions {
             self.saved.save_world_border(key, &dimension.border)?;
+        }
+        Ok(())
+    }
+
+    /// Flush every region file opened by the registered dimensions. Per-chunk
+    /// saves already sync before acknowledging dirty state; this is also a
+    /// convenient, explicit durability boundary for world shutdown.
+    pub fn sync_regions(&self) -> io::Result<()> {
+        for dimension in self.dimensions.values() {
+            dimension.sync_regions()?;
         }
         Ok(())
     }

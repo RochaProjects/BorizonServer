@@ -4,24 +4,59 @@
 //! entities, lighting, region-file ownership and durability policy remain with the
 //! caller. It makes it harder for the resident block store and scheduled tick owner
 //! to disagree about which chunks are loaded.
-use super::{Behaviours, LevelAccess, ResidentLevel, Ticks};
-use crate::{chunk::ChunkData, compression::Compression, nbt::Limits, region::RegionFile};
-use horizon_core::{position::ChunkPos, ticks::TickTypeId};
-use std::io;
+use super::{Behaviours, ResidentLevel, Ticks};
+use crate::{
+    chunk::ChunkData,
+    compression::Compression,
+    nbt::Limits,
+    region::RegionFile,
+    ticket_levels::{ChunkTickets, Sources},
+};
+use horizon_core::{
+    position::ChunkPos,
+    ticks::{SavedTick, TickTypeId},
+};
+use std::{collections::HashMap, io};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TickSnapshot {
+    blocks: Vec<SavedTick>,
+    fluids: Vec<SavedTick>,
+}
+
+/// Revision of one complete block-state and scheduled-tick save snapshot.
+/// The opaque tick contents make acknowledgements safe even if queues change
+/// after a staged or asynchronous save began.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResidentChunkRevision {
+    block_revision: u128,
+    tick_snapshot: TickSnapshot,
+}
 
 /// Coordinates a dimension's resident block columns and scheduled block/fluid ticks.
 pub struct ResidentDimension<'registry> {
     key: String,
     level: ResidentLevel<'registry>,
     ticks: Ticks,
+    chunk_tickets: ChunkTickets,
+    saved_ticks: HashMap<ChunkPos, TickSnapshot>,
 }
 impl<'registry> ResidentDimension<'registry> {
     /// Pair an initialized resident level with its tick owner and vanilla dimension ID.
     pub fn new(key: impl Into<String>, level: ResidentLevel<'registry>, ticks: Ticks) -> Self {
+        let mut chunk_tickets = ChunkTickets::default();
+        // A server dimension with no sources has no block-ticking chunks. The
+        // `None` source mode remains available for headless/test levels that
+        // intentionally tick everywhere.
+        chunk_tickets.update(Some(Sources::default()));
+        let mut level = level;
+        level.set_chunk_ticking_levels(chunk_tickets.levels());
         Self {
             key: key.into(),
             level,
             ticks,
+            chunk_tickets,
+            saved_ticks: HashMap::new(),
         }
     }
 
@@ -46,22 +81,24 @@ impl<'registry> ResidentDimension<'registry> {
         &mut self.ticks
     }
 
-    /// Set the level's game/day clocks together so simulation reads the same
-    /// values used by the dimension's scheduled-tick lifecycle.
-    pub fn set_times(&mut self, game_time: i64, day_time: i64) {
-        self.level.set_times(game_time, day_time);
+    /// Current vanilla chunk tickets for this dimension.
+    pub fn chunk_tickets(&self) -> &ChunkTickets {
+        &self.chunk_tickets
     }
 
-    /// Advance one dimension game tick; day time advances only when the caller's
-    /// `advance_time` game rule permits it. Scheduled queues observe this clock.
-    pub fn advance_time(&mut self, advance_day_time: bool) -> (i64, i64) {
-        let game_time = self.level.game_time().wrapping_add(1);
-        let day_time = self
-            .level
-            .day_time()
-            .wrapping_add(i64::from(advance_day_time));
+    /// Rebuild this dimension's ticket levels and immediately apply their
+    /// block-ticking readiness to the resident level. Loading/unloading chunks
+    /// remains the job of the caller's chunk lifecycle.
+    pub fn update_chunk_tickets(&mut self, sources: Option<Sources>) {
+        self.chunk_tickets.update(sources);
+        self.level
+            .set_chunk_ticking_levels(self.chunk_tickets.levels());
+    }
+
+    /// Set the level's game/day clocks together so simulation reads the same
+    /// values used by the dimension's scheduled-tick lifecycle.
+    pub(crate) fn set_times(&mut self, game_time: i64, day_time: i64) {
         self.level.set_times(game_time, day_time);
-        (game_time, day_time)
     }
 
     /// Run vanilla scheduled block and fluid ticks for the current game time.
@@ -96,6 +133,7 @@ impl<'registry> ResidentDimension<'registry> {
             debug_assert!(rolled_back, "newly loaded clean chunk must roll back");
             return Err(error);
         }
+        self.record_tick_snapshot(position);
         Ok(true)
     }
 
@@ -143,6 +181,7 @@ impl<'registry> ResidentDimension<'registry> {
                 error.to_string(),
             ));
         }
+        self.record_tick_snapshot(position);
         Ok(true)
     }
 
@@ -200,17 +239,93 @@ impl<'registry> ResidentDimension<'registry> {
         Ok(())
     }
 
-    /// Acknowledge a chunk snapshot after its storage commit succeeds.
+    /// Capture the block and tick state that a save will persist.
+    pub fn chunk_save_revision(&self, position: ChunkPos) -> Option<ResidentChunkRevision> {
+        Some(ResidentChunkRevision {
+            block_revision: self.level.chunk_revision(position)?,
+            tick_snapshot: self.current_tick_snapshot(position)?,
+        })
+    }
+
+    /// Acknowledge a complete chunk snapshot after its storage commit succeeds.
+    /// Returns false if either blocks or scheduled ticks changed since capture.
+    pub fn mark_chunk_snapshot_saved(
+        &mut self,
+        position: ChunkPos,
+        revision: &ResidentChunkRevision,
+    ) -> bool {
+        if self.level.chunk_revision(position) != Some(revision.block_revision)
+            || self.current_tick_snapshot(position).as_ref() != Some(&revision.tick_snapshot)
+        {
+            return false;
+        }
+        if !self
+            .level
+            .mark_chunk_saved(position, revision.block_revision)
+        {
+            return false;
+        }
+        self.saved_ticks
+            .insert(position, revision.tick_snapshot.clone());
+        true
+    }
+
+    /// Acknowledge block-state-only callers. Tick changes remain dirty until
+    /// acknowledged through `mark_chunk_snapshot_saved` with a full snapshot.
     pub fn mark_chunk_saved(&mut self, position: ChunkPos, revision: u128) -> bool {
         self.level.mark_chunk_saved(position, revision)
     }
 
-    /// Unload a clean chunk from both owners. Dirty chunks are retained.
+    fn current_tick_snapshot(&self, position: ChunkPos) -> Option<TickSnapshot> {
+        Some(TickSnapshot {
+            blocks: self.ticks.blocks.chunk(position)?.pack(0),
+            fluids: self.ticks.fluids.chunk(position)?.pack(0),
+        })
+    }
+
+    fn record_tick_snapshot(&mut self, position: ChunkPos) {
+        if let Some(snapshot) = self.current_tick_snapshot(position) {
+            self.saved_ticks.insert(position, snapshot);
+        }
+    }
+
+    /// Whether block state or scheduled block/fluid ticks have changed since
+    /// their last acknowledged durable snapshot.
+    pub fn is_chunk_dirty(&self, position: ChunkPos) -> bool {
+        if self.level.is_chunk_dirty(position) {
+            return true;
+        }
+        match (
+            self.current_tick_snapshot(position),
+            self.saved_ticks.get(&position),
+        ) {
+            (Some(current), Some(saved)) => current != *saved,
+            // A resident block column must have both vanilla tick queues and
+            // a baseline. Missing either indicates external owner mutation;
+            // fail closed rather than allowing a possibly lossy unload.
+            _ => self.level.chunk_revision(position).is_some(),
+        }
+    }
+
+    /// Resident chunks with either block-state or scheduled-tick changes.
+    pub fn dirty_chunks(&self) -> Vec<ChunkPos> {
+        let mut chunks = self
+            .level
+            .loaded_chunks()
+            .into_iter()
+            .filter(|&position| self.is_chunk_dirty(position))
+            .collect::<Vec<_>>();
+        chunks.sort_by_key(|position| (position.x, position.z));
+        chunks
+    }
+
+    /// Unload a clean chunk from both owners. Dirty block or tick snapshots are retained.
     pub fn unload_chunk(&mut self, position: ChunkPos) -> bool {
-        if !self.level.unload_chunk(position) {
+        if self.is_chunk_dirty(position) || !self.level.unload_chunk(position) {
             return false;
         }
         self.ticks.remove_chunk(position);
+        self.saved_ticks.remove(&position);
         true
     }
 
@@ -219,6 +334,7 @@ impl<'registry> ResidentDimension<'registry> {
         let discarded = self.level.discard_chunk(position);
         if discarded {
             self.ticks.remove_chunk(position);
+            self.saved_ticks.remove(&position);
         }
         discarded
     }

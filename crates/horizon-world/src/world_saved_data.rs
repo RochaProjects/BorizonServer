@@ -35,6 +35,37 @@ impl WorldSavedData {
         }
     }
 
+    /// Load `Data.Time`, vanilla's world game-time counter. A missing or
+    /// non-integral field defaults to zero; legacy `Data.DayTime` is not used
+    /// here because 26.3 stores the day clock separately in `world_clocks.dat`.
+    pub fn load_game_time(&self) -> io::Result<i64> {
+        Ok(self
+            .read_legacy_level_data()?
+            .and_then(|data| integer(data.get("Time")))
+            .unwrap_or(0))
+    }
+
+    /// Update only vanilla `Data.Time` in `level.dat`, preserving all other
+    /// root and Data fields. This does not write a legacy `DayTime` key.
+    pub fn save_game_time(&self, game_time: i64) -> io::Result<()> {
+        let path = self.world_root.join("level.dat");
+        let mut root = read_dat(&path)?.unwrap_or_else(empty_compound);
+        if !matches!(root, Tag::Compound(_)) {
+            root = empty_compound();
+        }
+        let mut data = root.get("Data").cloned().unwrap_or_else(empty_compound);
+        if !matches!(data, Tag::Compound(_)) {
+            data = empty_compound();
+        }
+        if let Tag::Compound(fields) = &mut data {
+            fields.insert("Time".into(), Tag::Long(game_time));
+        }
+        if let Tag::Compound(fields) = &mut root {
+            fields.insert("Data".into(), data);
+        }
+        write_dat(&path, &root)
+    }
+
     /// The world-global `data/minecraft/scoreboard.dat`.
     pub fn scoreboard_path(&self) -> PathBuf {
         self.world_root.join("data/minecraft/scoreboard.dat")
@@ -203,6 +234,22 @@ impl WorldSavedData {
         write_saved_data(&path, border.pack())
     }
 
+    /// Vanilla Anvil region directory for one dimension. The Overworld stores
+    /// chunks under the world root; other dimensions use `dimensions/<id>/region`.
+    pub fn region_directory(&self, dimension: &str) -> io::Result<PathBuf> {
+        let id = parse_dimension(dimension)?;
+        if is_overworld(&id) {
+            Ok(self.world_root.join("region"))
+        } else {
+            Ok(self
+                .world_root
+                .join("dimensions")
+                .join(id.namespace())
+                .join(id.path())
+                .join("region"))
+        }
+    }
+
     fn read_legacy_level_data(&self) -> io::Result<Option<Tag>> {
         let Some(root) = read_dat(&self.world_root.join("level.dat"))? else {
             return Ok(None);
@@ -357,6 +404,26 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn level_dat_game_time_round_trips_without_overwriting_other_vanilla_fields() {
+        let world = TempWorld::new();
+        world.write_legacy_level(Tag::compound([
+            ("Time", Tag::Long(1234)),
+            ("DayTime", Tag::Long(24_000)),
+            ("FutureField", Tag::Long(99)),
+        ]));
+        let store = world.store();
+        assert_eq!(store.load_game_time().unwrap(), 1234);
+        store.save_game_time(5678).unwrap();
+
+        let root = read_dat(&world.0.join("level.dat")).unwrap().unwrap();
+        let data = root.get("Data").unwrap();
+        assert_eq!(data.get("Time"), Some(&Tag::Long(5678)));
+        assert_eq!(data.get("DayTime"), Some(&Tag::Long(24_000)));
+        assert_eq!(data.get("FutureField"), Some(&Tag::Long(99)));
+        assert_eq!(store.load_game_time().unwrap(), 5678);
     }
 
     #[test]
@@ -704,6 +771,14 @@ mod tests {
     fn dimension_identifiers_cannot_escape_the_world_directory() {
         let world = TempWorld::new();
         let store = world.store();
+        assert_eq!(
+            store.region_directory("minecraft:overworld").unwrap(),
+            world.0.join("region")
+        );
+        assert_eq!(
+            store.region_directory("minecraft:the_nether").unwrap(),
+            world.0.join("dimensions/minecraft/the_nether/region")
+        );
         for id in [
             "",
             "minecraft:",
@@ -716,6 +791,10 @@ mod tests {
         ] {
             assert_eq!(
                 store.world_border_path(id).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(
+                store.region_directory(id).unwrap_err().kind(),
                 io::ErrorKind::InvalidInput
             );
             assert_eq!(

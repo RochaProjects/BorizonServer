@@ -84,6 +84,7 @@
 //! // Falling-block entity landed:
 //! behaviours.falling_block_landed(&mut level, &mut ticks, landing_pos, carried_state, false);
 //! ```
+use crate::ticket_levels::Levels;
 use crate::{
     chunk::BlockSection,
     dimension_type::DimensionFacts,
@@ -142,7 +143,7 @@ mod tests;
 pub use bonemeal::TemplateSettings;
 pub use buckets::{BucketContent, is_lava_bucket};
 pub use data::{BlockData, ItemBinding, ItemKind, Named, Props, PushReaction, StateFacts, Tags};
-pub use dimension::ResidentDimension;
+pub use dimension::{ResidentChunkRevision, ResidentDimension};
 pub use falling::Landing;
 pub use interact::{InteractionResult, PlayerContext, PlayerEffect, UseBranch, hit_slot};
 pub use pistons::{BlockEventData, MovingPiston};
@@ -631,6 +632,7 @@ pub struct ResidentLevel<'registry> {
     random: LegacyRandom,
     game_time: i64,
     day_time: i64,
+    ticking_levels: Levels,
 }
 
 struct ResidentColumn<'registry> {
@@ -672,6 +674,7 @@ impl<'registry> ResidentLevel<'registry> {
             random: LegacyRandom::new(seed),
             game_time: 0,
             day_time: 0,
+            ticking_levels: Levels::default(),
         })
     }
 
@@ -915,6 +918,10 @@ impl<'registry> ResidentLevel<'registry> {
         self.game_time = game_time;
         self.day_time = day_time;
     }
+
+    pub(crate) fn set_chunk_ticking_levels(&mut self, levels: Levels) {
+        self.ticking_levels = levels;
+    }
 }
 
 impl LevelAccess for ResidentLevel<'_> {
@@ -978,6 +985,14 @@ impl LevelAccess for ResidentLevel<'_> {
 
     fn day_time(&self) -> i64 {
         self.day_time
+    }
+
+    fn should_tick_blocks_at(&self, chunk: ChunkPos) -> bool {
+        self.ticking_levels.block_ticking(chunk.x, chunk.z)
+    }
+
+    fn is_ticking_chunk(&self, chunk: ChunkPos) -> bool {
+        self.ticking_levels.block_ticking(chunk.x, chunk.z)
     }
 }
 

@@ -1086,6 +1086,40 @@ fn local_world_runtime_owns_region_chunk_load_save_and_reopen() {
         dimension.resident_mut().level_mut().set_raw(block, stone),
         Some(registry.default_state("minecraft:air").unwrap())
     );
+    let mut dirty_payload = Some(data.clone());
+    assert!(!dimension.park_chunk(chunk, &mut dirty_payload));
+    assert!(dirty_payload.is_some());
+    assert!(dimension.resident().is_chunk_dirty(chunk));
+    let failed_save = dimension
+        .save_chunk_to_region(
+            &mut data,
+            crate::compression::Compression::Zlib,
+            123,
+            crate::nbt::Limits::saved(),
+            100,
+            |_| None,
+            |_| None,
+        )
+        .unwrap_err();
+    assert_eq!(failed_save.kind(), std::io::ErrorKind::InvalidData);
+    assert!(dimension.resident().is_chunk_dirty(chunk));
+    let failed_sync = dimension
+        .save_chunk_to_region_with_sync_for_test(
+            &mut data,
+            crate::compression::Compression::Zlib,
+            123,
+            crate::nbt::Limits::saved(),
+            100,
+            |id| (id == TickTypeId(7)).then(|| "minecraft:stone".to_owned()),
+            |id| (id == TickTypeId(3)).then(|| "minecraft:water".to_owned()),
+            |_| Err(std::io::Error::other("injected region sync failure")),
+        )
+        .unwrap_err();
+    assert_eq!(failed_sync.kind(), std::io::ErrorKind::Other);
+    assert!(dimension.resident().is_chunk_dirty(chunk));
+    let mut unsynced_payload = Some(data.clone());
+    assert!(!dimension.park_chunk(chunk, &mut unsynced_payload));
+    assert!(unsynced_payload.is_some());
     assert!(
         dimension
             .save_chunk_to_region(
@@ -1100,6 +1134,91 @@ fn local_world_runtime_owns_region_chunk_load_save_and_reopen() {
             .unwrap()
     );
     assert!(!dimension.resident().is_chunk_dirty(chunk));
+    let wrong_position = ChunkPos::new(chunk.x + 1, chunk.z);
+    let mut wrong_payload = Some(saved_test_chunk(wrong_position, -4, &chunk_state));
+    assert!(!dimension.park_chunk(chunk, &mut wrong_payload));
+    assert_eq!(wrong_payload.as_ref().unwrap().position(), wrong_position);
+    assert!(dimension.resident().chunk_save_revision(chunk).is_some());
+
+    let preserved_nbt = data.root().tag.clone();
+    let mut parked_payload = Some(data);
+    assert!(dimension.park_chunk(chunk, &mut parked_payload));
+    assert!(parked_payload.is_none());
+    assert!(dimension.is_chunk_parked(chunk));
+    assert_eq!(dimension.parked_chunk_count(), 1);
+    assert!(dimension.resident().chunk_save_revision(chunk).is_none());
+    let mut duplicate_payload = Some(saved_test_chunk(chunk, -4, &chunk_state));
+    assert!(!dimension.park_chunk(chunk, &mut duplicate_payload));
+    assert!(duplicate_payload.is_some());
+    assert_eq!(dimension.parked_chunk_count(), 1);
+
+    let activation_error = dimension
+        .activate_parked_chunk(chunk, 100, |_| None, |_| None)
+        .unwrap_err();
+    assert_eq!(activation_error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(dimension.is_chunk_parked(chunk));
+    assert_eq!(dimension.parked_chunk_count(), 1);
+    assert!(dimension.resident().chunk_save_revision(chunk).is_none());
+    assert!(!dimension.resident().has_chunk_ticks(chunk));
+
+    let data = dimension
+        .activate_parked_chunk(
+            chunk,
+            100,
+            |name| (name == "minecraft:stone").then_some(TickTypeId(7)),
+            |name| (name == "minecraft:water").then_some(TickTypeId(3)),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(!dimension.is_chunk_parked(chunk));
+    assert_eq!(dimension.parked_chunk_count(), 0);
+    assert_eq!(&data.root().tag, &preserved_nbt);
+    assert_eq!(
+        data.root().tag.get("unknown_root_field"),
+        Some(&Tag::Long(77))
+    );
+    assert_eq!(
+        data.root()
+            .tag
+            .get("sections")
+            .and_then(|sections| match sections {
+                Tag::List(entries) => entries.first(),
+                _ => None,
+            })
+            .and_then(|section| section.get("biomes")),
+        Some(&Tag::String("opaque-biome-payload".into()))
+    );
+    assert_eq!(
+        dimension
+            .resident()
+            .ticks()
+            .blocks
+            .chunk(chunk)
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(
+        dimension
+            .resident()
+            .ticks()
+            .fluids
+            .chunk(chunk)
+            .unwrap()
+            .count(),
+        1
+    );
+    assert!(
+        dimension
+            .activate_parked_chunk(
+                chunk,
+                100,
+                |name| (name == "minecraft:stone").then_some(TickTypeId(7)),
+                |name| (name == "minecraft:water").then_some(TickTypeId(3)),
+            )
+            .unwrap()
+            .is_none()
+    );
     drop(world);
 
     let mut restored = crate::world_runtime::LocalWorldRuntime::open(&root, &features).unwrap();

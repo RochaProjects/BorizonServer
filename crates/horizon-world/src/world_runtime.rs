@@ -1,9 +1,10 @@
 //! Local vanilla world owner joining world-global SavedData to resident dimensions.
 //!
-//! This is not the dedicated server engine: callers still drive ticks, choose
-//! dimension readiness, own region files and persist dirty chunk snapshots. The
-//! owner centralizes local SavedData loading/saving and per-dimension borders and
-//! total-tick counters without carrying client or remote-world state.
+//! This is not the dedicated server engine: callers still drive simulation ticks
+//! and choose chunk lifecycle/readiness. Active chunks' opaque NBT remains caller-
+//! owned; a manually parked chunk's full payload is retained by its dimension.
+//! The owner centralizes local SavedData, per-dimension borders/clocks and cached
+//! region files without carrying client or remote-world state.
 use crate::{
     chunk::ChunkData,
     compression::Compression,
@@ -68,6 +69,8 @@ pub struct WorldDimension<'registry> {
     resident: ResidentDimension<'registry>,
     border: WorldBorder,
     regions: DimensionRegionStore,
+    /// Complete opaque NBT payloads retained while their block/tick state is parked.
+    parked: HashMap<ChunkPos, ChunkData>,
     /// The per-dimension day clock persisted in `world_clocks.dat`.
     total_ticks: i64,
 }
@@ -111,6 +114,60 @@ impl<'registry> WorldDimension<'registry> {
         self.set_day_time(ticks);
     }
 
+    /// Park one clean resident chunk, transferring its complete NBT payload from
+    /// the caller only after coordinated unload succeeds. A `false` result leaves
+    /// `data` untouched; the caller must save and sync dirty snapshots first.
+    pub fn park_chunk(&mut self, position: ChunkPos, data: &mut Option<ChunkData>) -> bool {
+        let Some(chunk_data) = data.as_ref() else {
+            return false;
+        };
+        if chunk_data.position() != position
+            || self.parked.contains_key(&position)
+            || self.resident.chunk_save_revision(position).is_none()
+            || self.resident.is_chunk_dirty(position)
+            || !self.resident.unload_chunk(position)
+        {
+            return false;
+        }
+        let chunk_data = data.take().expect("validated parked chunk data");
+        let replaced = self.parked.insert(position, chunk_data);
+        debug_assert!(replaced.is_none(), "duplicate parked chunk was rejected");
+        true
+    }
+
+    /// Restore a parked payload to the resident block/tick owners. The opaque NBT
+    /// is returned to the caller only after both owners load successfully; missing
+    /// or already-resident chunks return `None` without consuming parked data.
+    pub fn activate_parked_chunk(
+        &mut self,
+        position: ChunkPos,
+        game_time: i64,
+        resolve_block: impl FnMut(&str) -> Option<TickTypeId>,
+        resolve_fluid: impl FnMut(&str) -> Option<TickTypeId>,
+    ) -> io::Result<Option<ChunkData>> {
+        let Some(data) = self.parked.get(&position) else {
+            return Ok(None);
+        };
+        if self.resident.chunk_save_revision(position).is_some() {
+            return Ok(None);
+        }
+        if !self
+            .resident
+            .load_chunk_data(data, game_time, resolve_block, resolve_fluid)?
+        {
+            return Ok(None);
+        }
+        Ok(self.parked.remove(&position))
+    }
+
+    pub fn is_chunk_parked(&self, position: ChunkPos) -> bool {
+        self.parked.contains_key(&position)
+    }
+
+    pub fn parked_chunk_count(&self) -> usize {
+        self.parked.len()
+    }
+
     /// Load one region chunk and return its original NBT-backed data for the
     /// caller to retain and later pass back to `save_chunk_to_region`.
     pub fn load_chunk_from_region(
@@ -152,6 +209,54 @@ impl<'registry> WorldDimension<'registry> {
         block_name: impl FnMut(TickTypeId) -> Option<String>,
         fluid_name: impl FnMut(TickTypeId) -> Option<String>,
     ) -> io::Result<bool> {
+        self.save_chunk_to_region_inner(
+            data,
+            compression,
+            timestamp,
+            limits,
+            game_time,
+            block_name,
+            fluid_name,
+            RegionFile::sync,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn save_chunk_to_region_with_sync_for_test(
+        &mut self,
+        data: &mut ChunkData,
+        compression: Compression,
+        timestamp: u32,
+        limits: Limits,
+        game_time: i64,
+        block_name: impl FnMut(TickTypeId) -> Option<String>,
+        fluid_name: impl FnMut(TickTypeId) -> Option<String>,
+        sync: impl FnOnce(&RegionFile) -> io::Result<()>,
+    ) -> io::Result<bool> {
+        self.save_chunk_to_region_inner(
+            data,
+            compression,
+            timestamp,
+            limits,
+            game_time,
+            block_name,
+            fluid_name,
+            sync,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn save_chunk_to_region_inner(
+        &mut self,
+        data: &mut ChunkData,
+        compression: Compression,
+        timestamp: u32,
+        limits: Limits,
+        game_time: i64,
+        block_name: impl FnMut(TickTypeId) -> Option<String>,
+        fluid_name: impl FnMut(TickTypeId) -> Option<String>,
+        sync: impl FnOnce(&RegionFile) -> io::Result<()>,
+    ) -> io::Result<bool> {
         let position = data.position();
         let revision = self
             .resident
@@ -171,7 +276,7 @@ impl<'registry> WorldDimension<'registry> {
             block_name,
             fluid_name,
         )?;
-        region.sync()?;
+        sync(region)?;
         Ok(self.resident.mark_chunk_snapshot_saved(position, &revision))
     }
 
@@ -302,6 +407,7 @@ impl<'registry> LocalWorldRuntime<'registry> {
                 resident,
                 border,
                 regions: DimensionRegionStore::new(region_directory),
+                parked: HashMap::new(),
                 total_ticks,
             },
         );
@@ -309,8 +415,8 @@ impl<'registry> LocalWorldRuntime<'registry> {
     }
 
     /// Persist world-global SavedData and the borders/clocks of registered
-    /// dimensions. Dirty chunks remain the resident dimensions' responsibility;
-    /// callers must save and sync those region records separately.
+    /// dimensions. Dirty chunks use the explicit chunk-level save contract and
+    /// `sync_regions` provides an aggregate shutdown flush.
     pub fn save_world_data(&mut self) -> io::Result<()> {
         let game_time = self.game_time();
         self.saved.save_game_time(game_time)?;

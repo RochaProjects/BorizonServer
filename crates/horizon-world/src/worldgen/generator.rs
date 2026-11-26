@@ -819,6 +819,39 @@ fn merge_proto_section_fields(
     Ok(crate::nbt::Tag::List(sections))
 }
 
+fn proto_block_entities_nbt(entries: &[([i32; 3], crate::nbt::Compound)]) -> crate::nbt::Tag {
+    crate::nbt::Tag::List(
+        entries
+            .iter()
+            .map(|(position, payload)| {
+                let mut tag = payload.clone();
+                tag.insert("x".into(), crate::nbt::Tag::Int(position[0]));
+                tag.insert("y".into(), crate::nbt::Tag::Int(position[1]));
+                tag.insert("z".into(), crate::nbt::Tag::Int(position[2]));
+                crate::nbt::Tag::Compound(tag)
+            })
+            .collect(),
+    )
+}
+
+fn proto_structure_references_nbt<'a>(
+    references: impl IntoIterator<Item = (&'a str, ChunkPos)>,
+) -> crate::nbt::Tag {
+    let mut grouped: BTreeMap<&str, Vec<i64>> = BTreeMap::new();
+    for (name, position) in references {
+        grouped
+            .entry(name)
+            .or_default()
+            .push(i64::from(position.x as u32) | (i64::from(position.z) << 32));
+    }
+    crate::nbt::Tag::Compound(
+        grouped
+            .into_iter()
+            .map(|(name, values)| (name.into(), crate::nbt::Tag::LongArray(values)))
+            .collect(),
+    )
+}
+
 /// A generated chunk with its quart biomes. Blocks and heightmaps live in
 /// `terrain`; after `generate_proto` it is at the TERRAIN status with the
 /// WORLD_SURFACE(_WG), OCEAN_FLOOR(_WG) and MOTION_BLOCKING(_NO_LEAVES)
@@ -899,6 +932,48 @@ impl ProtoChunk {
             .biomes
             .biome_sections_nbt(|id| Some(self.data.biome_name(*id).to_owned()))?;
         merge_proto_section_fields(&blocks, &biomes)
+    }
+    /// Encode structure/template block entities with their absolute positions.
+    pub fn block_entities_nbt(&self) -> crate::nbt::Tag {
+        proto_block_entities_nbt(&self.block_entities)
+    }
+    /// Encode generated entity payloads already represented in vanilla NBT.
+    pub fn entities_nbt(&self) -> crate::nbt::Tag {
+        crate::nbt::Tag::List(
+            self.entities
+                .iter()
+                .cloned()
+                .map(crate::nbt::Tag::Compound)
+                .collect(),
+        )
+    }
+    /// Encode local structure starts plus references to starts in neighbor
+    /// chunks. A start with an unsavable piece fails rather than disappearing.
+    pub fn structures_nbt(&self) -> io::Result<crate::nbt::Tag> {
+        let starts = self
+            .own_starts
+            .iter()
+            .map(|start| {
+                start
+                    .save()
+                    .map(|tag| (start.name.as_str().into(), tag))
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "structure start cannot be saved",
+                        )
+                    })
+            })
+            .collect::<io::Result<crate::nbt::Compound>>()?;
+        let references = proto_structure_references_nbt(
+            self.structure_starts
+                .iter()
+                .map(|start| (start.name.as_str(), start.chunk)),
+        );
+        Ok(crate::nbt::Tag::compound([
+            ("starts", crate::nbt::Tag::Compound(starts)),
+            ("References", references),
+        ]))
     }
     pub fn data(&self) -> &Arc<GeneratorData> {
         &self.data
@@ -3437,6 +3512,50 @@ impl GeneratorWorker {
 mod tests {
     use super::super::biome_chunks::CACHE_LIMIT;
     use super::*;
+    #[test]
+    fn proto_block_entity_nbt_writes_absolute_position_over_payload_coordinates() {
+        use crate::nbt::Tag;
+        let entries = vec![(
+            [-45, -63, 85],
+            crate::nbt::Compound::from([
+                ("id".into(), Tag::String("minecraft:chest".into())),
+                ("x".into(), Tag::Int(0)),
+            ]),
+        )];
+        let Tag::List(encoded) = proto_block_entities_nbt(&entries) else {
+            panic!("block entities form a list");
+        };
+        assert_eq!(
+            encoded[0].get("id"),
+            Some(&Tag::String("minecraft:chest".into()))
+        );
+        assert_eq!(encoded[0].get("x"), Some(&Tag::Int(-45)));
+        assert_eq!(encoded[0].get("y"), Some(&Tag::Int(-63)));
+        assert_eq!(encoded[0].get("z"), Some(&Tag::Int(85)));
+    }
+    #[test]
+    fn proto_structure_references_nbt_groups_names_and_packs_negative_chunks() {
+        use crate::nbt::Tag;
+        let encoded = proto_structure_references_nbt([
+            ("minecraft:village", ChunkPos::new(-2, -3)),
+            ("minecraft:stronghold", ChunkPos::new(4, 7)),
+            ("minecraft:village", ChunkPos::new(8, 9)),
+        ]);
+        assert_eq!(
+            encoded.get("minecraft:stronghold"),
+            Some(&Tag::LongArray(vec![
+                i64::from(4u32) | (i64::from(7i32) << 32),
+            ]))
+        );
+        let Some(Tag::LongArray(villages)) = encoded.get("minecraft:village") else {
+            panic!("village references are a long array");
+        };
+        assert_eq!(villages.len(), 2);
+        assert_eq!(
+            villages[0] as u64,
+            u64::from((-2i32) as u32) | (u64::from((-3i32) as u32) << 32)
+        );
+    }
     #[test]
     fn proto_section_merge_checks_y_and_keeps_both_palette_fields() {
         use crate::nbt::Tag;

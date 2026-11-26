@@ -1208,6 +1208,61 @@ mod upgrade_tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    /// A legacy level's weather and day clock are extracted into their vanilla
+    /// SavedData files by the 4772 file fix and upgraded to the current version.
+    #[test]
+    fn upgrade_extracts_legacy_weather_and_world_clocks() {
+        let base =
+            std::env::temp_dir().join(format!("horizon-saved-data-extract-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let level = Tag::compound([(
+            "Data",
+            Tag::compound([
+                ("DataVersion", Tag::Int(4000)),
+                ("Time", Tag::Long(12_000)),
+                ("DayTime", Tag::Long(34_000)),
+                ("clearWeatherTime", Tag::Int(31)),
+                ("rainTime", Tag::Int(47)),
+                ("thunderTime", Tag::Int(59)),
+                ("raining", Tag::Byte(1)),
+                ("thundering", Tag::Byte(0)),
+            ]),
+        )]);
+        write_dat(&base.join("level.dat"), &level).unwrap();
+
+        assert_eq!(upgrade_world(&base).unwrap(), 4000);
+
+        let weather = read_dat(&base.join("data/minecraft/weather.dat"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(weather.get("DataVersion"), Some(&Tag::Int(CURRENT)));
+        let weather_data = weather.get("data").unwrap();
+        assert_eq!(weather_data.get("clear_weather_time"), Some(&Tag::Int(31)));
+        assert_eq!(weather_data.get("rain_time"), Some(&Tag::Int(47)));
+        assert_eq!(weather_data.get("thunder_time"), Some(&Tag::Int(59)));
+        assert_eq!(weather_data.get("raining"), Some(&Tag::Byte(1)));
+        assert_eq!(weather_data.get("thundering"), Some(&Tag::Byte(0)));
+
+        let clocks = read_dat(&base.join("data/minecraft/world_clocks.dat"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(clocks.get("DataVersion"), Some(&Tag::Int(CURRENT)));
+        let overworld = clocks
+            .get("data")
+            .and_then(|data| data.get("minecraft:overworld"))
+            .unwrap();
+        assert_eq!(overworld.get("total_ticks"), Some(&Tag::Long(34_000)));
+
+        let upgraded_level = read_dat(&base.join("level.dat")).unwrap().unwrap();
+        let data = upgraded_level.get("Data").unwrap();
+        assert_eq!(data_version(data, -1), CURRENT);
+        assert_eq!(data.get("Time"), Some(&Tag::Long(12_000)));
+        assert_eq!(data.get("DayTime"), None);
+        assert_eq!(data.get("weather_data"), None);
+        assert_eq!(data.get("world_clocks"), None);
+        let _ = fs::remove_dir_all(&base);
+    }
+
     fn old_chunk(x: i32, z: i32) -> Tag {
         Tag::compound([
             ("DataVersion", Tag::Int(4000)),

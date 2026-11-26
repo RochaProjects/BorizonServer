@@ -85,6 +85,7 @@
 //! behaviours.falling_block_landed(&mut level, &mut ticks, landing_pos, carried_state, false);
 //! ```
 use crate::{
+    chunk::BlockSection,
     dimension_type::DimensionFacts,
     fluid::{FluidBlockBindings, FluidKind, FluidState},
     registry::{BlockRegistry, BlockStateId},
@@ -380,7 +381,8 @@ pub enum LevelEvent {
     },
 }
 
-/// The world as seen by block behaviour. Implemented by the game and tests.
+/// Storage/context seen by block behaviour. Implemented by server-owned world
+/// storage and tests; it is not itself a complete server runtime.
 pub trait LevelAccess {
     /// `WorldBorder.isWithinBounds(BlockPos)` for block movement.
     fn within_world_border(&self, _pos: BlockPos) -> bool {
@@ -402,8 +404,9 @@ pub trait LevelAccess {
     /// `getBlockState`. Unloaded or out-of-bounds positions read as air.
     fn block_state(&self, pos: BlockPos) -> BlockStateId;
     /// Storage write (`LevelChunkSection.setBlockState`). Returns the previous
-    /// state, or None when nothing could be stored (unloaded chunk).
+    /// state, or None when the chunk is unloaded or the position/state cannot be stored.
     fn set_raw(&mut self, pos: BlockPos, state: BlockStateId) -> Option<BlockStateId>;
+    /// Whether the containing chunk is resident; height bounds are separate.
     fn is_loaded(&self, pos: BlockPos) -> bool;
     /// Inclusive minimum and exclusive maximum build height.
     fn min_y(&self) -> i32 {
@@ -607,6 +610,182 @@ pub trait LevelAccess {
     /// environment attributes, e.g. eyeblossoms opening at night).
     fn day_time(&self) -> i64 {
         6000
+    }
+}
+
+/// First server-owned resident block store backing vanilla level behaviour.
+///
+/// This owns loaded block columns, the build-height bounds, vanilla random
+/// source and the two world clocks. It deliberately does not own persistence,
+/// heightmaps, lighting, entities or scheduled ticks; callers integrate those
+/// systems at the level lifecycle. Missing resident sections read as air.
+pub struct ResidentLevel<'registry> {
+    registry: &'registry BlockRegistry,
+    air: BlockStateId,
+    min_y: i32,
+    max_y: i32,
+    columns: HashMap<ChunkPos, ResidentColumn<'registry>>,
+    random: LegacyRandom,
+    game_time: i64,
+    day_time: i64,
+}
+
+struct ResidentColumn<'registry> {
+    sections: HashMap<i32, BlockSection<'registry>>,
+}
+
+impl<'registry> ResidentLevel<'registry> {
+    /// Create an empty resident level. Build bounds must align to chunk sections.
+    pub fn new(
+        registry: &'registry BlockRegistry,
+        min_y: i32,
+        height: i32,
+        seed: i64,
+    ) -> io::Result<Self> {
+        if height <= 0 || min_y.rem_euclid(16) != 0 || height % 16 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "level build bounds must be positive and section-aligned",
+            ));
+        }
+        let max_y = min_y.checked_add(height).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "level build bounds overflow")
+        })?;
+        let air = registry.default_state("minecraft:air").ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "block registry has no air state",
+            )
+        })?;
+        Ok(Self {
+            registry,
+            air,
+            min_y,
+            max_y,
+            columns: HashMap::new(),
+            random: LegacyRandom::new(seed),
+            game_time: 0,
+            day_time: 0,
+        })
+    }
+
+    /// Insert a resident column and its already-decoded sections. A duplicate
+    /// section, out-of-range section or section from another registry is rejected.
+    /// Returns false when the column was already resident and leaves it unchanged.
+    pub fn load_chunk(
+        &mut self,
+        position: ChunkPos,
+        sections: impl IntoIterator<Item = (i32, BlockSection<'registry>)>,
+    ) -> io::Result<bool> {
+        if self.columns.contains_key(&position) {
+            return Ok(false);
+        }
+        let min_section = self.min_y >> 4;
+        let max_section = self.max_y >> 4;
+        let mut resident = ResidentColumn {
+            sections: HashMap::new(),
+        };
+        for (section_y, section) in sections {
+            if !(min_section..max_section).contains(&section_y) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "section outside level build bounds",
+                ));
+            }
+            if !std::ptr::eq(section.registry(), self.registry) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "section uses a different block registry",
+                ));
+            }
+            if resident.sections.insert(section_y, section).is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "duplicate resident section Y",
+                ));
+            }
+        }
+        self.columns.insert(position, resident);
+        Ok(true)
+    }
+
+    /// Add an empty loaded column. Intended for new/generated columns and tests;
+    /// persisted columns must be decoded before `load_chunk`.
+    pub fn load_empty_chunk(&mut self, position: ChunkPos) -> bool {
+        self.load_chunk(position, std::iter::empty())
+            .expect("an empty column has no invalid sections")
+    }
+
+    /// Remove a resident column; block access to it then follows unloaded semantics.
+    pub fn unload_chunk(&mut self, position: ChunkPos) -> bool {
+        self.columns.remove(&position).is_some()
+    }
+
+    pub fn loaded_chunk_count(&self) -> usize {
+        self.columns.len()
+    }
+
+    pub fn set_times(&mut self, game_time: i64, day_time: i64) {
+        self.game_time = game_time;
+        self.day_time = day_time;
+    }
+}
+
+impl LevelAccess for ResidentLevel<'_> {
+    fn block_state(&self, pos: BlockPos) -> BlockStateId {
+        if !(self.min_y..self.max_y).contains(&pos.y) || !self.columns.contains_key(&pos.chunk()) {
+            return self.air;
+        }
+        self.columns
+            .get(&pos.chunk())
+            .and_then(|column| column.sections.get(&(pos.y >> 4)))
+            .and_then(|section| section.get(pos.section_index()).ok())
+            .unwrap_or(self.air)
+    }
+
+    fn set_raw(&mut self, pos: BlockPos, state: BlockStateId) -> Option<BlockStateId> {
+        if !(self.min_y..self.max_y).contains(&pos.y)
+            || !self.is_loaded(pos)
+            || self.registry.state(state).is_none()
+        {
+            return None;
+        }
+        let old = self.block_state(pos);
+        if old == state {
+            return Some(old);
+        }
+        let air = self.air;
+        let registry = self.registry;
+        let column = self.columns.get_mut(&pos.chunk())?;
+        let section = column.sections.entry(pos.y >> 4).or_insert_with(|| {
+            BlockSection::uniform(air, registry)
+                .expect("the registry's air state was validated at construction")
+        });
+        section.set(pos.section_index(), state).ok()
+    }
+
+    fn is_loaded(&self, pos: BlockPos) -> bool {
+        self.columns.contains_key(&pos.chunk())
+    }
+
+    fn min_y(&self) -> i32 {
+        self.min_y
+    }
+
+    fn max_y(&self) -> i32 {
+        self.max_y
+    }
+
+    fn random(&mut self) -> &mut LegacyRandom {
+        &mut self.random
+    }
+
+    fn game_time(&self) -> i64 {
+        self.game_time
+    }
+
+    fn day_time(&self) -> i64 {
+        self.day_time
     }
 }
 

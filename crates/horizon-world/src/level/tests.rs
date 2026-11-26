@@ -2,7 +2,8 @@
 //! resources (`HORIZON_RESOURCES`, or `.local/horizon-client/<version>` at the
 //! repository root) and are skipped when those are absent.
 use super::*;
-use crate::chunk::BlockState;
+use crate::chunk::{BlockProperties, BlockSection, BlockState};
+use crate::nbt::Tag;
 use horizon_core::random::RandomSource;
 use std::{
     collections::{HashMap, HashSet},
@@ -316,6 +317,141 @@ fn block_observation_follows_successful_commits_only() {
         level.seen.borrow()[0],
         Observation::Block(pos, stone, b.air())
     );
+}
+
+fn tiny_block_registry() -> BlockRegistry {
+    let state = |name: &str| BlockState {
+        name: name.to_owned(),
+        properties: BlockProperties::new(),
+    };
+    let root = Tag::compound([
+        ("DataVersion", Tag::Int(crate::DATA_VERSION)),
+        (
+            "states",
+            Tag::List(vec![
+                state("minecraft:air").to_nbt(),
+                state("minecraft:stone").to_nbt(),
+            ]),
+        ),
+        (
+            "defaults",
+            Tag::compound([
+                ("minecraft:air", Tag::Int(0)),
+                ("minecraft:stone", Tag::Int(1)),
+            ]),
+        ),
+    ]);
+    BlockRegistry::from_nbt(&root).unwrap()
+}
+
+#[test]
+fn resident_level_reads_writes_and_unloads_loaded_columns() {
+    let registry = tiny_block_registry();
+    let air = registry.default_state("minecraft:air").unwrap();
+    let stone = registry.default_state("minecraft:stone").unwrap();
+    let mut level = ResidentLevel::new(&registry, -64, 384, 42).unwrap();
+    let pos = BlockPos::new(-1, -64, -1);
+
+    assert_eq!(level.block_state(pos), air);
+    assert!(!level.is_loaded(pos));
+    assert_eq!(level.set_raw(pos, stone), None);
+    assert!(level.load_empty_chunk(pos.chunk()));
+    assert!(!level.load_empty_chunk(pos.chunk()));
+    assert!(level.is_loaded(pos));
+    assert_eq!(level.block_state(pos), air);
+    assert_eq!(level.set_raw(pos, stone), Some(air));
+    assert_eq!(level.block_state(pos), stone);
+    assert_eq!(level.set_raw(pos, air), Some(stone));
+
+    let above = BlockPos::new(-1, 320, -1);
+    assert!(level.is_loaded(above));
+    assert_eq!(level.block_state(above), air);
+    assert_eq!(level.set_raw(above, stone), None);
+    assert_eq!(level.loaded_chunk_count(), 1);
+    assert!(level.unload_chunk(pos.chunk()));
+    assert!(!level.is_loaded(pos));
+    assert_eq!(level.block_state(pos), air);
+    assert_eq!(level.set_raw(pos, stone), None);
+}
+
+#[test]
+fn resident_level_accepts_decoded_sections_and_keeps_world_clocks() {
+    let registry = tiny_block_registry();
+    let air = registry.default_state("minecraft:air").unwrap();
+    let stone = registry.default_state("minecraft:stone").unwrap();
+    let mut section = BlockSection::uniform(air, &registry).unwrap();
+    let pos = BlockPos::new(0, -64, 0);
+    section.set(pos.section_index(), stone).unwrap();
+
+    let mut level = ResidentLevel::new(&registry, -64, 384, 42).unwrap();
+    assert!(
+        level
+            .load_chunk(pos.chunk(), [(pos.y >> 4, section)])
+            .unwrap()
+    );
+    assert_eq!(level.block_state(pos), stone);
+    level.set_times(120, 2400);
+    assert_eq!(level.game_time(), 120);
+    assert_eq!(level.day_time(), 2400);
+}
+
+#[test]
+fn resident_level_rejects_invalid_bounds_and_sections_transactionally() {
+    let registry = tiny_block_registry();
+    let air = registry.default_state("minecraft:air").unwrap();
+    assert!(ResidentLevel::new(&registry, -63, 16, 42).is_err());
+    assert!(ResidentLevel::new(&registry, i32::MAX - 15, 32, 42).is_err());
+
+    let mut level = ResidentLevel::new(&registry, -64, 384, 42).unwrap();
+    let out_of_range = BlockSection::uniform(air, &registry).unwrap();
+    assert!(
+        level
+            .load_chunk(ChunkPos::new(0, 0), [(20, out_of_range)])
+            .is_err()
+    );
+    assert!(!level.is_loaded(BlockPos::new(0, 0, 0)));
+
+    let other_registry = tiny_block_registry();
+    let other_air = other_registry.default_state("minecraft:air").unwrap();
+    let foreign = BlockSection::uniform(other_air, &other_registry).unwrap();
+    assert!(
+        level
+            .load_chunk(ChunkPos::new(0, 0), [(0, foreign)])
+            .is_err()
+    );
+    assert!(!level.is_loaded(BlockPos::new(0, 0, 0)));
+
+    let first = BlockSection::uniform(air, &registry).unwrap();
+    let duplicate = BlockSection::uniform(air, &registry).unwrap();
+    assert!(
+        level
+            .load_chunk(ChunkPos::new(0, 0), [(0, first), (0, duplicate)])
+            .is_err()
+    );
+    assert!(!level.is_loaded(BlockPos::new(0, 0, 0)));
+    assert_eq!(level.loaded_chunk_count(), 0);
+}
+
+#[test]
+fn resident_level_is_a_consumer_for_vanilla_block_behaviours() {
+    let Some(f) = fixture() else { return };
+    let mut level = ResidentLevel::new(&f.registry, -64, 384, 42).unwrap();
+    let pos = BlockPos::new(0, 80, 0);
+    assert!(level.load_empty_chunk(pos.chunk()));
+    let mut ticks = Ticks::new(0);
+    let stone = f.registry.default_state("minecraft:stone").unwrap();
+    assert!(
+        f.behaviours
+            .set_block(&mut level, &mut ticks, pos, stone, flags::UPDATE_ALL)
+    );
+    assert_eq!(level.block_state(pos), stone);
+    assert!(f.behaviours.set_block(
+        &mut level,
+        &mut ticks,
+        pos,
+        f.behaviours.air(),
+        flags::UPDATE_ALL
+    ));
 }
 
 /// `LevelReader.getMaxLocalRawBrightness`: 15 outside the +-30,000,000 gate,

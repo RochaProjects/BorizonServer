@@ -1,4 +1,4 @@
-//! Vanilla-compatible world data for Horizon. This crate does not run gameplay.
+//! Vanilla-compatible world state and gameplay mechanics for Horizon; the dedicated server loop is separate.
 #![forbid(unsafe_code)]
 
 pub mod active_effect_tick;

@@ -1312,6 +1312,157 @@ fn local_world_runtime_owns_region_chunk_load_save_and_reopen() {
 }
 
 #[test]
+fn world_dimension_saves_dirty_chunks_in_budgeted_durable_sweeps() {
+    let registry = tiny_block_registry();
+    let root =
+        std::env::temp_dir().join(format!("horizon-dirty-chunk-sweep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let first = ChunkPos::new(-2, 3);
+    let second = ChunkPos::new(35, -1);
+    let first_block = BlockPos::new(-32, -64, 48);
+    let second_block = BlockPos::new(560, -64, -16);
+    let air = BlockState {
+        name: "minecraft:air".to_owned(),
+        properties: BlockProperties::new(),
+    };
+    let mut seed = Vec::new();
+    for position in [first, second] {
+        let data = saved_test_chunk(position, -4, &air);
+        let region_pos = position.region();
+        let path = root.join(format!("region/r.{}.{}.mca", region_pos.x, region_pos.z));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut region = crate::region::RegionFile::open_writable(&path, true).unwrap();
+        let record = crate::region::ChunkRecord::from_nbt(
+            data.root(),
+            crate::compression::Compression::Zlib,
+            1,
+            crate::nbt::Limits::saved(),
+        )
+        .unwrap();
+        region.write(position, &record).unwrap();
+        region.sync().unwrap();
+        seed.push(path);
+    }
+
+    let features = Vec::new();
+    let mut world = crate::world_runtime::LocalWorldRuntime::open(&root, &features).unwrap();
+    assert!(
+        world
+            .add_dimension(ResidentDimension::new(
+                "minecraft:overworld",
+                ResidentLevel::new(&registry, -64, 384, 42).unwrap(),
+                Ticks::new(0),
+            ))
+            .unwrap()
+    );
+    let dimension = world.dimension_mut("minecraft:overworld").unwrap();
+    for position in [first, second] {
+        assert!(
+            dimension
+                .load_chunk_from_region(
+                    position,
+                    crate::nbt::Limits::saved(),
+                    0,
+                    |_| None,
+                    |_| None,
+                )
+                .unwrap()
+        );
+    }
+    let stone = registry.default_state("minecraft:stone").unwrap();
+    assert_eq!(
+        dimension
+            .resident_mut()
+            .level_mut()
+            .set_raw(first_block, stone),
+        Some(registry.default_state("minecraft:air").unwrap())
+    );
+    assert_eq!(
+        dimension
+            .resident_mut()
+            .level_mut()
+            .set_raw(second_block, stone),
+        Some(registry.default_state("minecraft:air").unwrap())
+    );
+
+    let none = |_| None;
+    let empty = dimension
+        .save_dirty_chunks(
+            0,
+            crate::compression::Compression::Zlib,
+            99,
+            crate::nbt::Limits::saved(),
+            0,
+            none,
+            none,
+        )
+        .unwrap();
+    assert_eq!(empty.saved, 0);
+    assert_eq!(empty.remaining_dirty, 2);
+
+    let partial = dimension
+        .save_dirty_chunks(
+            1,
+            crate::compression::Compression::Zlib,
+            100,
+            crate::nbt::Limits::saved(),
+            0,
+            none,
+            none,
+        )
+        .unwrap();
+    assert_eq!(partial.saved, 1);
+    assert_eq!(partial.remaining_dirty, 1);
+    assert!(!dimension.resident().is_chunk_dirty(first));
+    assert!(dimension.resident().is_chunk_dirty(second));
+
+    let failed = dimension
+        .save_dirty_chunks_with_sync_for_test(
+            1,
+            crate::compression::Compression::Zlib,
+            101,
+            crate::nbt::Limits::saved(),
+            0,
+            none,
+            none,
+            |_| Err(std::io::Error::other("injected second region sync failure")),
+        )
+        .unwrap_err();
+    assert_eq!(failed.kind(), std::io::ErrorKind::Other);
+    assert!(!dimension.resident().is_chunk_dirty(first));
+    assert!(dimension.resident().is_chunk_dirty(second));
+    assert!(dimension.active_chunk_data(second).is_some());
+
+    let retried = dimension
+        .save_dirty_chunks(
+            usize::MAX,
+            crate::compression::Compression::Zlib,
+            102,
+            crate::nbt::Limits::saved(),
+            0,
+            none,
+            none,
+        )
+        .unwrap();
+    assert_eq!(retried.saved, 1);
+    assert_eq!(retried.remaining_dirty, 0);
+    for (position, block, path) in [
+        (first, first_block, &seed[0]),
+        (second, second_block, &seed[1]),
+    ] {
+        let mut region = crate::region::RegionFile::open(path).unwrap();
+        let record = region.read(position).unwrap().unwrap();
+        assert_eq!(record.timestamp, if position == first { 100 } else { 102 });
+        let data =
+            crate::chunk::ChunkData::new(record.nbt(crate::nbt::Limits::saved()).unwrap()).unwrap();
+        assert_eq!(data.block(block).unwrap().unwrap().name, "minecraft:stone");
+    }
+    world.sync_regions().unwrap();
+    drop(world);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn resident_dimension_tracks_tick_only_changes_and_rejects_stale_snapshot_ack() {
     let registry = tiny_block_registry();
     let chunk = ChunkPos::new(2, -1);

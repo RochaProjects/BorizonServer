@@ -89,6 +89,15 @@ pub struct TicketLifecycleReport {
     pub deferred_dirty: usize,
 }
 
+/// Result of one caller-triggered dirty-chunk save sweep.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DirtyChunkSaveReport {
+    /// Dirty snapshots acknowledged after their region sync succeeded.
+    pub saved: usize,
+    /// Dirty resident chunks left for a later caller-triggered sweep.
+    pub remaining_dirty: usize,
+}
+
 impl<'registry> WorldDimension<'registry> {
     pub fn resident(&self) -> &ResidentDimension<'registry> {
         &self.resident
@@ -335,6 +344,91 @@ impl<'registry> WorldDimension<'registry> {
             fluid_name,
             sync,
         )
+    }
+
+    /// Save up to `budget` dirty resident chunks in deterministic coordinate
+    /// order. This is an explicit sweep, not a timer or autosave scheduler;
+    /// each chunk is acknowledged only after its region sync succeeds. If an
+    /// error occurs, earlier chunks may already be durable and later chunks
+    /// remain dirty for a retry.
+    pub fn save_dirty_chunks(
+        &mut self,
+        budget: usize,
+        compression: Compression,
+        timestamp: u32,
+        limits: Limits,
+        game_time: i64,
+        block_name: impl FnMut(TickTypeId) -> Option<String>,
+        fluid_name: impl FnMut(TickTypeId) -> Option<String>,
+    ) -> io::Result<DirtyChunkSaveReport> {
+        self.save_dirty_chunks_inner(
+            budget,
+            compression,
+            timestamp,
+            limits,
+            game_time,
+            block_name,
+            fluid_name,
+            RegionFile::sync,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn save_dirty_chunks_with_sync_for_test(
+        &mut self,
+        budget: usize,
+        compression: Compression,
+        timestamp: u32,
+        limits: Limits,
+        game_time: i64,
+        block_name: impl FnMut(TickTypeId) -> Option<String>,
+        fluid_name: impl FnMut(TickTypeId) -> Option<String>,
+        sync: impl FnMut(&RegionFile) -> io::Result<()>,
+    ) -> io::Result<DirtyChunkSaveReport> {
+        self.save_dirty_chunks_inner(
+            budget,
+            compression,
+            timestamp,
+            limits,
+            game_time,
+            block_name,
+            fluid_name,
+            sync,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn save_dirty_chunks_inner(
+        &mut self,
+        budget: usize,
+        compression: Compression,
+        timestamp: u32,
+        limits: Limits,
+        game_time: i64,
+        mut block_name: impl FnMut(TickTypeId) -> Option<String>,
+        mut fluid_name: impl FnMut(TickTypeId) -> Option<String>,
+        mut sync: impl FnMut(&RegionFile) -> io::Result<()>,
+    ) -> io::Result<DirtyChunkSaveReport> {
+        let dirty = self.resident.dirty_chunks();
+        let mut saved = 0;
+        for position in dirty.into_iter().take(budget) {
+            if self.save_owned_chunk_to_region_inner(
+                position,
+                compression,
+                timestamp,
+                limits,
+                game_time,
+                &mut block_name,
+                &mut fluid_name,
+                |region| sync(region),
+            )? {
+                saved += 1;
+            }
+        }
+        Ok(DirtyChunkSaveReport {
+            saved,
+            remaining_dirty: self.resident.dirty_chunks().len(),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]

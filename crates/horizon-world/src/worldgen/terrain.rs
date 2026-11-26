@@ -312,6 +312,25 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
     pub fn filled_sections(&self) -> impl Iterator<Item = usize> + '_ {
         (0..self.blocks.non_air.len()).filter(|&i| self.blocks.non_air[i] != 0)
     }
+    /// Encode only the `sections` block-state compounds used by a proto-chunk
+    /// save adapter. This is deliberately not a complete chunk NBT record:
+    /// status, biomes, heightmaps, ticks, entities and structures need their
+    /// own codecs before the result can be persisted as a vanilla chunk.
+    pub fn block_sections_nbt(&self) -> io::Result<Vec<crate::nbt::Tag>> {
+        (0..self.blocks.sections.len())
+            .map(|index| {
+                let section_y = self.blocks.min_y / 16 + index as i32;
+                let y = i8::try_from(section_y).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "section Y out of NBT range")
+                })?;
+                let section = self.blocks.sections[index].to_nbt()?;
+                Ok(crate::nbt::Tag::compound([
+                    ("Y", crate::nbt::Tag::Byte(y)),
+                    ("block_states", section),
+                ]))
+            })
+            .collect()
+    }
     pub fn highest_filled_section_index(&self) -> Option<usize> {
         self.blocks.non_air.iter().rposition(|&count| count != 0)
     }
@@ -965,6 +984,42 @@ mod tests {
             ),
         ]))
         .unwrap()
+    }
+
+    #[test]
+    fn block_section_nbt_keeps_coordinate_and_block_palette_in_synthetic_fixture() {
+        let registry = test_registry();
+        let position = ChunkPos::new(-3, 5);
+        let mut chunk = TerrainChunk::new(position, -64, 384, &registry, Properties).unwrap();
+        let world = [-48 + 3, -63, 80 + 5];
+        chunk
+            .set_block_raw(world[0], world[1], world[2], BlockStateId(2))
+            .unwrap();
+
+        let sections = chunk.block_sections_nbt().unwrap();
+        assert_eq!(sections.len(), 24);
+        assert_eq!(sections[0].get("Y"), Some(&Tag::Byte(-4)));
+        let states = sections[0].get("block_states").unwrap();
+        let palette = crate::chunk::PalettedContainer::from_nbt(states, 4096, 4).unwrap();
+        let local_index = ((1usize) << 8) | (5usize << 4) | 3usize;
+        assert_eq!(
+            crate::chunk::BlockState::from_nbt(palette.get(local_index).unwrap()).unwrap(),
+            crate::chunk::BlockState {
+                name: "minecraft:stone".to_owned(),
+                properties: Default::default(),
+            }
+        );
+        assert!(sections[1..].iter().all(|section| {
+            let Some(states) = section.get("block_states") else {
+                return false;
+            };
+            let Ok(palette) = crate::chunk::PalettedContainer::from_nbt(states, 4096, 4) else {
+                return false;
+            };
+            palette.palette_len() == 1
+                && crate::chunk::BlockState::from_nbt(palette.get(0).unwrap())
+                    .is_ok_and(|state| state.name == "minecraft:air")
+        }));
     }
 
     #[test]

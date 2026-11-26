@@ -347,6 +347,9 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
     pub fn generation_stage(&self) -> PreLightChunkStage {
         self.stage
     }
+    pub fn min_section(&self) -> i32 {
+        self.blocks.min_y >> 4
+    }
     /// Retained old terrain may already have completed stages that the new
     /// below-zero generation has not reached. Biome reads use this status.
     pub fn highest_generated_status(&self) -> crate::chunk_status::ChunkStatus {

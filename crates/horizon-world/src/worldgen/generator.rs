@@ -852,6 +852,49 @@ fn proto_structure_references_nbt<'a>(
     )
 }
 
+fn assemble_proto_chunk_data(
+    position: ChunkPos,
+    stage: PreLightChunkStage,
+    min_section: i32,
+    sections: crate::nbt::Tag,
+    heightmaps: crate::nbt::Tag,
+    postprocessing: crate::nbt::Tag,
+    block_ticks: crate::nbt::Tag,
+    fluid_ticks: crate::nbt::Tag,
+    block_entities: crate::nbt::Tag,
+    entities: crate::nbt::Tag,
+    structures: crate::nbt::Tag,
+    retrogen: Option<crate::nbt::Tag>,
+) -> io::Result<crate::chunk::ChunkData> {
+    use crate::nbt::{NamedTag, Tag};
+    let mut fields = vec![
+        ("DataVersion", Tag::Int(crate::DATA_VERSION)),
+        ("xPos", Tag::Int(position.x)),
+        ("zPos", Tag::Int(position.z)),
+        ("yPos", Tag::Int(min_section)),
+        ("Status", Tag::String(stage.status().name().into())),
+        ("LastUpdate", Tag::Long(0)),
+        ("InhabitedTime", Tag::Long(0)),
+        // ProtoChunk generation is pre-light; never claim cached light data.
+        ("isLightOn", Tag::Byte(0)),
+        ("sections", sections),
+        ("Heightmaps", heightmaps),
+        ("PostProcessing", postprocessing),
+        ("block_ticks", block_ticks),
+        ("fluid_ticks", fluid_ticks),
+        ("block_entities", block_entities),
+        ("entities", entities),
+        ("structures", structures),
+    ];
+    if let Some(retrogen) = retrogen {
+        fields.push(("below_zero_retrogen", retrogen));
+    }
+    crate::chunk::ChunkData::new(NamedTag {
+        name: "".into(),
+        tag: Tag::compound(fields),
+    })
+}
+
 /// A generated chunk with its quart biomes. Blocks and heightmaps live in
 /// `terrain`; after `generate_proto` it is at the TERRAIN status with the
 /// WORLD_SURFACE(_WG), OCEAN_FLOOR(_WG) and MOTION_BLOCKING(_NO_LEAVES)
@@ -974,6 +1017,32 @@ impl ProtoChunk {
             ("starts", crate::nbt::Tag::Compound(starts)),
             ("References", references),
         ]))
+    }
+    /// Build a stage-correct `ChunkData` record from generated state. This
+    /// writes the supported pre-light fields only; it does not finalize lighting
+    /// or claim `Full` status.
+    pub fn to_chunk_data(
+        &self,
+        block_name: impl FnMut(horizon_core::ticks::TickTypeId) -> Option<String>,
+        fluid_name: impl FnMut(horizon_core::ticks::TickTypeId) -> Option<String>,
+    ) -> io::Result<crate::chunk::ChunkData> {
+        let (block_ticks, fluid_ticks) = self.terrain.tick_lists_nbt(block_name, fluid_name)?;
+        assemble_proto_chunk_data(
+            self.position(),
+            self.terrain.generation_stage(),
+            self.terrain.min_section(),
+            self.sections_nbt()?,
+            self.terrain.heightmaps_nbt()?,
+            self.terrain.postprocessing_nbt(),
+            block_ticks,
+            fluid_ticks,
+            self.block_entities_nbt(),
+            self.entities_nbt(),
+            self.structures_nbt()?,
+            self.terrain
+                .below_zero_retrogen()
+                .map(crate::retrogen::BelowZeroRetrogen::to_nbt),
+        )
     }
     pub fn data(&self) -> &Arc<GeneratorData> {
         &self.data
@@ -3555,6 +3624,42 @@ mod tests {
             villages[0] as u64,
             u64::from((-2i32) as u32) | (u64::from((-3i32) as u32) << 32)
         );
+    }
+    #[test]
+    fn proto_chunk_data_assembly_preserves_intermediate_status_and_unlit_state() {
+        use crate::nbt::Tag;
+        let sections = Tag::List(vec![Tag::compound([
+            ("Y", Tag::Byte(-4)),
+            ("block_states", Tag::Compound(crate::nbt::Compound::new())),
+            ("biomes", Tag::Compound(crate::nbt::Compound::new())),
+        ])]);
+        let data = assemble_proto_chunk_data(
+            ChunkPos::new(-3, 5),
+            PreLightChunkStage::Terrain,
+            -4,
+            sections.clone(),
+            Tag::Compound(crate::nbt::Compound::new()),
+            Tag::List(vec![Tag::List(Vec::new())]),
+            Tag::List(Vec::new()),
+            Tag::List(Vec::new()),
+            Tag::List(Vec::new()),
+            Tag::List(Vec::new()),
+            Tag::compound([
+                ("starts", Tag::Compound(crate::nbt::Compound::new())),
+                ("References", Tag::Compound(crate::nbt::Compound::new())),
+            ]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(data.position(), ChunkPos::new(-3, 5));
+        let root = &data.root().tag;
+        assert_eq!(
+            root.get("Status"),
+            Some(&Tag::String("minecraft:terrain".into()))
+        );
+        assert_eq!(root.get("isLightOn"), Some(&Tag::Byte(0)));
+        assert_eq!(root.get("yPos"), Some(&Tag::Int(-4)));
+        assert_eq!(root.get("sections"), Some(&sections));
     }
     #[test]
     fn proto_section_merge_checks_y_and_keeps_both_palette_fields() {

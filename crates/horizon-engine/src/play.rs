@@ -15,17 +15,21 @@ use horizon_core::{
 };
 use horizon_protocol::packets::{configuration::KeepAlive, play};
 use horizon_world::{
+    compression::Compression,
     fluid::FluidKind,
     level::{BlockId, LevelAccess, ResidentDimension, ResidentLevel, Ticks, data::state_flags},
+    nbt::Limits,
     player_mining::{self, DestroySpeedModifiers},
+    world_runtime::LocalWorldRuntime,
     worldgen::generator::{GeneratorWorker, OverworldGenerator, ProtoChunk},
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    path::Path,
     sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const CHUNK_RADIUS: i32 = 1;
@@ -45,7 +49,7 @@ pub(crate) struct PreparedPlayWorld {
     chunk_packets: Vec<Vec<u8>>,
     chunk_packet_cache: Mutex<HashMap<ChunkPos, Vec<u8>>>,
     generator_worker: Option<Mutex<GeneratorWorker>>,
-    resident: Mutex<ResidentDimension<'static>>,
+    runtime: Mutex<LocalWorldRuntime<'static>>,
 }
 
 fn generated_chunk_data(
@@ -75,6 +79,69 @@ fn generated_chunk_data(
             },
         )
         .map_err(|error| format!("encode generated resident chunk: {error}"))
+}
+
+fn resolve_block_tick(resources: &ServerResources, name: &str) -> Option<TickTypeId> {
+    resources
+        .behaviours
+        .table
+        .block_by_name(name)
+        .map(|id| TickTypeId(u32::from(id.0)))
+}
+
+fn resolve_fluid_tick(name: &str) -> Option<TickTypeId> {
+    FluidKind::ALL
+        .into_iter()
+        .find(|fluid| fluid.name() == name)
+        .map(|fluid| TickTypeId(fluid.index() as u32))
+}
+
+fn block_tick_name(resources: &ServerResources, id: TickTypeId) -> Option<String> {
+    u16::try_from(id.0)
+        .ok()
+        .filter(|id| usize::from(*id) < resources.behaviours.table.block_count())
+        .map(|id| {
+            resources
+                .behaviours
+                .table
+                .info(BlockId(id))
+                .name
+                .to_string()
+        })
+}
+
+fn fluid_tick_name(id: TickTypeId) -> Option<String> {
+    usize::try_from(id.0)
+        .ok()
+        .and_then(|index| FluidKind::ALL.get(index))
+        .map(|fluid| fluid.name().to_owned())
+}
+
+fn save_runtime_dirty_chunks(
+    runtime: &mut LocalWorldRuntime<'static>,
+    resources: &ServerResources,
+) -> Result<usize, String> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as u32;
+    let report = runtime
+        .save_dirty_chunks(
+            usize::MAX,
+            Compression::Zlib,
+            timestamp,
+            Limits::saved(),
+            |id| block_tick_name(resources, id),
+            fluid_tick_name,
+        )
+        .map_err(|error| format!("save dirty PLAY chunks: {error}"))?;
+    if report.remaining_dirty != 0 {
+        return Err(format!(
+            "{} PLAY chunks remained dirty after a full save sweep",
+            report.remaining_dirty
+        ));
+    }
+    Ok(report.saved)
 }
 
 fn encode_center_chunk(
@@ -219,7 +286,11 @@ impl Drop for PlayerPermit<'_> {
 }
 
 impl PreparedPlayWorld {
-    pub(crate) fn build(resources: Arc<ServerResources>, seed: i64) -> Result<Self, String> {
+    pub(crate) fn build(
+        resources: Arc<ServerResources>,
+        seed: i64,
+        world_root: &Path,
+    ) -> Result<Self, String> {
         let dimension_type = resources
             .synchronized_registries
             .entry_index("minecraft:dimension_type", "minecraft:overworld")
@@ -249,18 +320,25 @@ impl PreparedPlayWorld {
         let spawn = find_spawn(&region, &resources)?;
         let spawn_center = chunk_center(spawn);
 
-        let mut resident = ResidentDimension::new(
+        let resident = ResidentDimension::new(
             "minecraft:overworld",
             ResidentLevel::new(resources.registry, -64, 384, seed)
                 .map_err(|error| format!("create resident Overworld: {error}"))?,
             Ticks::new(seed as i32),
         );
+        let mut runtime = LocalWorldRuntime::open(world_root, &[]).map_err(|error| {
+            format!("open PLAY world storage {}: {error}", world_root.display())
+        })?;
+        runtime
+            .add_dimension(resident)
+            .map_err(|error| format!("register PLAY Overworld storage: {error}"))?;
+        let game_time = runtime.game_time();
         let mut chunk_packets = Vec::with_capacity(CHUNK_COUNT);
         let mut chunk_packet_cache = HashMap::with_capacity(CHUNK_COUNT);
         for z in spawn_center.z - CHUNK_RADIUS..=spawn_center.z + CHUNK_RADIUS {
             for x in spawn_center.x - CHUNK_RADIUS..=spawn_center.x + CHUNK_RADIUS {
                 let position = ChunkPos::new(x, z);
-                let (packet, chunk_data) = if position == region[4].position() {
+                let (mut packet, chunk_data) = if position == region[4].position() {
                     let lights = resources.light_occlusion.light_overworld_region(
                         &region,
                         resources.registry,
@@ -270,29 +348,53 @@ impl PreparedPlayWorld {
                 } else {
                     generate_center_chunk(&mut worker, position, &resources)?
                 };
-                resident
-                    .load_generated_chunk_data(
-                        &chunk_data,
-                        0,
-                        |name| {
-                            resources
-                                .behaviours
-                                .table
-                                .block_by_name(name)
-                                .map(|id| TickTypeId(u32::from(id.0)))
-                        },
-                        |name| {
-                            FluidKind::ALL
-                                .into_iter()
-                                .find(|fluid| fluid.name() == name)
-                                .map(|fluid| TickTypeId(fluid.index() as u32))
-                        },
+                let dimension = runtime
+                    .dimension_mut("minecraft:overworld")
+                    .expect("the Play Overworld was just registered");
+                let loaded = dimension
+                    .load_chunk_from_region(
+                        position,
+                        Limits::saved(),
+                        game_time,
+                        |name| resolve_block_tick(&resources, name),
+                        resolve_fluid_tick,
                     )
-                    .map_err(|error| format!("load generated resident chunk: {error}"))?;
+                    .map_err(|error| {
+                        format!(
+                            "load persisted PLAY chunk ({},{}): {error}",
+                            position.x, position.z
+                        )
+                    })?;
+                if loaded {
+                    let saved = dimension
+                        .active_chunk_data(position)
+                        .expect("loaded PLAY chunk retains its saved NBT");
+                    play_chunk::overlay_saved_block_states(
+                        &mut packet,
+                        saved,
+                        resources.registry,
+                        &resources.behaviours,
+                    )?;
+                } else {
+                    dimension
+                        .insert_generated_chunk(
+                            chunk_data,
+                            game_time,
+                            |name| resolve_block_tick(&resources, name),
+                            resolve_fluid_tick,
+                        )
+                        .map_err(|error| {
+                            format!(
+                                "install generated PLAY chunk ({},{}): {error}",
+                                position.x, position.z
+                            )
+                        })?;
+                }
                 chunk_packet_cache.insert(position, packet.clone());
                 chunk_packets.push(packet);
             }
         }
+        save_runtime_dirty_chunks(&mut runtime, &resources)?;
         Ok(Self {
             resources,
             dimension_type,
@@ -300,7 +402,7 @@ impl PreparedPlayWorld {
             chunk_packets,
             chunk_packet_cache: Mutex::new(chunk_packet_cache),
             generator_worker: Some(Mutex::new(worker)),
-            resident: Mutex::new(resident),
+            runtime: Mutex::new(runtime),
         })
     }
 
@@ -315,9 +417,12 @@ impl PreparedPlayWorld {
             self.spawn[2].floor() as i32,
         );
         if !self
-            .resident
+            .runtime
             .lock()
             .unwrap_or_else(|error| error.into_inner())
+            .dimension("minecraft:overworld")
+            .expect("the Play Overworld is registered")
+            .resident()
             .level()
             .is_loaded(spawn_block)
         {
@@ -444,10 +549,14 @@ impl PreparedPlayWorld {
         fall_distance: f64,
         on_ground: bool,
     ) -> Result<([f64; 3], bool), String> {
-        let resident = self
-            .resident
+        let runtime = self
+            .runtime
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let resident = runtime
+            .dimension("minecraft:overworld")
+            .expect("the Play Overworld is registered")
+            .resident();
         crate::play_collision::resolve_player_move(
             resident.level(),
             &self.resources,
@@ -495,43 +604,64 @@ impl PreparedPlayWorld {
         {
             return Ok(());
         }
-        let (packet, chunk_data) = generate_center_chunk(&mut worker, position, &self.resources)?;
-        let mut resident = self
-            .resident
+        let (mut packet, chunk_data) =
+            generate_center_chunk(&mut worker, position, &self.resources)?;
+        let mut runtime = self
+            .runtime
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let game_time = runtime.game_time();
+        let dimension = runtime
+            .dimension_mut("minecraft:overworld")
+            .expect("the Play Overworld is registered");
         let probe = BlockPos::new(position.x * 16, -64, position.z * 16);
-        if resident.level().is_loaded(probe) {
+        if dimension.resident().level().is_loaded(probe) {
             return Err(format!(
                 "resident chunk ({},{}) has no packet snapshot; refusing to send regenerated data",
                 position.x, position.z
             ));
         }
-        resident
-            .load_generated_chunk_data(
-                &chunk_data,
-                0,
-                |name| {
-                    self.resources
-                        .behaviours
-                        .table
-                        .block_by_name(name)
-                        .map(|id| TickTypeId(u32::from(id.0)))
-                },
-                |name| {
-                    FluidKind::ALL
-                        .into_iter()
-                        .find(|fluid| fluid.name() == name)
-                        .map(|fluid| TickTypeId(fluid.index() as u32))
-                },
+        let loaded = dimension
+            .load_chunk_from_region(
+                position,
+                Limits::saved(),
+                game_time,
+                |name| resolve_block_tick(&self.resources, name),
+                resolve_fluid_tick,
             )
             .map_err(|error| {
                 format!(
-                    "load streamed chunk ({},{}): {error}",
+                    "load persisted streamed chunk ({},{}): {error}",
                     position.x, position.z
                 )
             })?;
-        drop(resident);
+        if loaded {
+            let saved = dimension
+                .active_chunk_data(position)
+                .expect("loaded PLAY chunk retains its saved NBT");
+            play_chunk::overlay_saved_block_states(
+                &mut packet,
+                saved,
+                self.resources.registry,
+                &self.resources.behaviours,
+            )?;
+        } else {
+            dimension
+                .insert_generated_chunk(
+                    chunk_data,
+                    game_time,
+                    |name| resolve_block_tick(&self.resources, name),
+                    resolve_fluid_tick,
+                )
+                .map_err(|error| {
+                    format!(
+                        "install streamed PLAY chunk ({},{}): {error}",
+                        position.x, position.z
+                    )
+                })?;
+        }
+        save_runtime_dirty_chunks(&mut runtime, &self.resources)?;
+        drop(runtime);
         self.chunk_packet_cache
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -1135,10 +1265,14 @@ fn process_player_action(
         if !in_reach {
             return Ok(());
         }
-        let resident = world
-            .resident
+        let runtime = world
+            .runtime
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let resident = runtime
+            .dimension("minecraft:overworld")
+            .expect("the Play Overworld is registered")
+            .resident();
         if !resident.level().is_loaded(pos)
             || pos.y < resident.level().min_y()
             || pos.y >= resident.level().max_y()
@@ -1165,7 +1299,7 @@ fn process_player_action(
         };
         if per_tick >= 1.0 {
             player.digging = None;
-            drop(resident);
+            drop(runtime);
             destroy_player_block(writer, player.entity_id, world, digging)?;
         } else {
             player.dig_clock = Some((action.pos, player.server_tick));
@@ -1176,10 +1310,14 @@ fn process_player_action(
 
     if action.action == 2 {
         player.digging = None;
-        let resident = world
-            .resident
+        let runtime = world
+            .runtime
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let resident = runtime
+            .dimension("minecraft:overworld")
+            .expect("the Play Overworld is registered")
+            .resident();
         let state = resident.level().block_state(pos);
         send_block_update(writer, action.pos, state.0 as i32)?;
         send_crack_progress(writer, player.entity_id, action.pos, -1)?;
@@ -1204,10 +1342,14 @@ fn process_player_action(
     }) else {
         return Ok(());
     };
-    let resident = world
-        .resident
+    let runtime = world
+        .runtime
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    let resident = runtime
+        .dimension("minecraft:overworld")
+        .expect("the Play Overworld is registered")
+        .resident();
     if !resident.level().is_loaded(pos)
         || pos.y < resident.level().min_y()
         || pos.y >= resident.level().max_y()
@@ -1231,7 +1373,7 @@ fn process_player_action(
             },
         ),
     );
-    drop(resident);
+    drop(runtime);
     digging.progress =
         dig_progress_at_tick(digging.per_tick, player.server_tick, digging.started_at);
     if stop_dig_breaks(digging.progress) {
@@ -1287,20 +1429,29 @@ fn destroy_player_block(
     digging: DiggingState,
 ) -> Result<(), String> {
     let pos = BlockPos::new(digging.pos[0], digging.pos[1], digging.pos[2]);
-    let mut resident = world
-        .resident
+    let mut runtime = world
+        .runtime
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if !resident.level().is_loaded(pos) {
-        return Ok(());
+    let (destroyed, state) = {
+        let resident = runtime
+            .dimension_mut("minecraft:overworld")
+            .expect("the Play Overworld is registered")
+            .resident_mut();
+        if !resident.level().is_loaded(pos) {
+            return Ok(());
+        }
+        let state = resident.level().block_state(pos);
+        let correct_tool =
+            world.resources.behaviours.facts(state).flags & state_flags::REQUIRES_TOOL == 0;
+        let destroyed =
+            resident.destroy_block_by_player(&world.resources.behaviours, pos, false, correct_tool);
+        (destroyed, resident.level().block_state(pos))
+    };
+    if destroyed {
+        save_runtime_dirty_chunks(&mut runtime, &world.resources)?;
     }
-    let state = resident.level().block_state(pos);
-    let correct_tool =
-        world.resources.behaviours.facts(state).flags & state_flags::REQUIRES_TOOL == 0;
-    let destroyed =
-        resident.destroy_block_by_player(&world.resources.behaviours, pos, false, correct_tool);
-    let state = resident.level().block_state(pos);
-    drop(resident);
+    drop(runtime);
     if destroyed {
         world.patch_cached_block_state(pos, state)?;
         send_block_update(writer, digging.pos, state.0 as i32)?;
@@ -1318,10 +1469,14 @@ fn advance_player_mining(
         player.server_tick = player.server_tick.wrapping_add(1);
         return Ok(());
     };
-    let resident = world
-        .resident
+    let runtime = world
+        .runtime
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    let resident = runtime
+        .dimension("minecraft:overworld")
+        .expect("the Play Overworld is registered")
+        .resident();
     let mut delayed_completion = None;
     if let Some(mut digging) = player.digging.take() {
         let pos = BlockPos::new(digging.pos[0], digging.pos[1], digging.pos[2]);
@@ -1378,7 +1533,7 @@ fn advance_player_mining(
             }
         }
     }
-    drop(resident);
+    drop(runtime);
     if let Some(digging) = delayed_completion {
         destroy_player_block(writer, player.entity_id, world, digging)?;
     }
@@ -1482,6 +1637,89 @@ mod tests {
         play::Clientbound::decode(id, &payload).unwrap()
     }
 
+    fn test_world_root() -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "borizon-play-world-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    fn runtime_with_resident(
+        resident: ResidentDimension<'static>,
+    ) -> (LocalWorldRuntime<'static>, std::path::PathBuf) {
+        let root = test_world_root();
+        let mut runtime = LocalWorldRuntime::open(&root, &[]).expect("open temporary world");
+        runtime
+            .add_dimension(resident)
+            .expect("register temporary Overworld");
+        (runtime, root)
+    }
+
+    fn world_block_state(
+        world: &PreparedPlayWorld,
+        pos: BlockPos,
+    ) -> horizon_world::registry::BlockStateId {
+        let runtime = world.runtime.lock().unwrap();
+        runtime
+            .dimension("minecraft:overworld")
+            .unwrap()
+            .resident()
+            .level()
+            .block_state(pos)
+    }
+
+    fn set_world_block_state(
+        world: &PreparedPlayWorld,
+        pos: BlockPos,
+        state: horizon_world::registry::BlockStateId,
+    ) -> Option<horizon_world::registry::BlockStateId> {
+        let mut runtime = world.runtime.lock().unwrap();
+        runtime
+            .dimension_mut("minecraft:overworld")
+            .unwrap()
+            .resident_mut()
+            .level_mut()
+            .set_raw(pos, state)
+    }
+
+    fn packet_block_state(packet: &[u8], pos: BlockPos) -> i32 {
+        let mut reader = horizon_protocol::buf::Reader::new(packet);
+        let id = reader.varint().unwrap();
+        let play::Clientbound::LevelChunkWithLight(decoded) =
+            play::Clientbound::decode(id, reader.rest()).unwrap()
+        else {
+            panic!("expected LevelChunkWithLight packet");
+        };
+        let sections = decoded.chunk.sections(24, 16, 7).unwrap();
+        let section_y = pos.y.div_euclid(16);
+        let section_index = usize::try_from(section_y + 4).unwrap();
+        let index = (pos.y.rem_euclid(16) as usize) << 8
+            | (pos.z.rem_euclid(16) as usize) << 4
+            | pos.x.rem_euclid(16) as usize;
+        sections[section_index].states.get(index)
+    }
+
+    fn chunk_data_at(
+        source: &horizon_world::chunk::ChunkData,
+        position: ChunkPos,
+    ) -> horizon_world::chunk::ChunkData {
+        let mut nbt = source.clone().into_nbt();
+        let horizon_world::nbt::Tag::Compound(root) = &mut nbt.tag else {
+            panic!("ChunkData root must be a compound");
+        };
+        root.insert(
+            horizon_world::nbt::JavaString::from("xPos"),
+            horizon_world::nbt::Tag::Int(position.x),
+        );
+        root.insert(
+            horizon_world::nbt::JavaString::from("zPos"),
+            horizon_world::nbt::Tag::Int(position.z),
+        );
+        horizon_world::chunk::ChunkData::new(nbt).expect("clone valid Anvil chunk NBT")
+    }
+
     #[test]
     fn stop_dig_matches_reference_seventy_percent_threshold() {
         assert!(!stop_dig_breaks(0.699_999));
@@ -1557,28 +1795,77 @@ mod tests {
             crate::resources::load(std::path::Path::new(&resources_path))
                 .expect("load official 26.3 server resources"),
         );
-        let world = PreparedPlayWorld::build(resources, 0)
+        let root = test_world_root();
+        let world = PreparedPlayWorld::build(resources.clone(), 0, &root)
             .expect("build the complete official-resource PLAY world");
         let center = chunk_center(world.spawn);
         let expected = chunks_in_view(center);
-        let cache = world
+        let target = {
+            let runtime = world.runtime.lock().unwrap();
+            let resident = runtime.dimension("minecraft:overworld").unwrap().resident();
+            let air = resources.registry.default_state("minecraft:air").unwrap();
+            let mut found = None;
+            for y in -64..320 {
+                let pos = BlockPos::new(center.x * 16 + 8, y, center.z * 16 + 8);
+                let state = resident.level().block_state(pos);
+                if state != air {
+                    found = Some(pos);
+                    break;
+                }
+            }
+            found.expect("generated center column contains a non-air block")
+        };
+        {
+            let cache = world.chunk_packet_cache.lock().unwrap();
+            assert_eq!(world.chunk_packets.len(), CHUNK_COUNT);
+            assert_eq!(cache.len(), CHUNK_COUNT);
+            assert_eq!(cache.keys().copied().collect::<HashSet<_>>(), expected);
+            assert!(cache.values().all(|packet| !packet.is_empty()));
+        }
+        {
+            let runtime = world.runtime.lock().unwrap();
+            let resident = runtime.dimension("minecraft:overworld").unwrap().resident();
+            assert_eq!(resident.level().loaded_chunks().len(), CHUNK_COUNT);
+            assert!(expected.iter().all(|chunk| {
+                resident
+                    .level()
+                    .is_loaded(BlockPos::new(chunk.x * 16, 0, chunk.z * 16))
+            }));
+        }
+
+        let air = resources.registry.default_state("minecraft:air").unwrap();
+        {
+            let mut runtime = world.runtime.lock().unwrap();
+            runtime
+                .dimension_mut("minecraft:overworld")
+                .unwrap()
+                .resident_mut()
+                .level_mut()
+                .set_raw(target, air)
+                .expect("target belongs to a loaded generated chunk");
+            save_runtime_dirty_chunks(&mut runtime, &resources).expect("save changed block state");
+        }
+        drop(world);
+
+        let reopened = PreparedPlayWorld::build(resources, 0, &root)
+            .expect("reopen PLAY world from Anvil chunk data");
+        let runtime = reopened.runtime.lock().unwrap();
+        let resident = runtime.dimension("minecraft:overworld").unwrap().resident();
+        assert_eq!(resident.level().block_state(target), air);
+        let chunk = reopened
             .chunk_packet_cache
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        assert_eq!(world.chunk_packets.len(), CHUNK_COUNT);
-        assert_eq!(cache.len(), CHUNK_COUNT);
-        assert_eq!(cache.keys().copied().collect::<HashSet<_>>(), expected);
-        assert!(cache.values().all(|packet| !packet.is_empty()));
-        let resident = world
-            .resident
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        assert_eq!(resident.level().loaded_chunks().len(), CHUNK_COUNT);
-        assert!(expected.iter().all(|chunk| {
-            resident
-                .level()
-                .is_loaded(BlockPos::new(chunk.x * 16, 0, chunk.z * 16))
-        }));
+            .unwrap()
+            .get(&target.chunk())
+            .unwrap()
+            .clone();
+        assert_eq!(
+            packet_block_state(&chunk, target),
+            i32::try_from(air.0).unwrap()
+        );
+        drop(runtime);
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1603,28 +1890,55 @@ mod tests {
             .expect("vanilla stone state");
         let target = BlockPos::new(0, 64, 0);
         let spawn = [0.5, 65.0, 0.5];
-        let mut resident = ResidentDimension::new(
+        let resident = ResidentDimension::new(
             "minecraft:overworld",
             ResidentLevel::new(resources.registry, -64, 384, 0).expect("create resident level"),
             Ticks::new(0),
         );
-        for z in -1..=1 {
-            for x in -1..=2 {
-                resident
-                    .load_empty_chunk(ChunkPos::new(x, z))
-                    .expect("load movement fixture chunk");
-            }
-        }
-        assert_eq!(
-            resident.level_mut().set_raw(target, stone),
-            Some(air),
-            "place vanilla stone into the loaded chunk fixture"
-        );
-        let wall = BlockPos::new(1, 65, 0);
-        assert_eq!(resident.level_mut().set_raw(wall, stone), Some(air));
-        let generator_worker = OverworldGenerator::new(resources.worldgen.clone(), 0)
+        let mut generator_worker = OverworldGenerator::new(resources.worldgen.clone(), 0)
             .expect("create official Overworld generator")
             .worker();
+        let proto = generator_worker
+            .generate_proto(ChunkPos::new(0, 0))
+            .expect("generate fixture chunk NBT");
+        let mut data = generated_chunk_data(&proto, &resources).expect("encode fixture chunk NBT");
+        let air_tag = horizon_world::nbt::Tag::compound([(
+            "id",
+            horizon_world::nbt::Tag::String(horizon_world::nbt::JavaString::from("minecraft:air")),
+        )]);
+        let air_palette = horizon_world::chunk::PalettedContainer::uniform(
+            air_tag,
+            horizon_protocol::chunk::BLOCKS,
+            4,
+        )
+        .unwrap()
+        .to_nbt();
+        data.set_section_block_states((-4..20).map(|section_y| (section_y, air_palette.clone())))
+            .expect("make fixture section block palettes uniformly air");
+        let (mut runtime, world_root) = runtime_with_resident(resident);
+        let dimension = runtime.dimension_mut("minecraft:overworld").unwrap();
+        for z in -1..=1 {
+            for x in -1..=2 {
+                let position = ChunkPos::new(x, z);
+                dimension
+                    .insert_generated_chunk(
+                        chunk_data_at(&data, position),
+                        0,
+                        |name| resolve_block_tick(&resources, name),
+                        resolve_fluid_tick,
+                    )
+                    .expect("load persistable movement fixture chunk");
+            }
+        }
+        {
+            let resident = runtime
+                .dimension_mut("minecraft:overworld")
+                .unwrap()
+                .resident_mut();
+            assert_eq!(resident.level_mut().set_raw(target, stone), Some(air));
+            let wall = BlockPos::new(1, 65, 0);
+            assert_eq!(resident.level_mut().set_raw(wall, stone), Some(air));
+        }
         let mut world = PreparedPlayWorld {
             resources,
             dimension_type: 0,
@@ -1632,7 +1946,7 @@ mod tests {
             chunk_packets: Vec::new(),
             chunk_packet_cache: Mutex::new(HashMap::new()),
             generator_worker: Some(Mutex::new(generator_worker)),
-            resident: Mutex::new(resident),
+            runtime: Mutex::new(runtime),
         };
         let (movement_server_pipe, movement_client_pipe) = Pipe::pair();
         let (_, mut movement_writer) = Connection::local(movement_server_pipe).split();
@@ -1733,19 +2047,14 @@ mod tests {
             .registry
             .default_state("minecraft:powder_snow")
             .expect("vanilla powder-snow state");
-        {
-            let mut resident = world.resident.lock().unwrap();
-            assert_eq!(
-                resident.level_mut().set_raw(BlockPos::new(0, 65, 2), water),
-                Some(air)
-            );
-            assert_eq!(
-                resident
-                    .level_mut()
-                    .set_raw(BlockPos::new(0, 65, 3), powder_snow),
-                Some(air)
-            );
-        }
+        assert_eq!(
+            set_world_block_state(&world, BlockPos::new(0, 65, 2), water),
+            Some(air)
+        );
+        assert_eq!(
+            set_world_block_state(&world, BlockPos::new(0, 65, 3), powder_snow),
+            Some(air)
+        );
         let (through_water, _) = world
             .resolve_player_move(9, [0.5, 65.0, 2.5], [2.5, 65.0, 2.5], 0.0, false)
             .expect("resolve player-context water movement");
@@ -1824,15 +2133,11 @@ mod tests {
             play::Clientbound::decode(stage_id, &stage_payload).unwrap(),
             play::Clientbound::BlockDestruction(play::BlockDestruction { progress: 255, .. })
         ));
-        let resident = world.resident.lock().unwrap();
-        let after = resident.level().block_state(target);
+        let after = world_block_state(&world, target);
         assert_eq!(after, air, "the PlayerAction flow must destroy the block");
         assert_ne!(stone, after);
-        drop(resident);
 
-        let mut resident = world.resident.lock().unwrap();
-        assert_eq!(resident.level_mut().set_raw(target, stone), Some(air));
-        drop(resident);
+        assert_eq!(set_world_block_state(&world, target, stone), Some(air));
         process_player_action(
             &mut writer,
             &mut player,
@@ -1876,10 +2181,7 @@ mod tests {
             play::Clientbound::BlockDestruction(play::BlockDestruction { progress: 255, .. })
         ));
         assert!(player.digging.is_none());
-        assert_eq!(
-            world.resident.lock().unwrap().level().block_state(target),
-            stone
-        );
+        assert_eq!(world_block_state(&world, target), stone);
 
         process_player_action(
             &mut writer,
@@ -1950,15 +2252,12 @@ mod tests {
             "sub-70% STOP should be delayed"
         );
         for _ in 0..=(1.0 / per_tick).ceil() as usize {
-            if world.resident.lock().unwrap().level().block_state(target) == air {
+            if world_block_state(&world, target) == air {
                 break;
             }
             advance_player_mining(&mut writer, &mut player, Some(&world)).unwrap();
         }
-        assert_eq!(
-            world.resident.lock().unwrap().level().block_state(target),
-            air
-        );
+        assert_eq!(world_block_state(&world, target), air);
         assert!(matches!(
             receive_clientbound(&mut client),
             play::Clientbound::BlockUpdate(_)
@@ -1967,6 +2266,8 @@ mod tests {
             receive_clientbound(&mut client),
             play::Clientbound::BlockDestruction(play::BlockDestruction { progress: 255, .. })
         ));
+        drop(world);
+        std::fs::remove_dir_all(world_root).unwrap();
     }
 
     #[test]

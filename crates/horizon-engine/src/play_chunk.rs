@@ -7,6 +7,7 @@ use horizon_protocol::{
     packets::play,
 };
 use horizon_world::{
+    chunk::ChunkData as SavedChunkData,
     level::{Behaviours, data::state_flags},
     nbt::{JavaString, Tag},
     registry::{BlockRegistry, BlockStateId},
@@ -218,6 +219,87 @@ pub(crate) fn patch_cached_block_state(
         .collect::<Vec<_>>();
     values[index] = new_id;
     section.states = Paletted::from_values(&values, Strategy::Blocks, BLOCK_BITS);
+    chunk_packet.chunk.buffer = chunk::ChunkData::from_sections(&sections);
+    *packet = play::Clientbound::LevelChunkWithLight(chunk_packet).encode();
+    Ok(())
+}
+
+/// Overlay the authoritative saved block palettes onto a freshly encoded packet.
+/// Worldgen still supplies biome, heightmap and light payloads; their saved-state
+/// restoration/recomputation remains a separate lifecycle step.
+pub(crate) fn overlay_saved_block_states(
+    packet: &mut Vec<u8>,
+    saved: &SavedChunkData,
+    registry: &BlockRegistry,
+    behaviours: &Behaviours,
+) -> Result<(), String> {
+    let mut reader = Reader::new(packet);
+    let packet_id = reader
+        .varint()
+        .map_err(|error| format!("read generated chunk packet ID: {error}"))?;
+    let decoded = play::Clientbound::decode(packet_id, reader.rest())
+        .map_err(|error| format!("decode generated chunk packet: {error}"))?;
+    let play::Clientbound::LevelChunkWithLight(mut chunk_packet) = decoded else {
+        return Err("generated packet is not LevelChunkWithLight".into());
+    };
+    if (chunk_packet.x, chunk_packet.z) != (saved.position().x, saved.position().z) {
+        return Err("saved chunk coordinates do not match generated packet".into());
+    }
+
+    let saved_sections = saved
+        .section_block_states()
+        .map_err(|error| format!("read saved chunk palettes: {error}"))?;
+    let saved_sections = saved_sections
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+    let air = registry
+        .default_state("minecraft:air")
+        .ok_or("block registry is missing minecraft:air")?;
+    let mut sections = chunk_packet
+        .chunk
+        .sections(SECTION_COUNT, BLOCK_BITS, BIOME_BITS)
+        .map_err(|error| format!("decode generated chunk sections: {error}"))?;
+
+    for (section_index, section) in sections.iter_mut().enumerate() {
+        let section_y = MIN_SECTION_Y + section_index as i32;
+        let palette = match saved_sections.get(&section_y).copied().flatten() {
+            Some(tag) => Some(
+                horizon_world::chunk::PalettedContainer::from_nbt(tag, chunk::BLOCKS, 4).map_err(
+                    |error| format!("decode saved block palette at section Y={section_y}: {error}"),
+                )?,
+            ),
+            None => None,
+        };
+        let mut values = Vec::with_capacity(chunk::BLOCKS);
+        let mut non_empty = 0_i16;
+        let mut fluids = 0_i16;
+        for index in 0..chunk::BLOCKS {
+            let state = if let Some(palette) = &palette {
+                registry
+                    .saved_state_id(palette.get(index).map_err(|error| {
+                        format!("read saved block at section Y={section_y}: {error}")
+                    })?)
+                    .ok_or_else(|| {
+                        format!("saved palette contains unknown block at Y={section_y}")
+                    })?
+            } else {
+                air
+            };
+            let facts = behaviours.facts(state);
+            if facts.flags & state_flags::AIR == 0 {
+                non_empty += 1;
+            }
+            if facts.fluid != horizon_world::fluid::FluidState::EMPTY {
+                fluids += 1;
+            }
+            values.push(i32::try_from(state.0).map_err(|_| {
+                format!("saved block state {} does not fit the wire format", state.0)
+            })?);
+        }
+        section.states = Paletted::from_values(&values, Strategy::Blocks, BLOCK_BITS);
+        section.non_empty = non_empty;
+        section.fluids = fluids;
+    }
     chunk_packet.chunk.buffer = chunk::ChunkData::from_sections(&sections);
     *packet = play::Clientbound::LevelChunkWithLight(chunk_packet).encode();
     Ok(())

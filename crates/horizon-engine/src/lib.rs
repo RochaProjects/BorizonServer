@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const HELP: &str = "Horizon dedicated engine\n\nUsage:\n  horizon-engine --help\n  horizon-engine --version\n  horizon-engine --preflight\n  horizon-engine --validate-resources <directory>\n  horizon-engine --probe-worldgen <directory> [seed]\n  horizon-engine --probe-chunk-packet <directory> [seed]\n  horizon-engine --status-listen <address>\n  horizon-engine --login-listen <address> <resources>\n  horizon-engine --play-listen <address> <resources> [seed]\n\n--preflight checks eula.txt and loads/writes server.properties in the current directory.\n--validate-resources loads the server-side block registry, vanilla behaviours and worldgen bundle.\n--probe-worldgen generates an Overworld terrain-stage chunk, saves it to a temporary Anvil region, and reopens it; this is not play-ready.\n--probe-chunk-packet generates and decorates a 3x3 Overworld region, then round-trips the center chunk+light PLAY packet; light-level parity and gameplay are still incomplete.\n--status-listen serves vanilla 26.3 server-list status/ping only.\n--login-listen serves STATUS and offline LOGIN/CONFIGURATION, then closes because PLAY is not implemented.\n--play-listen sends a prepared 3x3 Overworld into PLAY; gameplay simulation and persistence remain incomplete.\nRunning without an option is intentionally refused.";
+const HELP: &str = "Horizon dedicated engine\n\nUsage:\n  horizon-engine --help\n  horizon-engine --version\n  horizon-engine --preflight\n  horizon-engine --validate-resources <directory>\n  horizon-engine --probe-worldgen <directory> [seed]\n  horizon-engine --probe-chunk-packet <directory> [seed]\n  horizon-engine --status-listen <address>\n  horizon-engine --login-listen <address> <resources>\n  horizon-engine --play-listen <address> <resources> [seed] [world-dir]\n\n--preflight checks eula.txt and loads/writes server.properties in the current directory.\n--validate-resources loads the server-side block registry, vanilla behaviours and worldgen bundle.\n--probe-worldgen generates an Overworld terrain-stage chunk, saves it to a temporary Anvil region, and reopens it; this is not play-ready.\n--probe-chunk-packet generates and decorates a 3x3 Overworld region, then round-trips the center chunk+light PLAY packet; light-level parity and gameplay are still incomplete.\n--status-listen serves vanilla 26.3 server-list status/ping only.\n--login-listen serves STATUS and offline LOGIN/CONFIGURATION, then closes because PLAY is not implemented.\n--play-listen sends a prepared 3x3 Overworld into PLAY, loading/saving Anvil chunks under world-dir (default: world); use the same seed when reopening.\nRunning without an option is intentionally refused.";
 
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
@@ -25,7 +25,7 @@ enum Command {
     ProbeChunkPacket(PathBuf, i64),
     StatusListen(String),
     LoginListen(String, PathBuf),
-    PlayListen(String, PathBuf, i64),
+    PlayListen(String, PathBuf, i64, PathBuf),
     Run,
 }
 
@@ -141,13 +141,24 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, Strin
                     .map_err(|_| "world seed must be a signed 64-bit integer")?,
                 None => 0,
             };
+            let world_root = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("world"));
             if args.next().is_some() {
-                return Err("--play-listen accepts an address, resources and optional seed".into());
+                return Err(
+                    "--play-listen accepts address, resources, optional seed and world-dir".into(),
+                );
             }
             let address = address
                 .into_string()
                 .map_err(|_| "listener address must be valid UTF-8")?;
-            Ok(Command::PlayListen(address, PathBuf::from(resources), seed))
+            Ok(Command::PlayListen(
+                address,
+                PathBuf::from(resources),
+                seed,
+                world_root,
+            ))
         }
         Some(_) => Err("unknown argument; use --help".into()),
         None => Err("arguments must be valid UTF-8".into()),
@@ -190,9 +201,9 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> Result<String, String> {
             .map(|()| "login probe listener stopped".into())
             .map_err(|e| format!("login probe listener: {e}"))
         }
-        Command::PlayListen(address, directory, seed) => {
+        Command::PlayListen(address, directory, seed, world_root) => {
             let resources = std::sync::Arc::new(resources::load(&directory)?);
-            let world = play::PreparedPlayWorld::build(resources.clone(), seed)?;
+            let world = play::PreparedPlayWorld::build(resources.clone(), seed, &world_root)?;
             status::listen_with_play(
                 address,
                 std::sync::Arc::new(resources.synchronized_registries.clone()),
@@ -448,6 +459,37 @@ mod tests {
         );
         assert!(parse_args([OsString::from("--dedicated")]).is_err());
         assert!(parse_args([OsString::from("--help"), OsString::from("extra")]).is_err());
+    }
+
+    #[test]
+    fn parses_play_listener_world_root_and_default() {
+        assert_eq!(
+            parse_args(
+                [
+                    "--play-listen",
+                    "127.0.0.1:25565",
+                    "resources",
+                    "42",
+                    "world-save",
+                ]
+                .map(OsString::from)
+            ),
+            Ok(Command::PlayListen(
+                "127.0.0.1:25565".into(),
+                PathBuf::from("resources"),
+                42,
+                PathBuf::from("world-save"),
+            ))
+        );
+        assert_eq!(
+            parse_args(["--play-listen", "127.0.0.1:25565", "resources",].map(OsString::from)),
+            Ok(Command::PlayListen(
+                "127.0.0.1:25565".into(),
+                PathBuf::from("resources"),
+                0,
+                PathBuf::from("world"),
+            ))
+        );
     }
 
     #[test]

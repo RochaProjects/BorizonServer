@@ -1529,6 +1529,42 @@ mod tests {
     }
 
     #[test]
+    fn official_resources_build_complete_play_spawn_view() {
+        let Some(resources_path) = std::env::var_os("BORIZON_SERVER_RESOURCES") else {
+            eprintln!(
+                "skipped: set BORIZON_SERVER_RESOURCES to run the official 26.3 PLAY bootstrap test"
+            );
+            return;
+        };
+        let resources = Arc::new(
+            crate::resources::load(std::path::Path::new(&resources_path))
+                .expect("load official 26.3 server resources"),
+        );
+        let world = PreparedPlayWorld::build(resources, 0)
+            .expect("build the complete official-resource PLAY world");
+        let center = chunk_center(world.spawn);
+        let expected = chunks_in_view(center);
+        let cache = world
+            .chunk_packet_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(world.chunk_packets.len(), CHUNK_COUNT);
+        assert_eq!(cache.len(), CHUNK_COUNT);
+        assert_eq!(cache.keys().copied().collect::<HashSet<_>>(), expected);
+        assert!(cache.values().all(|packet| !packet.is_empty()));
+        let resident = world
+            .resident
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(resident.level().loaded_chunks().len(), CHUNK_COUNT);
+        assert!(expected.iter().all(|chunk| {
+            resident
+                .level()
+                .is_loaded(BlockPos::new(chunk.x * 16, 0, chunk.z * 16))
+        }));
+    }
+
+    #[test]
     fn official_server_resources_drive_play_mining_and_contextual_movement() {
         let Some(resources_path) = std::env::var_os("BORIZON_SERVER_RESOURCES") else {
             eprintln!(

@@ -1,3 +1,5 @@
+mod inventory;
+mod item_entity;
 mod light;
 pub mod login;
 mod play;
@@ -13,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const HELP: &str = "Horizon dedicated engine\n\nUsage:\n  horizon-engine --help\n  horizon-engine --version\n  horizon-engine --preflight\n  horizon-engine --validate-resources <directory>\n  horizon-engine --probe-worldgen <directory> [seed]\n  horizon-engine --probe-chunk-packet <directory> [seed]\n  horizon-engine --status-listen <address>\n  horizon-engine --login-listen <address> <resources>\n  horizon-engine --play-listen <address> <resources> [seed] [world-dir]\n\n--preflight checks eula.txt and loads/writes server.properties in the current directory.\n--validate-resources loads the server-side block registry, vanilla behaviours and worldgen bundle.\n--probe-worldgen generates an Overworld terrain-stage chunk, saves it to a temporary Anvil region, and reopens it; this is not play-ready.\n--probe-chunk-packet generates and decorates a 3x3 Overworld region, then round-trips the center chunk+light PLAY packet; light-level parity and gameplay are still incomplete.\n--status-listen serves vanilla 26.3 server-list status/ping only.\n--login-listen serves STATUS and offline LOGIN/CONFIGURATION, then closes because PLAY is not implemented.\n--play-listen sends a prepared 3x3 Overworld into PLAY, loading/saving Anvil chunks under world-dir (default: world); use the same seed when reopening.\nRunning without an option is intentionally refused.";
+const HELP: &str = "Horizon dedicated engine\n\nUsage:\n  horizon-engine --help\n  horizon-engine --version\n  horizon-engine --preflight\n  horizon-engine --validate-resources <directory>\n  horizon-engine --probe-worldgen <directory> [seed]\n  horizon-engine --probe-chunk-packet <directory> [seed]\n  horizon-engine --status-listen <address>\n  horizon-engine --login-listen <address> <resources>\n  horizon-engine --play-listen <address> <resources> [seed] [world-dir]\n\n--preflight checks eula.txt and loads/writes server.properties in the current directory.\n--validate-resources loads the server-side block registry, vanilla behaviours and worldgen bundle.\n--probe-worldgen generates an Overworld terrain-stage chunk, saves it to a temporary Anvil region, and reopens it; this is not play-ready.\n--probe-chunk-packet generates and decorates a 3x3 Overworld region, then round-trips the center chunk+light PLAY packet; light-level parity and gameplay are still incomplete.\n--status-listen serves vanilla 26.3 server-list status/ping only.\n--login-listen serves offline LOGIN/CONFIGURATION, then closes because PLAY is not implemented.\n--play-listen sends the spawn 3x3 first, then asynchronously streams toward server.properties view-distance; chunks load/save under world-dir (default: server.properties level-name). Seed, view/simulation distance, mode, difficulty, hardcore, max players, MOTD and online-mode use server.properties when omitted. This remains partial PLAY, not full vanilla parity.\nWith no option, starts the current partial PLAY listener from server.properties.";
 
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
@@ -25,7 +27,7 @@ enum Command {
     ProbeChunkPacket(PathBuf, i64),
     StatusListen(String),
     LoginListen(String, PathBuf),
-    PlayListen(String, PathBuf, i64, PathBuf),
+    PlayListen(String, PathBuf, Option<i64>, Option<PathBuf>),
     Run,
 }
 
@@ -134,17 +136,15 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, Strin
                 return Err("--play-listen requires a resource directory".into());
             };
             let seed = match args.next() {
-                Some(seed) => seed
-                    .to_str()
-                    .ok_or("world seed must be valid UTF-8")?
-                    .parse::<i64>()
-                    .map_err(|_| "world seed must be a signed 64-bit integer")?,
-                None => 0,
+                Some(seed) => Some(
+                    seed.to_str()
+                        .ok_or("world seed must be valid UTF-8")?
+                        .parse::<i64>()
+                        .map_err(|_| "world seed must be a signed 64-bit integer")?,
+                ),
+                None => None,
             };
-            let world_root = args
-                .next()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("world"));
+            let world_root = args.next().map(PathBuf::from);
             if args.next().is_some() {
                 return Err(
                     "--play-listen accepts address, resources, optional seed and world-dir".into(),
@@ -178,12 +178,15 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> Result<String, String> {
         Command::ValidateResources(directory) => {
             let resources = resources::load(&directory)?;
             Ok(format!(
-                "Server resources valid: {} block states, {} worldgen biomes, {} synchronized registries ({} entries), {} registry tags, resources={}",
+                "Server resources valid: {} block states, {} worldgen biomes, {} synchronized registries ({} entries), {} registry tags, {} built-in registries, {} item IDs, {} loot tables, resources={}",
                 resources.registry.len(),
                 resources.worldgen.biome_names().len(),
                 resources.synchronized_registries.registries().len(),
                 resources.synchronized_registries.entry_count(),
                 resources.synchronized_registries.tag_count(),
+                resources.builtin_registries.registries.len(),
+                resources.item_ids.names.len(),
+                resources.loot.table_count(),
                 directory.display()
             ))
         }
@@ -203,17 +206,93 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> Result<String, String> {
         }
         Command::PlayListen(address, directory, seed, world_root) => {
             let resources = std::sync::Arc::new(resources::load(&directory)?);
-            let world = play::PreparedPlayWorld::build(resources.clone(), seed, &world_root)?;
-            status::listen_with_play(
+            let mut entropy = horizon_server_files::properties::SystemEntropy::default();
+            let properties = horizon_server_files::properties::ServerProperties::from_file(
+                &std::path::PathBuf::from("server.properties"),
+                &mut entropy,
+            )?;
+            let seed = seed.unwrap_or(properties.seed);
+            let world_root = world_root.unwrap_or_else(|| PathBuf::from(&properties.level_name));
+            let world = play::PreparedPlayWorld::build_with_settings(
+                resources.clone(),
+                seed,
+                &world_root,
+                properties.view_distance,
+                properties.simulation_distance,
+                properties.game_mode,
+                properties.difficulty,
+                properties.max_players.max(1) as usize,
+                properties.hardcore,
+            )?;
+            let online = properties
+                .online_mode
+                .then(|| login::OnlineAuthenticator::generate(properties.prevent_proxy_connections))
+                .transpose()?
+                .map(std::sync::Arc::new);
+            status::listen_with_play_and_motd(
                 address,
                 std::sync::Arc::new(resources.synchronized_registries.clone()),
                 std::sync::Arc::new(world),
+                properties.motd.clone(),
+                online,
             )
             .map(|()| "play listener stopped".into())
             .map_err(|e| format!("play listener: {e}"))
         }
-        Command::Run => Err("the dedicated gameplay runtime has not been extracted yet; use --preflight to validate server files".into()),
+        Command::Run => run_default_server(),
     }
+}
+
+fn run_default_server() -> Result<String, String> {
+    println!("{}", preflight(Path::new("."))?);
+    let mut entropy = horizon_server_files::properties::SystemEntropy::default();
+    let properties = horizon_server_files::properties::ServerProperties::from_file(
+        Path::new("server.properties"),
+        &mut entropy,
+    )?;
+    if !(0..=u16::MAX as i32).contains(&properties.server_port) {
+        return Err(format!(
+            "server-port {} is outside the valid TCP port range",
+            properties.server_port
+        ));
+    }
+    let host = if properties.server_ip.is_empty() {
+        "0.0.0.0"
+    } else {
+        &properties.server_ip
+    };
+    let address = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        std::net::SocketAddr::new(ip, properties.server_port as u16).to_string()
+    } else {
+        format!("{host}:{}", properties.server_port)
+    };
+    let resources = std::sync::Arc::new(resources::load(Path::new("resources"))?);
+    let world_root = PathBuf::from(&properties.level_name);
+    let world = play::PreparedPlayWorld::build_with_settings(
+        resources.clone(),
+        properties.seed,
+        &world_root,
+        properties.view_distance,
+        properties.simulation_distance,
+        properties.game_mode,
+        properties.difficulty,
+        properties.max_players.max(1) as usize,
+        properties.hardcore,
+    )?;
+    let online = properties
+        .online_mode
+        .then(|| login::OnlineAuthenticator::generate(properties.prevent_proxy_connections))
+        .transpose()?
+        .map(std::sync::Arc::new);
+    status::listen_with_play_and_motd(
+        address,
+        std::sync::Arc::new(resources.synchronized_registries.clone()),
+        std::sync::Arc::new(world),
+        properties.motd,
+        online,
+    )
+    .map(|()| "play listener stopped".into())
+    .map_err(|error| format!("play listener: {error}"))
 }
 
 /// Exercise generated chunk palettes and the current light calculation through
@@ -242,10 +321,11 @@ fn probe_chunk_packet(directory: &Path, seed: i64) -> Result<String, String> {
     let features = worker
         .decorate(&mut region)
         .map_err(|error| format!("decorate the PLAY probe region: {error}"))?;
-    let light_chunks = resources.light_occlusion.light_overworld_region(
+    let light_chunks = resources.light_occlusion.light_region(
         &region,
         resources.registry,
         &resources.behaviours,
+        true,
     )?;
     let proto = region
         .into_iter()
@@ -477,8 +557,8 @@ mod tests {
             Ok(Command::PlayListen(
                 "127.0.0.1:25565".into(),
                 PathBuf::from("resources"),
-                42,
-                PathBuf::from("world-save"),
+                Some(42),
+                Some(PathBuf::from("world-save")),
             ))
         );
         assert_eq!(
@@ -486,8 +566,8 @@ mod tests {
             Ok(Command::PlayListen(
                 "127.0.0.1:25565".into(),
                 PathBuf::from("resources"),
-                0,
-                PathBuf::from("world"),
+                None,
+                None,
             ))
         );
     }

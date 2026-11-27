@@ -193,8 +193,8 @@ fn write_level(base: &Path, mut data: Tag, version: i32) -> io::Result<()> {
     set(&mut data, "DataVersion", Tag::Int(version));
     write_dat(&base.join("level.dat"), &Tag::compound([("Data", data)]))
 }
-/// `SavedDataNbt.write`.
-fn write_saved_data(path: &Path, data: Tag, version: i32) -> io::Result<()> {
+/// `SavedDataNbt.write` for a server-owned saved-data record.
+pub fn write_saved_data(path: &Path, data: Tag, version: i32) -> io::Result<()> {
     write_dat(
         path,
         &Tag::compound([("data", data), ("DataVersion", Tag::Int(version))]),

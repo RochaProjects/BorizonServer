@@ -321,6 +321,55 @@ impl ChunkData {
         &self.root
     }
 
+    /// Replace block entities at the supplied positions while retaining every
+    /// unrelated entry in the chunk's opaque `block_entities` list.
+    pub fn set_block_entity_updates(
+        &mut self,
+        updates: impl IntoIterator<Item = (BlockPos, Option<Compound>)>,
+    ) -> io::Result<()> {
+        let mut updates = updates.into_iter().collect::<Vec<_>>();
+        updates.sort_by_key(|(position, _)| (position.x, position.y, position.z));
+        if updates.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(invalid("duplicate block entity update"));
+        }
+        if updates
+            .iter()
+            .any(|(position, _)| position.chunk() != self.position)
+        {
+            return Err(invalid("block entity is outside this chunk"));
+        }
+
+        let Tag::Compound(root) = &mut self.root.tag else {
+            unreachable!("ChunkData validates a compound root")
+        };
+        let entities = root
+            .entry(key("block_entities"))
+            .or_insert_with(|| Tag::List(Vec::new()));
+        let Tag::List(entities) = entities else {
+            return Err(invalid("chunk block_entities is not a list"));
+        };
+        entities.retain(|entity| {
+            let (Some(x), Some(y), Some(z)) = (
+                entity_integer(entity, "x"),
+                entity_integer(entity, "y"),
+                entity_integer(entity, "z"),
+            ) else {
+                return true;
+            };
+            !updates
+                .iter()
+                .any(|(position, _)| (position.x, position.y, position.z) == (x, y, z))
+        });
+        for (position, data) in updates {
+            let Some(mut data) = data else { continue };
+            data.insert(key("x"), Tag::Int(position.x));
+            data.insert(key("y"), Tag::Int(position.y));
+            data.insert(key("z"), Tag::Int(position.z));
+            entities.push(Tag::Compound(data));
+        }
+        Ok(())
+    }
+
     /// Read the block-state palettes attached to each saved section. A section
     /// with no `block_states` compound is returned as `None` and is interpreted
     /// by the resident level as all air. Other section fields remain opaque.
@@ -523,6 +572,16 @@ fn int_or_zero(tag: &Tag, name: &str) -> i32 {
         Some(Tag::Int(v)) => *v,
         Some(Tag::Long(v)) => *v as i32,
         _ => 0,
+    }
+}
+
+fn entity_integer(tag: &Tag, name: &str) -> Option<i32> {
+    match tag.get(name) {
+        Some(Tag::Byte(value)) => Some(i32::from(*value)),
+        Some(Tag::Short(value)) => Some(i32::from(*value)),
+        Some(Tag::Int(value)) => Some(*value),
+        Some(Tag::Long(value)) => Some(*value as i32),
+        _ => None,
     }
 }
 fn out_of_bounds() -> io::Error {

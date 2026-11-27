@@ -41,6 +41,12 @@ report_dir="$temp_dir/generated/reports/biome_parameters/minecraft"
   echo "vanilla data generator did not produce Overworld and Nether biome parameter reports" >&2
   exit 1
 }
+registry_report="$temp_dir/generated/reports/registries.json"
+[[ -s "$registry_report" ]] || {
+  echo "vanilla data generator did not produce reports/registries.json" >&2
+  exit 1
+}
 install -D -m 0644 "$report_dir/overworld.json" "$resources_dir/worldgen/biome_parameters/overworld.json"
 install -D -m 0644 "$report_dir/nether.json" "$resources_dir/worldgen/biome_parameters/nether.json"
-echo "Exported vanilla Overworld and Nether biome parameter reports"
+install -D -m 0644 "$registry_report" "$resources_dir/registries.json"
+echo "Exported vanilla Overworld and Nether biome parameter reports and built-in registries"

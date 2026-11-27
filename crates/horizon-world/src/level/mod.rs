@@ -628,6 +628,8 @@ pub struct ResidentLevel<'registry> {
     min_y: i32,
     max_y: i32,
     columns: HashMap<ChunkPos, ResidentColumn<'registry>>,
+    changed_blocks: Vec<(BlockPos, BlockStateId)>,
+    pending_events: Vec<LevelEvent>,
     next_revision: u128,
     random: LegacyRandom,
     game_time: i64,
@@ -671,6 +673,8 @@ impl<'registry> ResidentLevel<'registry> {
             min_y,
             max_y,
             columns: HashMap::new(),
+            changed_blocks: Vec::new(),
+            pending_events: Vec::new(),
             next_revision: 1,
             random: LegacyRandom::new(seed),
             game_time: 0,
@@ -960,12 +964,29 @@ impl<'registry> ResidentLevel<'registry> {
         self.game_rules = rules;
     }
 
+    /// Take block-state mutations made since the previous drain. The owner
+    /// uses this journal to publish authoritative changes to connected clients.
+    pub fn take_block_changes(&mut self) -> Vec<(BlockPos, BlockStateId)> {
+        std::mem::take(&mut self.changed_blocks)
+    }
+
+    /// Take simulation side effects emitted since the previous drain. Server
+    /// owners can translate sound and level events to packets while retaining
+    /// player- and entity-specific effects for their own lifecycle systems.
+    pub fn take_events(&mut self) -> Vec<LevelEvent> {
+        std::mem::take(&mut self.pending_events)
+    }
+
     pub(crate) fn set_chunk_ticking_levels(&mut self, levels: Levels) {
         self.ticking_levels = levels;
     }
 }
 
 impl LevelAccess for ResidentLevel<'_> {
+    fn emit(&mut self, event: LevelEvent) {
+        self.pending_events.push(event);
+    }
+
     fn game_rule_catalog(&self) -> &crate::gamerules::GameRules {
         &self.game_rules
     }
@@ -1004,6 +1025,7 @@ impl LevelAccess for ResidentLevel<'_> {
         if previous.is_some() {
             column.dirty = true;
             column.revision = revision;
+            self.changed_blocks.push((pos, state));
         }
         previous
     }

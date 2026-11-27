@@ -1,40 +1,63 @@
 //! Server-owned PLAY bootstrap with one resident Overworld shared by sessions.
 //!
 //! This is not yet the authoritative gameplay loop. Player movement uses resident
-//! contextual collisions, basic survival mining, and synchronous radius-one chunk
-//! streaming handle a limited gameplay path; gravity, entity/block-entity simulation,
-//! other interactions, coherent post-mutation chunk packets, graceful final shutdown,
-//! and complete metadata persistence remain pending.
+//! contextual collisions, basic survival mining, and queued chunk streaming. Dropped
+//! items have a limited shared gravity/collision/pickup lifecycle;
+//! player gravity, mobs, block entities, other interactions, complete entity/chunk
+//! persistence, graceful final shutdown, and full vanilla parity remain pending.
 
-use crate::{login::ConfiguredConnection, play_chunk, resources::ServerResources};
+use crate::{
+    inventory::PlayerInventory,
+    item_entity::{DroppedItem, ItemEntityStore},
+    login::ConfiguredConnection,
+    play_chunk,
+    resources::ServerResources,
+};
 #[cfg(test)]
-use horizon_core::geometry::{Aabb, Vec3, VoxelShape, try_resolve_step_movement};
+use horizon_core::geometry::{Aabb, VoxelShape, try_resolve_step_movement};
 use horizon_core::{
+    geometry::{Direction, Vec3},
     position::{BlockPos, ChunkPos},
+    random::{LegacyRandom, RandomSource},
     ticks::TickTypeId,
 };
-use horizon_protocol::packets::{configuration::KeepAlive, play};
+use horizon_protocol::{
+    entity_data::{self, Value as EntityDataValue},
+    item::{Component as ItemComponent, Stack},
+    packets::{configuration::KeepAlive, play},
+};
 use horizon_world::{
     compression::Compression,
     fluid::FluidKind,
-    level::{BlockId, LevelAccess, ResidentDimension, ResidentLevel, Ticks, data::state_flags},
+    level::{
+        BlockId, LevelAccess, LevelEvent, PlaceContext, PlaceOutcome, PlayerContext,
+        ResidentDimension, ResidentLevel, Ticks, data::state_flags,
+    },
+    loot::{BlockLootContext, LootStack},
     nbt::Limits,
     player_mining::{self, DestroySpeedModifiers},
     ticket_levels::Sources as ChunkTicketSources,
     world_runtime::LocalWorldRuntime,
-    worldgen::generator::{GeneratorWorker, OverworldGenerator, ProtoChunk},
+    worldgen::generator::{GeneratorWorker, OverworldGenerator, ProtoChunk, SavedFinalWrite},
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::Path,
     sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const CHUNK_RADIUS: i32 = 1;
 const CHUNK_COUNT: usize = 9;
+const DEFAULT_VIEW_DISTANCE: i32 = 10;
+#[cfg(test)]
+const DEFAULT_SIMULATION_DISTANCE: i32 = 10;
+const CHUNK_GENERATION_QUEUE: usize = 256;
+const CHUNK_GENERATION_IDLE_RELEASE: Duration = Duration::from_secs(5);
+const CHUNKS_PER_TICK: f32 = 9.0;
+const MAX_CHUNK_BATCH: usize = 64;
 const MAX_LIFECYCLE_CANDIDATES: usize = 4096;
 const PLAY_TICK_BARRIER: Duration = Duration::from_millis(50);
 const SERVER_TICK: Duration = Duration::from_millis(50);
@@ -43,6 +66,7 @@ const INBOX_LIMIT: usize = 20 * PACKETS_PER_TICK;
 const INBOX_BYTES: usize = 16 << 20;
 const NETWORK_CHANNEL_CAPACITY: usize = 8;
 const MAX_CLIENT_MOVEMENT_SQUARED_PER_TICK: f64 = 100.0;
+const MAX_RETAINED_BLOCK_UPDATES: usize = 65_536;
 
 pub(crate) struct PreparedPlayWorld {
     resources: Arc<ServerResources>,
@@ -50,16 +74,996 @@ pub(crate) struct PreparedPlayWorld {
     spawn: [f64; 3],
     chunk_packets: Vec<Vec<u8>>,
     chunk_packet_cache: Mutex<HashMap<ChunkPos, Vec<u8>>>,
-    generator_worker: Option<Mutex<GeneratorWorker>>,
+    chunk_generation: Option<ChunkGeneration>,
+    view_distance: i32,
+    simulation_distance: i32,
+    game_mode: i32,
+    difficulty: i32,
+    max_players: usize,
+    hardcore: bool,
     runtime: Mutex<LocalWorldRuntime<'static>>,
     player_chunks: Mutex<HashMap<i32, ChunkPos>>,
+    block_updates: Mutex<BlockUpdateLog>,
+    level_events: Mutex<LevelEventLog>,
+    item_entities: ItemEntityStore,
+    loot_random: Mutex<LegacyRandom>,
+}
+
+struct ChunkGeneration {
+    requests: Arc<ChunkRequestQueue>,
+    completed: Mutex<Receiver<ChunkWorkResult>>,
+    pipeline: Mutex<ChunkPipeline>,
+    generation_budget: usize,
+    decoration_budget: usize,
+    light_budget: usize,
+}
+
+struct ChunkPipeline {
+    centers: Vec<ChunkPos>,
+    radius: i32,
+    requested: HashSet<ChunkPos>,
+    targets: HashSet<ChunkPos>,
+    feature_targets: HashSet<ChunkPos>,
+    terrain_targets: HashSet<ChunkPos>,
+    protos: HashMap<ChunkPos, Arc<ProtoChunk>>,
+    saved_chunks: HashMap<ChunkPos, Arc<horizon_world::chunk::ChunkData>>,
+    saved_checked: HashSet<ChunkPos>,
+    terrain_jobs: HashSet<ChunkPos>,
+    feature_jobs: HashSet<ChunkPos>,
+    light_jobs: HashSet<ChunkPos>,
+    features: HashSet<ChunkPos>,
+    lit: HashSet<ChunkPos>,
+    delivered: HashSet<ChunkPos>,
+    rank: HashMap<ChunkPos, usize>,
+    rank_origins: HashSet<ChunkPos>,
+}
+
+impl Default for ChunkPipeline {
+    fn default() -> Self {
+        Self {
+            centers: Vec::new(),
+            radius: DEFAULT_VIEW_DISTANCE,
+            requested: HashSet::new(),
+            targets: HashSet::new(),
+            feature_targets: HashSet::new(),
+            terrain_targets: HashSet::new(),
+            protos: HashMap::new(),
+            saved_chunks: HashMap::new(),
+            saved_checked: HashSet::new(),
+            terrain_jobs: HashSet::new(),
+            feature_jobs: HashSet::new(),
+            light_jobs: HashSet::new(),
+            features: HashSet::new(),
+            lit: HashSet::new(),
+            delivered: HashSet::new(),
+            rank: HashMap::new(),
+            rank_origins: HashSet::new(),
+        }
+    }
+}
+
+enum ChunkWork {
+    Terrain(ChunkPos),
+    Features(
+        ChunkPos,
+        Box<[ProtoChunk; CHUNK_COUNT]>,
+        HashMap<ChunkPos, Arc<horizon_world::chunk::ChunkData>>,
+    ),
+    Light(ChunkPos, Box<[Arc<ProtoChunk>; CHUNK_COUNT]>),
+}
+
+impl ChunkWork {
+    fn position(&self) -> ChunkPos {
+        match self {
+            Self::Terrain(position) | Self::Features(position, _, _) | Self::Light(position, _) => {
+                *position
+            }
+        }
+    }
+
+    fn stage_priority(&self) -> i128 {
+        match self {
+            Self::Light(..) => 0,
+            Self::Features(..) => 1,
+            Self::Terrain(..) => 2,
+        }
+    }
+}
+
+enum ChunkWorkResult {
+    Terrain(ChunkPos, Result<ProtoChunk, String>),
+    Features(
+        ChunkPos,
+        Result<(Box<[ProtoChunk; CHUNK_COUNT]>, Vec<SavedFinalWrite>), String>,
+    ),
+    Light(
+        ChunkPos,
+        Result<(Vec<u8>, horizon_world::chunk::ChunkData), String>,
+    ),
+}
+
+struct GeneratorIdleState {
+    generator: OverworldGenerator,
+    worker_count: usize,
+    idle_workers: Mutex<usize>,
+}
+
+impl GeneratorIdleState {
+    fn new(generator: OverworldGenerator, worker_count: usize) -> Self {
+        Self {
+            generator,
+            worker_count,
+            idle_workers: Mutex::new(0),
+        }
+    }
+
+    fn worker_became_idle(&self) {
+        let mut idle = self
+            .idle_workers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *idle = idle.saturating_add(1).min(self.worker_count);
+        if *idle == self.worker_count {
+            self.generator.release_caches();
+        }
+    }
+
+    fn worker_became_active(&self) {
+        let mut idle = self
+            .idle_workers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *idle = idle.saturating_sub(1);
+    }
+}
+
+#[derive(Default)]
+struct ChunkRequestQueue {
+    state: Mutex<ChunkRequestState>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct ChunkRequestState {
+    pending: VecDeque<(i128, ChunkWork)>,
+    closed: bool,
+}
+
+impl ChunkRequestQueue {
+    fn try_send(
+        &self,
+        work: ChunkWork,
+        priority: i128,
+    ) -> Result<(), (ChunkQueueSendError, ChunkWork)> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.closed {
+            return Err((ChunkQueueSendError::Closed, work));
+        }
+        if state.pending.len() >= CHUNK_GENERATION_QUEUE {
+            return Err((ChunkQueueSendError::Full, work));
+        }
+        let at = state
+            .pending
+            .iter()
+            .position(|(queued_priority, _)| *queued_priority > priority)
+            .unwrap_or(state.pending.len());
+        state.pending.insert(at, (priority, work));
+        self.ready.notify_one();
+        Ok(())
+    }
+
+    /// `Ok(None)` means shutdown; `Err(())` means the idle wait timed out.
+    fn receive_timeout(&self, timeout: Duration) -> Result<Option<ChunkWork>, ()> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let (mut state, wait) = self
+            .ready
+            .wait_timeout_while(state, timeout, |state| {
+                state.pending.is_empty() && !state.closed
+            })
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some((_, work)) = state.pending.pop_front() {
+            return Ok(Some(work));
+        }
+        if state.closed {
+            return Ok(None);
+        }
+        debug_assert!(wait.timed_out());
+        Err(())
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.closed = true;
+        state.pending.clear();
+        self.ready.notify_all();
+    }
+
+    fn retain(
+        &self,
+        mut keep: impl FnMut(&ChunkWork) -> bool,
+        mut priority: impl FnMut(&ChunkWork) -> i128,
+    ) -> Vec<ChunkWork> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut removed = Vec::new();
+        let mut retained = VecDeque::with_capacity(state.pending.len());
+        while let Some((_, work)) = state.pending.pop_front() {
+            if keep(&work) {
+                retained.push_back((priority(&work), work));
+            } else {
+                removed.push(work);
+            }
+        }
+        retained
+            .make_contiguous()
+            .sort_by_key(|(priority, _)| *priority);
+        state.pending = retained;
+        removed
+    }
+}
+
+enum ChunkQueueSendError {
+    Full,
+    Closed,
+}
+
+impl Drop for ChunkGeneration {
+    fn drop(&mut self) {
+        self.requests.close();
+    }
+}
+
+impl ChunkGeneration {
+    fn start(
+        generator: OverworldGenerator,
+        resources: Arc<ServerResources>,
+        initial_terrain: Option<[ProtoChunk; CHUNK_COUNT]>,
+    ) -> Result<Self, String> {
+        let request_queue = Arc::new(ChunkRequestQueue::default());
+        let (results, completed) = mpsc::sync_channel(CHUNK_GENERATION_QUEUE);
+        let worker_count =
+            thread::available_parallelism().map_or(1, |count| count.get().div_ceil(2));
+        // Match Streaming's per-stage in-flight limits. Bounding queued protos
+        // keeps terrain from monopolizing memory before nearby chunks reach
+        // FEATURES and LIGHT.
+        let generation_budget = worker_count * 3;
+        let decoration_budget = worker_count * 2;
+        let light_budget = worker_count * 4;
+        let idle_state = Arc::new(GeneratorIdleState::new(generator.clone(), worker_count));
+        for index in 0..worker_count {
+            let generator = generator.clone();
+            let resources = resources.clone();
+            let idle_state = idle_state.clone();
+            let requests = request_queue.clone();
+            let results = results.clone();
+            let spawn = thread::Builder::new()
+                .name(format!("borizon-chunk-generation-{index}"))
+                .spawn(move || {
+                    let mut worker = generator.worker();
+                    let mut idle = false;
+                    loop {
+                        let request = requests.receive_timeout(CHUNK_GENERATION_IDLE_RELEASE);
+                        match request {
+                            Ok(Some(work)) => {
+                                if idle {
+                                    idle_state.worker_became_active();
+                                    idle = false;
+                                }
+                                let result = match work {
+                                    ChunkWork::Terrain(position) => {
+                                        let result = worker
+                                            .generate_proto(position)
+                                            .map_err(|error| {
+                                                format!("generate terrain chunk ({},{}): {error}", position.x, position.z)
+                                            });
+                                        ChunkWorkResult::Terrain(position, result)
+                                    }
+                                    ChunkWork::Features(position, mut region, saved) => {
+                                        let result = region
+                                            .iter_mut()
+                                            .try_for_each(|proto| {
+                                                if let Some(data) = saved.get(&proto.position()) {
+                                                    proto.restore_saved_final(&data).map_err(
+                                                        |error| {
+                                                            format!(
+                                                                "restore saved final chunk ({},{}): {error}",
+                                                                proto.position().x,
+                                                                proto.position().z
+                                                            )
+                                                        },
+                                                    )?;
+                                                }
+                                                Ok::<_, String>(())
+                                            })
+                                            .and_then(|_| {
+                                                worker.decorate(region.as_mut()).map_err(|error| {
+                                                    format!("decorate features around ({},{}): {error}", position.x, position.z)
+                                                })
+                                            })
+                                            .and_then(|_| {
+                                                for proto in region.iter_mut() {
+                                                    proto.finalize_block_entities();
+                                                }
+                                                if region[4].position() != position
+                                                    || !region[4].is_decorated()
+                                                {
+                                                    return Err(format!(
+                                                        "FEATURES stage did not complete chunk ({},{})",
+                                                        position.x, position.z
+                                                    ));
+                                                }
+                                                let mut final_writes = Vec::new();
+                                                for proto in region.iter() {
+                                                    if let Some(data) = saved.get(&proto.position()) {
+                                                        final_writes.extend(
+                                                            proto
+                                                                .saved_final_writes(data)
+                                                                .map_err(|error| {
+                                                                    format!(
+                                                                        "collect saved final writes for ({},{}): {error}",
+                                                                        proto.position().x,
+                                                                        proto.position().z
+                                                                    )
+                                                                })?,
+                                                        );
+                                                    }
+                                                }
+                                                Ok((region, final_writes))
+                                            });
+                                        ChunkWorkResult::Features(position, result)
+                                    }
+                                    ChunkWork::Light(position, region) => {
+                                        let refs: [&ProtoChunk; CHUNK_COUNT] =
+                                            std::array::from_fn(|index| region[index].as_ref());
+                                        let result = resources
+                                            .light_occlusion
+                                            .light_region_refs(
+                                                &refs,
+                                                resources.registry,
+                                                &resources.behaviours,
+                                                true,
+                                            )
+                                            .and_then(|lights| {
+                                                encode_center_chunk(
+                                                    &region[4],
+                                                    lights[4].clone(),
+                                                    &resources,
+                                                )
+                                            });
+                                        ChunkWorkResult::Light(position, result)
+                                    }
+                                };
+                                if results.send(result).is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(()) => {
+                                worker.release();
+                                if !idle {
+                                    idle_state.worker_became_idle();
+                                    idle = true;
+                                }
+                            }
+                        }
+                    }
+                });
+            if let Err(error) = spawn {
+                request_queue.close();
+                return Err(format!("start server chunk-generation worker: {error}"));
+            }
+        }
+        drop(results);
+        let mut pipeline = ChunkPipeline::default();
+        if let Some(chunks) = initial_terrain {
+            for chunk in chunks {
+                pipeline.protos.insert(chunk.position(), Arc::new(chunk));
+            }
+        }
+        Ok(Self {
+            requests: request_queue,
+            completed: Mutex::new(completed),
+            pipeline: Mutex::new(pipeline),
+            generation_budget,
+            decoration_budget,
+            light_budget,
+        })
+    }
+
+    /// Add a chunk to the desired view. The scheduler expands it into the
+    /// TERRAIN, FEATURES and LIGHT dependencies required by the server status graph.
+    fn request(&self, position: ChunkPos) -> Result<(), String> {
+        self.pipeline
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .requested
+            .insert(position);
+        Ok(())
+    }
+
+    /// Ask for Anvil snapshots only when the next ordered FEATURES region has
+    /// its terrain protos ready, keeping disk work bounded to one region.
+    fn saved_snapshot_positions(&self, centers: &[ChunkPos], radius: i32) -> HashSet<ChunkPos> {
+        let mut pipeline = self
+            .pipeline
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        pipeline.set_view(centers, radius);
+        let mut features = pipeline
+            .feature_targets
+            .iter()
+            .copied()
+            .filter(|center| {
+                !pipeline.features.contains(center)
+                    && !pipeline.feature_jobs.contains(center)
+                    && !pipeline.feature_blocked(*center)
+                    && !pipeline.feature_jobs.iter().any(|running| {
+                        (running.x - center.x).abs() <= 2 && (running.z - center.z).abs() <= 2
+                    })
+            })
+            .collect::<Vec<_>>();
+        features.sort_by_key(|center| pipeline.priority_at(1, *center));
+        let Some(center) = features.into_iter().find(|center| {
+            region_positions(*center).iter().all(|position| {
+                pipeline
+                    .protos
+                    .get(position)
+                    .is_some_and(|proto| Arc::strong_count(proto) == 1)
+            })
+        }) else {
+            return HashSet::new();
+        };
+        region_positions(center)
+            .into_iter()
+            .filter(|position| !pipeline.saved_checked.contains(position))
+            .collect()
+    }
+
+    fn advance(
+        &self,
+        centers: &[ChunkPos],
+        radius: i32,
+        saved_snapshots: HashMap<ChunkPos, Option<horizon_world::chunk::ChunkData>>,
+    ) -> Result<
+        (
+            Vec<(ChunkPos, (Vec<u8>, horizon_world::chunk::ChunkData))>,
+            Vec<SavedFinalWrite>,
+        ),
+        String,
+    > {
+        let receiver = self
+            .completed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut results = Vec::new();
+        loop {
+            match receiver.try_recv() {
+                Ok(result) => results.push(result),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err("server chunk-generation worker stopped".into());
+                }
+            }
+        }
+        drop(receiver);
+
+        let mut pipeline = self
+            .pipeline
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        pipeline.set_view(centers, radius);
+        for (position, data) in saved_snapshots {
+            pipeline.saved_checked.insert(position);
+            if let Some(data) = data {
+                pipeline.saved_chunks.insert(position, Arc::new(data));
+            }
+        }
+        let mut ready = Vec::new();
+        let mut saved_final_writes = Vec::new();
+        for result in results {
+            match result {
+                ChunkWorkResult::Terrain(position, result) => {
+                    pipeline.terrain_jobs.remove(&position);
+                    let proto = result?;
+                    if pipeline.terrain_targets.contains(&position) {
+                        pipeline.protos.insert(position, Arc::new(proto));
+                    }
+                }
+                ChunkWorkResult::Features(center, result) => {
+                    pipeline.feature_jobs.remove(&center);
+                    let (region, writes) = result?;
+                    saved_final_writes.extend(writes);
+                    for proto in *region {
+                        let position = proto.position();
+                        if pipeline.terrain_targets.contains(&position) {
+                            pipeline.protos.insert(position, Arc::new(proto));
+                        }
+                    }
+                    if pipeline.feature_targets.contains(&center) {
+                        pipeline.features.insert(center);
+                    }
+                }
+                ChunkWorkResult::Light(position, result) => {
+                    pipeline.light_jobs.remove(&position);
+                    let chunk = result?;
+                    if pipeline.targets.contains(&position) {
+                        pipeline.lit.insert(position);
+                        if pipeline.delivered.insert(position) {
+                            ready.push((position, chunk));
+                        }
+                    }
+                }
+            }
+        }
+
+        pipeline.schedule(
+            &self.requests,
+            self.generation_budget,
+            self.decoration_budget,
+            self.light_budget,
+        )?;
+        Ok((ready, saved_final_writes))
+    }
+}
+
+impl ChunkPipeline {
+    fn set_view(&mut self, centers: &[ChunkPos], radius: i32) {
+        // A radius of one is used while preparing the initial 3×3 spawn view.
+        // The live client view is clamped to at least two by build_with_settings.
+        let radius = radius.max(1);
+        let centers_changed = self.centers != centers || self.radius != radius;
+        self.centers.clear();
+        self.centers.extend_from_slice(centers);
+        self.radius = radius;
+
+        let mut targets = HashSet::new();
+        for center in centers {
+            targets.extend(square_chunks(*center, radius));
+        }
+        if centers.is_empty() {
+            targets.extend(self.requested.iter().copied());
+        } else {
+            self.requested.retain(|position| {
+                centers
+                    .iter()
+                    .any(|center| is_tracked(*center, radius, *position))
+            });
+            targets.extend(self.requested.iter().copied());
+        }
+        self.targets = targets;
+        self.feature_targets = expand_chunks(&self.targets, 2);
+        self.terrain_targets = expand_chunks(&self.feature_targets, 1);
+
+        self.protos
+            .retain(|position, _| self.terrain_targets.contains(position));
+        self.features
+            .retain(|position| self.feature_targets.contains(position));
+        self.lit.retain(|position| self.targets.contains(position));
+        self.delivered
+            .retain(|position| self.targets.contains(position));
+
+        let rank_origins = if centers.is_empty() {
+            self.requested.clone()
+        } else {
+            centers.iter().copied().collect()
+        };
+        if centers_changed || self.rank_origins != rank_origins {
+            self.rank_origins = rank_origins.clone();
+            self.rank.clear();
+            for center in &rank_origins {
+                for (rank, (x, z)) in horizon_world::worldgen::decoration_order::vanilla_order(
+                    (center.x, center.z),
+                    radius + 2,
+                )
+                .into_iter()
+                .enumerate()
+                {
+                    self.rank
+                        .entry(ChunkPos::new(x, z))
+                        .and_modify(|current| *current = (*current).min(rank))
+                        .or_insert(rank);
+                }
+            }
+        }
+
+        // A proto is only useful while an unfinished FEATURES center or an
+        // unlit target can read its 3×3 region. Keeping every terrain support
+        // chunk until it leaves the player's view retains hundreds of large
+        // protos after their packet has already been produced.
+        let mut needed_protos = HashSet::new();
+        for center in self
+            .feature_targets
+            .difference(&self.features)
+            .chain(self.targets.difference(&self.lit))
+        {
+            needed_protos.extend(region_positions(*center));
+        }
+        self.protos
+            .retain(|position, _| needed_protos.contains(position));
+        self.saved_chunks
+            .retain(|position, _| self.terrain_targets.contains(position));
+        self.saved_checked
+            .retain(|position| self.terrain_targets.contains(position));
+    }
+
+    fn priority_at(&self, stage: i128, position: ChunkPos) -> i128 {
+        let rank = self.rank.get(&position).copied().unwrap_or(usize::MAX / 2);
+        stage * (1_i128 << 100)
+            + centers_distance_key(&self.centers, position) * (1_i128 << 32)
+            + rank as i128
+    }
+
+    fn schedule(
+        &mut self,
+        requests: &ChunkRequestQueue,
+        generation_budget: usize,
+        decoration_budget: usize,
+        light_budget: usize,
+    ) -> Result<(), String> {
+        let removed = requests.retain(
+            |work| match work {
+                ChunkWork::Terrain(position) => self.terrain_targets.contains(position),
+                ChunkWork::Features(position, _, _) => self.feature_targets.contains(position),
+                ChunkWork::Light(position, _) => self.targets.contains(position),
+            },
+            |work| self.priority_at(work.stage_priority(), work.position()),
+        );
+        for work in removed {
+            match work {
+                ChunkWork::Terrain(position) => {
+                    self.terrain_jobs.remove(&position);
+                }
+                ChunkWork::Features(position, region, _) => {
+                    self.feature_jobs.remove(&position);
+                    for proto in *region {
+                        let position = proto.position();
+                        if self.terrain_targets.contains(&position) {
+                            self.protos.insert(position, Arc::new(proto));
+                        }
+                    }
+                }
+                ChunkWork::Light(position, _) => {
+                    self.light_jobs.remove(&position);
+                }
+            }
+        }
+
+        let mut terrain = self
+            .terrain_targets
+            .iter()
+            .copied()
+            .filter(|position| {
+                !self.protos.contains_key(position) && !self.terrain_jobs.contains(position)
+            })
+            .collect::<Vec<_>>();
+        terrain.sort_by_key(|position| self.priority_at(2, *position));
+        terrain.truncate(generation_budget.saturating_sub(self.terrain_jobs.len()));
+        for position in terrain {
+            self.terrain_jobs.insert(position);
+            let work = ChunkWork::Terrain(position);
+            match requests.try_send(work, self.priority_at(2, position)) {
+                Ok(()) => {}
+                Err((ChunkQueueSendError::Full, _)) => {
+                    self.terrain_jobs.remove(&position);
+                    break;
+                }
+                Err((ChunkQueueSendError::Closed, _)) => {
+                    self.terrain_jobs.remove(&position);
+                    return Err("server chunk-generation queue is closed".into());
+                }
+            }
+        }
+
+        let mut features = self
+            .feature_targets
+            .iter()
+            .copied()
+            .filter(|position| {
+                !self.features.contains(position) && !self.feature_jobs.contains(position)
+            })
+            .collect::<Vec<_>>();
+        features.sort_by_key(|position| self.priority_at(1, *position));
+        for center in features {
+            if self.feature_jobs.len() >= decoration_budget {
+                break;
+            }
+            if self.feature_blocked(center)
+                || self.feature_jobs.iter().any(|running| {
+                    (running.x - center.x).abs() <= 2 && (running.z - center.z).abs() <= 2
+                })
+            {
+                continue;
+            }
+            let positions = region_positions(center);
+            if positions
+                .iter()
+                .any(|position| !self.saved_checked.contains(position))
+            {
+                continue;
+            }
+            if positions.iter().any(|position| {
+                self.protos
+                    .get(position)
+                    .is_none_or(|proto| Arc::strong_count(proto) != 1)
+            }) {
+                continue;
+            }
+            let mut chunks = Vec::with_capacity(CHUNK_COUNT);
+            for &position in &positions {
+                let proto = self
+                    .protos
+                    .remove(&position)
+                    .expect("checked feature region");
+                match Arc::try_unwrap(proto) {
+                    Ok(proto) => chunks.push(proto),
+                    Err(_) => unreachable!("checked FEATURES protos are uniquely owned"),
+                }
+            }
+            let region: Box<[ProtoChunk; CHUNK_COUNT]> = match chunks.try_into() {
+                Ok(region) => Box::new(region),
+                Err(_) => unreachable!("FEATURES region has nine proto chunks"),
+            };
+            self.feature_jobs.insert(center);
+            let saved = positions
+                .iter()
+                .filter_map(|position| {
+                    self.saved_chunks
+                        .get(position)
+                        .cloned()
+                        .map(|data| (*position, data))
+                })
+                .collect();
+            let work = ChunkWork::Features(center, region, saved);
+            let priority = self.priority_at(1, center);
+            match requests.try_send(work, priority) {
+                Ok(()) => {}
+                Err((ChunkQueueSendError::Full, ChunkWork::Features(position, region, _))) => {
+                    self.feature_jobs.remove(&position);
+                    for proto in *region {
+                        self.protos.insert(proto.position(), Arc::new(proto));
+                    }
+                    break;
+                }
+                Err((ChunkQueueSendError::Closed, _)) => {
+                    self.feature_jobs.remove(&center);
+                    return Err("server chunk-generation queue is closed".into());
+                }
+                Err(_) => unreachable!("FEATURES submission returns its own job"),
+            }
+        }
+
+        let mut lights = self
+            .targets
+            .iter()
+            .copied()
+            .filter(|position| !self.lit.contains(position) && !self.light_jobs.contains(position))
+            .collect::<Vec<_>>();
+        lights.sort_by_key(|position| self.priority_at(0, *position));
+        for center in lights {
+            if self.light_jobs.len() >= light_budget {
+                break;
+            }
+            let local_features_ready = (-2..=2).all(|dz| {
+                (-2..=2).all(|dx| {
+                    self.features
+                        .contains(&ChunkPos::new(center.x + dx, center.z + dz))
+                })
+            });
+            if !local_features_ready {
+                continue;
+            }
+            let positions = region_positions(center);
+            let Some(region) = positions
+                .iter()
+                .map(|position| self.protos.get(position).cloned())
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            let region: Box<[Arc<ProtoChunk>; CHUNK_COUNT]> = match region.try_into() {
+                Ok(region) => Box::new(region),
+                Err(_) => unreachable!("light region has nine proto chunks"),
+            };
+            self.light_jobs.insert(center);
+            let work = ChunkWork::Light(center, region);
+            let priority = self.priority_at(0, center);
+            match requests.try_send(work, priority) {
+                Ok(()) => {}
+                Err((ChunkQueueSendError::Full, ChunkWork::Light(position, _))) => {
+                    self.light_jobs.remove(&position);
+                    break;
+                }
+                Err((ChunkQueueSendError::Closed, _)) => {
+                    self.light_jobs.remove(&center);
+                    return Err("server chunk-generation queue is closed".into());
+                }
+                Err(_) => unreachable!("LIGHT submission returns its own job"),
+            }
+        }
+
+        Ok(())
+    }
+
+    fn feature_blocked(&self, center: ChunkPos) -> bool {
+        let own_rank = self.rank.get(&center).copied().unwrap_or(usize::MAX);
+        (-2..=2).any(|dz| {
+            (-2..=2).any(|dx| {
+                if (dx, dz) == (0, 0) {
+                    return false;
+                }
+                let neighbor = ChunkPos::new(center.x + dx, center.z + dz);
+                self.feature_targets.contains(&neighbor)
+                    && self.rank.get(&neighbor).copied().unwrap_or(usize::MAX) < own_rank
+                    && !self.features.contains(&neighbor)
+            })
+        })
+    }
+}
+
+fn square_chunks(center: ChunkPos, radius: i32) -> HashSet<ChunkPos> {
+    let mut chunks = HashSet::new();
+    for z in center.z - radius..=center.z + radius {
+        for x in center.x - radius..=center.x + radius {
+            chunks.insert(ChunkPos::new(x, z));
+        }
+    }
+    chunks
+}
+
+fn expand_chunks(chunks: &HashSet<ChunkPos>, radius: i32) -> HashSet<ChunkPos> {
+    let mut expanded = HashSet::new();
+    for center in chunks {
+        expanded.extend(square_chunks(*center, radius));
+    }
+    expanded
+}
+
+fn region_positions(center: ChunkPos) -> [ChunkPos; CHUNK_COUNT] {
+    std::array::from_fn(|index| {
+        ChunkPos::new(
+            center.x + (index % CHUNK_COUNT_SIDE) as i32 - CHUNK_RADIUS,
+            center.z + (index / CHUNK_COUNT_SIDE) as i32 - CHUNK_RADIUS,
+        )
+    })
+}
+
+#[derive(Clone, Debug)]
+struct WorldBlockUpdate {
+    sequence: u64,
+    dimension: String,
+    pos: [i32; 3],
+    state: i32,
+}
+
+#[derive(Default)]
+struct BlockUpdateLog {
+    next_sequence: u64,
+    updates: VecDeque<WorldBlockUpdate>,
+}
+
+impl BlockUpdateLog {
+    fn latest_sequence(&self) -> u64 {
+        self.next_sequence.saturating_sub(1)
+    }
+
+    fn append(&mut self, dimension: String, pos: [i32; 3], state: i32) -> Result<(), String> {
+        let sequence = self.next_sequence.max(1);
+        self.next_sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| "PLAY block update sequence exhausted".to_owned())?;
+        self.updates.push_back(WorldBlockUpdate {
+            sequence,
+            dimension,
+            pos,
+            state,
+        });
+        while self.updates.len() > MAX_RETAINED_BLOCK_UPDATES {
+            self.updates.pop_front();
+        }
+        Ok(())
+    }
+
+    fn since(&self, cursor: u64) -> Result<(Vec<WorldBlockUpdate>, u64), String> {
+        let latest = self.latest_sequence();
+        let oldest = self
+            .updates
+            .front()
+            .map(|update| update.sequence)
+            .unwrap_or(latest);
+        if cursor.saturating_add(1) < oldest {
+            return Err(format!(
+                "PLAY session fell behind block update stream (cursor {cursor}, oldest {oldest})"
+            ));
+        }
+        Ok((
+            self.updates
+                .iter()
+                .filter(|update| update.sequence > cursor)
+                .cloned()
+                .collect(),
+            latest,
+        ))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct WorldLevelEvent {
+    sequence: u64,
+    dimension: String,
+    event: PublishedLevelEvent,
+}
+
+#[derive(Clone, Debug)]
+enum PublishedLevelEvent {
+    Level {
+        pos: [i32; 3],
+        id: i32,
+        data: i32,
+    },
+    Sound {
+        pos: [i32; 3],
+        sound: String,
+        volume: f32,
+        pitch: f32,
+    },
+}
+
+#[derive(Default)]
+struct LevelEventLog {
+    next_sequence: u64,
+    events: VecDeque<WorldLevelEvent>,
+}
+
+impl LevelEventLog {
+    fn latest_sequence(&self) -> u64 {
+        self.next_sequence.saturating_sub(1)
+    }
+
+    fn append(&mut self, dimension: String, event: PublishedLevelEvent) -> Result<(), String> {
+        let sequence = self.next_sequence.max(1);
+        self.next_sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| "PLAY level event sequence exhausted".to_owned())?;
+        self.events.push_back(WorldLevelEvent {
+            sequence,
+            dimension,
+            event,
+        });
+        while self.events.len() > MAX_RETAINED_BLOCK_UPDATES {
+            self.events.pop_front();
+        }
+        Ok(())
+    }
+
+    fn since(&self, cursor: u64) -> Result<(Vec<WorldLevelEvent>, u64), String> {
+        let latest = self.latest_sequence();
+        let oldest = self
+            .events
+            .front()
+            .map(|event| event.sequence)
+            .unwrap_or(latest);
+        if cursor.saturating_add(1) < oldest {
+            return Err(format!(
+                "PLAY session fell behind level event stream (cursor {cursor}, oldest {oldest})"
+            ));
+        }
+        Ok((
+            self.events
+                .iter()
+                .filter(|event| event.sequence > cursor)
+                .cloned()
+                .collect(),
+            latest,
+        ))
+    }
 }
 
 fn generated_chunk_data(
     proto: &ProtoChunk,
     resources: &ServerResources,
+    light: Option<&horizon_protocol::chunk::LightData>,
+    has_skylight: bool,
 ) -> Result<horizon_world::chunk::ChunkData, String> {
-    proto
+    let mut data = proto
         .to_chunk_data(
             |id| {
                 u16::try_from(id.0)
@@ -81,7 +1085,60 @@ fn generated_chunk_data(
                     .map(|fluid| fluid.name().to_owned())
             },
         )
-        .map_err(|error| format!("encode generated resident chunk: {error}"))
+        .map_err(|error| format!("encode generated resident chunk: {error}"))?;
+    if let Some(light) = light {
+        let section_count = usize::try_from(proto.terrain.height() / 16)
+            .map_err(|_| "generated chunk has invalid section count")?;
+        if section_count == 0 || proto.terrain.height() % 16 != 0 {
+            return Err("generated chunk has invalid section height".into());
+        }
+        let min_section = proto.terrain.min_y().div_euclid(16);
+        let light_layers = light.layers(section_count + 2);
+        let mut root = data.into_nbt();
+        let horizon_world::nbt::Tag::Compound(fields) = &mut root.tag else {
+            unreachable!("generated chunk root is a compound")
+        };
+        fields.insert(
+            "Status".into(),
+            horizon_world::nbt::Tag::String("minecraft:full".into()),
+        );
+        fields.insert("isLightOn".into(), horizon_world::nbt::Tag::Byte(1));
+        let Some(horizon_world::nbt::Tag::List(sections)) =
+            fields.get_mut(&horizon_world::nbt::JavaString::from("sections"))
+        else {
+            return Err("generated chunk sections are not a list".into());
+        };
+        for section in sections {
+            let Some(horizon_world::nbt::Tag::Byte(y)) = section.get("Y") else {
+                return Err("generated section has no section Y".into());
+            };
+            let index = usize::try_from(i32::from(*y) - min_section)
+                .map_err(|_| "generated section is outside the light range")?;
+            let Some((sky, block)) = light_layers.get(index + 1) else {
+                return Err("generated section is outside the light payload".into());
+            };
+            let horizon_world::nbt::Tag::Compound(section) = section else {
+                return Err("generated section is not a compound".into());
+            };
+            if has_skylight {
+                if let Some(sky) = sky {
+                    section.insert(
+                        "SkyLight".into(),
+                        horizon_world::nbt::Tag::ByteArray(sky.clone()),
+                    );
+                }
+            }
+            if let Some(block) = block {
+                section.insert(
+                    "BlockLight".into(),
+                    horizon_world::nbt::Tag::ByteArray(block.clone()),
+                );
+            }
+        }
+        data = horizon_world::chunk::ChunkData::new(root)
+            .map_err(|error| format!("finalize generated chunk data: {error}"))?;
+    }
+    Ok(data)
 }
 
 fn resolve_block_tick(resources: &ServerResources, name: &str) -> Option<TickTypeId> {
@@ -120,6 +1177,34 @@ fn fluid_tick_name(id: TickTypeId) -> Option<String> {
         .map(|fluid| fluid.name().to_owned())
 }
 
+fn generate_terrain_region(
+    worker: &mut GeneratorWorker,
+    center: ChunkPos,
+) -> Result<[ProtoChunk; CHUNK_COUNT], String> {
+    let mut chunks = Vec::with_capacity(CHUNK_COUNT);
+    for z in center.z - CHUNK_RADIUS..=center.z + CHUNK_RADIUS {
+        for x in center.x - CHUNK_RADIUS..=center.x + CHUNK_RADIUS {
+            chunks.push(
+                worker
+                    .generate_proto(ChunkPos::new(x, z))
+                    .map_err(|error| format!("generate chunk ({x},{z}): {error}"))?,
+            );
+        }
+    }
+    let region: [ProtoChunk; CHUNK_COUNT] = chunks
+        .try_into()
+        .map_err(|_| "worldgen did not produce a 3×3 chunk region")?;
+    if region[4].position() != center {
+        return Err(format!(
+            "worldgen did not generate the requested center chunk ({},{})",
+            center.x, center.z
+        ));
+    }
+    Ok(region)
+}
+
+const CHUNK_COUNT_SIDE: usize = (CHUNK_RADIUS as usize * 2) + 1;
+
 fn save_runtime_dirty_chunks(
     runtime: &mut LocalWorldRuntime<'static>,
     resources: &ServerResources,
@@ -153,8 +1238,10 @@ fn encode_center_chunk(
     resources: &ServerResources,
 ) -> Result<(Vec<u8>, horizon_world::chunk::ChunkData), String> {
     let position = proto.position();
-    let chunk =
+    let mut chunk =
         play_chunk::encode_generated_chunk(proto, resources.registry, &resources.behaviours)?;
+    let chunk_data = generated_chunk_data(proto, resources, Some(&light), true)?;
+    play_chunk::overlay_saved_block_entities(&mut chunk, &chunk_data, resources)?;
     let packet = play::Clientbound::LevelChunkWithLight(play::LevelChunkWithLight {
         x: position.x,
         z: position.z,
@@ -162,42 +1249,7 @@ fn encode_center_chunk(
         light,
     })
     .encode();
-    Ok((packet, generated_chunk_data(proto, resources)?))
-}
-
-fn generate_center_chunk(
-    worker: &mut GeneratorWorker,
-    center: ChunkPos,
-    resources: &ServerResources,
-) -> Result<(Vec<u8>, horizon_world::chunk::ChunkData), String> {
-    let mut chunks = Vec::with_capacity(CHUNK_COUNT);
-    for z in center.z - CHUNK_RADIUS..=center.z + CHUNK_RADIUS {
-        for x in center.x - CHUNK_RADIUS..=center.x + CHUNK_RADIUS {
-            chunks.push(
-                worker
-                    .generate_proto(ChunkPos::new(x, z))
-                    .map_err(|error| format!("generate chunk ({x},{z}): {error}"))?,
-            );
-        }
-    }
-    let mut region: [ProtoChunk; CHUNK_COUNT] = chunks
-        .try_into()
-        .map_err(|_| "worldgen did not produce a 3×3 chunk region")?;
-    worker
-        .decorate(&mut region)
-        .map_err(|error| format!("decorate chunk ({},{}): {error}", center.x, center.z))?;
-    if !region[4].is_decorated() || region[4].position() != center {
-        return Err(format!(
-            "worldgen did not finalize the requested center chunk ({},{})",
-            center.x, center.z
-        ));
-    }
-    let lights = resources.light_occlusion.light_overworld_region(
-        &region,
-        resources.registry,
-        &resources.behaviours,
-    )?;
-    encode_center_chunk(&region[4], lights[4].clone(), resources)
+    Ok((packet, chunk_data))
 }
 
 /// Shared world admission state for the PLAY listener. The resident dimension
@@ -208,18 +1260,30 @@ pub(crate) struct PlayServer {
     players: Mutex<PlayerRegistry>,
 }
 
-#[derive(Default)]
 struct PlayerRegistry {
     by_uuid: HashMap<u128, i32>,
     next_player_id: i32,
+    max_players: usize,
+}
+
+impl Default for PlayerRegistry {
+    fn default() -> Self {
+        Self {
+            by_uuid: HashMap::new(),
+            next_player_id: 1,
+            max_players: 20,
+        }
+    }
 }
 
 impl PlayServer {
     pub(crate) fn new(world: Arc<PreparedPlayWorld>) -> Self {
+        let max_players = world.max_players;
         Self {
             world,
             players: Mutex::new(PlayerRegistry {
                 next_player_id: 1,
+                max_players,
                 ..PlayerRegistry::default()
             }),
         }
@@ -272,15 +1336,58 @@ impl PlayServer {
         runtime.tick_scheduled(&world.resources.behaviours);
         runtime.tick_random_chunks(&world.resources.behaviours);
         runtime.run_block_events(&world.resources.behaviours);
-        if autosave {
-            save_runtime_dirty_chunks(&mut runtime, &world.resources)?;
-            runtime
-                .save_world_data()
-                .map_err(|error| format!("autosave PLAY world data: {error}"))?;
-            runtime
-                .sync_regions()
-                .map_err(|error| format!("autosave sync PLAY Anvil regions: {error}"))?;
-        }
+        let resident = runtime
+            .dimension("minecraft:overworld")
+            .expect("the PLAY Overworld is registered")
+            .resident();
+        let border = runtime
+            .dimension("minecraft:overworld")
+            .expect("the PLAY Overworld is registered")
+            .border();
+        world.item_entities.tick(|item, wanted| {
+            let block = BlockPos::new(
+                item.position[0].floor() as i32,
+                item.position[1].floor() as i32,
+                item.position[2].floor() as i32,
+            );
+            if !resident.level().is_loaded(block) {
+                return Ok(None);
+            }
+            match crate::play_collision::resolve_item_move(
+                resident.level(),
+                border.geometry(),
+                &world.resources,
+                item.id,
+                item.position,
+                wanted,
+                item.on_ground,
+            ) {
+                Ok(moved) => Ok(Some(moved)),
+                Err(error) if error.contains("unloaded chunk") => Ok(None),
+                Err(error) => Err(format!("tick dropped item {}: {error}", item.id)),
+            }
+        })?;
+        let changes = runtime.take_block_changes();
+        let events = runtime.take_level_events();
+        let save_result = if autosave {
+            save_runtime_dirty_chunks(&mut runtime, &world.resources)
+                .and_then(|_| {
+                    runtime
+                        .save_world_data()
+                        .map_err(|error| format!("autosave PLAY world data: {error}"))
+                })
+                .and_then(|_| {
+                    runtime
+                        .sync_regions()
+                        .map_err(|error| format!("autosave sync PLAY Anvil regions: {error}"))
+                })
+        } else {
+            Ok(())
+        };
+        drop(runtime);
+        world.publish_block_changes(changes)?;
+        world.publish_level_events(events)?;
+        save_result?;
         Ok(())
     }
 
@@ -289,6 +1396,10 @@ impl PlayServer {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .online()
+    }
+
+    pub(crate) fn max_players(&self) -> usize {
+        self.world.max_players
     }
 
     fn register_player(&self, uuid: u128, name: &str) -> Result<i32, String> {
@@ -315,11 +1426,10 @@ impl PlayerRegistry {
     }
 
     fn register(&mut self, uuid: u128, name: &str) -> Result<i32, String> {
-        const MAX_PLAYERS: usize = 20;
         if self.by_uuid.contains_key(&uuid) {
             return Err(format!("player {name} is already connected"));
         }
-        if self.by_uuid.len() >= MAX_PLAYERS {
+        if self.by_uuid.len() >= self.max_players {
             return Err("server is full".into());
         }
         let id = self.next_player_id;
@@ -348,125 +1458,165 @@ impl Drop for PlayerPermit<'_> {
 }
 
 impl PreparedPlayWorld {
+    #[cfg(test)]
     pub(crate) fn build(
         resources: Arc<ServerResources>,
         seed: i64,
         world_root: &Path,
     ) -> Result<Self, String> {
+        Self::build_with_settings(
+            resources,
+            seed,
+            world_root,
+            DEFAULT_VIEW_DISTANCE,
+            DEFAULT_SIMULATION_DISTANCE,
+            0,
+            1,
+            20,
+            false,
+        )
+    }
+
+    pub(crate) fn build_with_settings(
+        resources: Arc<ServerResources>,
+        seed: i64,
+        world_root: &Path,
+        view_distance: i32,
+        simulation_distance: i32,
+        game_mode: i32,
+        difficulty: i32,
+        max_players: usize,
+        hardcore: bool,
+    ) -> Result<Self, String> {
         let dimension_type = resources
             .synchronized_registries
             .entry_index("minecraft:dimension_type", "minecraft:overworld")
             .ok_or("synchronized dimension_type registry has no minecraft:overworld")?;
-        let generator = OverworldGenerator::new(resources.worldgen.clone(), seed)
-            .map_err(|error| format!("create vanilla Overworld generator: {error}"))?;
-        let mut worker = generator.worker();
-        let mut region = Vec::with_capacity(CHUNK_COUNT);
-        for z in -CHUNK_RADIUS..=CHUNK_RADIUS {
-            for x in -CHUNK_RADIUS..=CHUNK_RADIUS {
-                region.push(
-                    worker
-                        .generate_proto(ChunkPos::new(x, z))
-                        .map_err(|error| format!("generate spawn chunk ({x},{z}): {error}"))?,
-                );
+        let saved_world = horizon_world::world_saved_data::WorldSavedData::new(world_root);
+        saved_world
+            .restore_level_dat_old()
+            .map_err(|error| format!("restore PLAY level.dat_old: {error}"))?;
+        let level_path = world_root.join("level.dat");
+        if !level_path.exists()
+            && std::fs::read_dir(world_root)
+                .ok()
+                .and_then(|mut entries| entries.next())
+                .is_some()
+        {
+            return Err(format!(
+                "PLAY world {} contains data but has no readable level.dat or level.dat_old",
+                world_root.display()
+            ));
+        }
+        if let Some(root) = horizon_world::datafix::files::read_dat(&level_path)
+            .map_err(|error| format!("read PLAY level.dat: {error}"))?
+        {
+            let data = root.get("Data");
+            let version = data.map_or(-1, |data| {
+                horizon_world::datafix::files::data_version(data, -1)
+            });
+            if version > horizon_world::datafix::CURRENT {
+                return Err(format!(
+                    "PLAY world DataVersion {version} is newer than this server ({})",
+                    horizon_world::datafix::CURRENT
+                ));
+            }
+            if version < horizon_world::datafix::CURRENT {
+                horizon_world::datafix::files::upgrade_world_with(
+                    world_root,
+                    &horizon_world::datafix::progress::UpgradeProgress::new(),
+                )
+                .map_err(|error| format!("upgrade PLAY world data: {error}"))?;
             }
         }
-        let mut region: [ProtoChunk; CHUNK_COUNT] = region
-            .try_into()
-            .map_err(|_| "worldgen did not produce the spawn 3×3")?;
-        worker
-            .decorate(&mut region)
-            .map_err(|error| format!("decorate spawn chunks: {error}"))?;
-        if !region[4].is_decorated() {
-            return Err("worldgen did not bring the spawn chunk to Features status".into());
-        }
-        let spawn = find_spawn(&region, &resources)?;
-        let spawn_center = chunk_center(spawn);
+        let saved_basics = saved_world
+            .load_world_basics()
+            .map_err(|error| format!("read saved PLAY world settings: {error}"))?;
+        let seed = saved_basics.seed.unwrap_or(seed);
+        let generator = OverworldGenerator::new(resources.worldgen.clone(), seed)
+            .map_err(|error| format!("create vanilla Overworld generator: {error}"))?;
+        let origin = ChunkPos::new(0, 0);
+        let mut worker = generator.worker();
+        let (spawn, spawn_center, initial_terrain) = if let Some([x, y, z]) = saved_basics.spawn {
+            let spawn = [f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5];
+            let center = chunk_center(spawn);
+            (spawn, center, None)
+        } else {
+            // Spawn selection needs terrain and its surface map; feature
+            // decoration is performed later by the same staged pipeline used
+            // for every streamed chunk.
+            let origin_region = generate_terrain_region(&mut worker, origin)?;
+            let spawn = find_spawn(&origin_region, &resources)?;
+            let center = chunk_center(spawn);
+            (spawn, center, Some(origin_region))
+        };
 
-        let resident = ResidentDimension::new(
-            "minecraft:overworld",
-            ResidentLevel::new(resources.registry, -64, 384, seed)
-                .map_err(|error| format!("create resident Overworld: {error}"))?,
-            Ticks::new(seed as i32),
-        );
         let mut runtime = LocalWorldRuntime::open(world_root, &[]).map_err(|error| {
             format!("open PLAY world storage {}: {error}", world_root.display())
         })?;
-        runtime
-            .add_dimension(resident)
-            .map_err(|error| format!("register PLAY Overworld storage: {error}"))?;
-        let game_time = runtime.game_time();
-        let mut chunk_packets = Vec::with_capacity(CHUNK_COUNT);
-        let mut chunk_packet_cache = HashMap::with_capacity(CHUNK_COUNT);
-        for z in spawn_center.z - CHUNK_RADIUS..=spawn_center.z + CHUNK_RADIUS {
-            for x in spawn_center.x - CHUNK_RADIUS..=spawn_center.x + CHUNK_RADIUS {
-                let position = ChunkPos::new(x, z);
-                let (mut packet, chunk_data) = if position == region[4].position() {
-                    let lights = resources.light_occlusion.light_overworld_region(
-                        &region,
-                        resources.registry,
-                        &resources.behaviours,
-                    )?;
-                    encode_center_chunk(&region[4], lights[4].clone(), &resources)?
-                } else {
-                    generate_center_chunk(&mut worker, position, &resources)?
-                };
-                let dimension = runtime
-                    .dimension_mut("minecraft:overworld")
-                    .expect("the Play Overworld was just registered");
-                let loaded = dimension
-                    .load_chunk_from_region(
-                        position,
-                        Limits::saved(),
-                        game_time,
-                        |name| resolve_block_tick(&resources, name),
-                        resolve_fluid_tick,
-                    )
-                    .map_err(|error| {
-                        format!(
-                            "load persisted PLAY chunk ({},{}): {error}",
-                            position.x, position.z
-                        )
-                    })?;
-                if loaded {
-                    let saved = dimension
-                        .active_chunk_data(position)
-                        .expect("loaded PLAY chunk retains its saved NBT");
-                    play_chunk::overlay_saved_block_states(
-                        &mut packet,
-                        saved,
-                        resources.registry,
-                        &resources.behaviours,
-                    )?;
-                } else {
-                    dimension
-                        .insert_generated_chunk(
-                            chunk_data,
-                            game_time,
-                            |name| resolve_block_tick(&resources, name),
-                            resolve_fluid_tick,
-                        )
-                        .map_err(|error| {
-                            format!(
-                                "install generated PLAY chunk ({},{}): {error}",
-                                position.x, position.z
-                            )
-                        })?;
-                }
-                chunk_packet_cache.insert(position, packet.clone());
-                chunk_packets.push(packet);
-            }
+        for key in [
+            "minecraft:overworld",
+            "minecraft:the_nether",
+            "minecraft:the_end",
+        ] {
+            let height = horizon_world::worldgen::overrides::LevelHeight::vanilla(key)
+                .ok_or_else(|| format!("missing vanilla height for dimension {key}"))?;
+            let resident = ResidentDimension::new(
+                key,
+                ResidentLevel::new(resources.registry, height.min_y, height.height, seed)
+                    .map_err(|error| format!("create resident {key}: {error}"))?,
+                Ticks::new(seed as i32),
+            );
+            runtime
+                .add_dimension(resident)
+                .map_err(|error| format!("register PLAY dimension {key}: {error}"))?;
         }
-        save_runtime_dirty_chunks(&mut runtime, &resources)?;
-        Ok(Self {
+        let chunk_packets = Vec::with_capacity(CHUNK_COUNT);
+        let chunk_packet_cache = HashMap::with_capacity(CHUNK_COUNT);
+        let difficulty_name =
+            ["peaceful", "easy", "normal", "hard"][difficulty.clamp(0, 3) as usize];
+        let level_name = world_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("world");
+        horizon_world::world_saved_data::WorldSavedData::new(world_root)
+            .save_world_basics(
+                seed,
+                [
+                    spawn[0].floor() as i32,
+                    spawn[1].floor() as i32,
+                    spawn[2].floor() as i32,
+                ],
+                level_name,
+                game_mode,
+                difficulty_name,
+                hardcore,
+            )
+            .map_err(|error| format!("save PLAY world seed and spawn: {error}"))?;
+        let chunk_generation =
+            ChunkGeneration::start(generator, resources.clone(), initial_terrain)?;
+        let mut prepared = Self {
             resources,
             dimension_type,
             spawn,
             chunk_packets,
             chunk_packet_cache: Mutex::new(chunk_packet_cache),
-            generator_worker: Some(Mutex::new(worker)),
+            chunk_generation: Some(chunk_generation),
+            view_distance: view_distance.clamp(2, 32),
+            simulation_distance: simulation_distance.clamp(2, 32),
+            game_mode: game_mode.clamp(0, 3),
+            difficulty: difficulty.clamp(0, 3),
+            max_players: max_players.max(1),
+            hardcore,
             runtime: Mutex::new(runtime),
             player_chunks: Mutex::new(HashMap::new()),
-        })
+            block_updates: Mutex::new(BlockUpdateLog::default()),
+            level_events: Mutex::new(LevelEventLog::default()),
+            item_entities: ItemEntityStore::default(),
+            loot_random: Mutex::new(LegacyRandom::new(seed)),
+        };
+        prepared.prepare_spawn_chunks(spawn_center)?;
+        Ok(prepared)
     }
 
     pub(crate) fn initialize(
@@ -474,22 +1624,35 @@ impl PreparedPlayWorld {
         mut configured: ConfiguredConnection,
         player_id: i32,
     ) -> Result<(), String> {
+        let view_distance = configured
+            .client_information
+            .as_ref()
+            .map_or(self.view_distance, |info| i32::from(info.view_distance))
+            .clamp(2, self.view_distance);
         let spawn_block = BlockPos::new(
             self.spawn[0].floor() as i32,
             self.spawn[1].floor() as i32,
             self.spawn[2].floor() as i32,
         );
-        if !self
-            .runtime
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .dimension("minecraft:overworld")
-            .expect("the Play Overworld is registered")
-            .resident()
-            .level()
-            .is_loaded(spawn_block)
-        {
-            return Err("generated spawn is not loaded in the shared resident world".into());
+        let spawn_loaded = || {
+            self.runtime
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .dimension("minecraft:overworld")
+                .expect("the Play Overworld is registered")
+                .resident()
+                .level()
+                .is_loaded(spawn_block)
+        };
+        if !spawn_loaded() {
+            if let Err(error) = self.set_player_chunk(player_id, chunk_center(self.spawn)) {
+                let _ = self.remove_player_chunk(player_id);
+                return Err(error);
+            }
+            if !spawn_loaded() {
+                let _ = self.remove_player_chunk(player_id);
+                return Err("player ticket did not load the PLAY spawn chunk".into());
+            }
         }
         // The client sends its terminal CONFIGURATION acknowledgement before
         // installing its PLAY encoder. The reference server hands the session
@@ -503,18 +1666,27 @@ impl PreparedPlayWorld {
             self.spawn[2].floor() as i32,
         ];
         let spawn_chunk = [spawn_block[0].div_euclid(16), spawn_block[2].div_euclid(16)];
+        let border = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .dimension("minecraft:overworld")
+            .expect("the Play Overworld is registered")
+            .border()
+            .clone();
+        let [border_center_x, border_center_z] = border.center();
         let packets = [
             play::Clientbound::Login(play::Login {
                 player_id,
-                hardcore: false,
+                hardcore: self.hardcore,
                 levels: vec![
                     "minecraft:overworld".into(),
                     "minecraft:the_nether".into(),
                     "minecraft:the_end".into(),
                 ],
-                max_players: 20,
-                chunk_radius: CHUNK_RADIUS,
-                simulation_distance: CHUNK_RADIUS,
+                max_players: self.max_players.min(i32::MAX as usize) as i32,
+                chunk_radius: view_distance,
+                simulation_distance: self.simulation_distance,
                 reduced_debug_info: false,
                 show_death_screen: true,
                 limited_crafting: false,
@@ -522,7 +1694,7 @@ impl PreparedPlayWorld {
                     dimension_type: self.dimension_type,
                     dimension: dimension.clone(),
                     seed: 0,
-                    game_type: 0,
+                    game_type: self.game_mode,
                     previous_game_type: None,
                     debug: false,
                     flat: false,
@@ -534,11 +1706,15 @@ impl PreparedPlayWorld {
                 enforces_secure_chat: false,
             }),
             play::Clientbound::ChangeDifficulty(play::ChangeDifficulty {
-                difficulty: 1,
+                difficulty: self.difficulty,
                 locked: false,
             }),
             play::Clientbound::PlayerAbilities(play::PlayerAbilities {
-                flags: 0,
+                flags: match self.game_mode {
+                    1 => 0b1101, // invulnerable, may fly, instant build
+                    3 => 0b0111, // invulnerable, flying, may fly
+                    _ => 0,
+                },
                 flying_speed: 0.05,
                 walking_speed: 0.1,
             }),
@@ -550,11 +1726,28 @@ impl PreparedPlayWorld {
                 yaw: 0.0,
                 pitch: 0.0,
             }),
+            // ClientPacketListener keeps the "Loading terrain" screen up until
+            // the server announces LEVEL_CHUNKS_LOAD_START (event 13). Vanilla
+            // sends it with PlayerList.sendLevelInfo before the chunk stream.
+            play::Clientbound::GameEvent(play::GameEvent {
+                event: 13,
+                param: 0.0,
+            }),
             play::Clientbound::SetChunkCacheRadius(play::Distance {
-                distance: CHUNK_RADIUS,
+                distance: view_distance,
             }),
             play::Clientbound::SetSimulationDistance(play::Distance {
-                distance: CHUNK_RADIUS,
+                distance: self.simulation_distance,
+            }),
+            play::Clientbound::InitializeBorder(play::InitializeBorder {
+                center_x: border_center_x,
+                center_z: border_center_z,
+                old_size: border.size(),
+                new_size: border.target_size(),
+                lerp_time: border.remaining_ticks(),
+                absolute_max_size: border.absolute_max_size(),
+                warning_blocks: border.warning_distance,
+                warning_time: border.warning_time,
             }),
             play::Clientbound::SetChunkCacheCenter(play::SetChunkCacheCenter {
                 x: spawn_chunk[0],
@@ -602,7 +1795,18 @@ impl PreparedPlayWorld {
             configured.profile.name, self.spawn[0], self.spawn[1], self.spawn[2]
         );
         self.set_player_chunk(player_id, chunk_center(self.spawn))?;
-        let result = serve_until_disconnect(configured, self.spawn, player_id, Some(self));
+        let player_name = configured.profile.name.clone();
+        let spawn_center = chunk_center(self.spawn);
+        let result = serve_until_disconnect(
+            configured,
+            self.spawn,
+            player_id,
+            player_name,
+            Some(self),
+            view_distance,
+            self.simulation_distance,
+            spawn_center,
+        );
         let cleanup = self.finish_player_session(player_id);
         match (result, cleanup) {
             (Err(error), _) => Err(error),
@@ -643,6 +1847,7 @@ impl PreparedPlayWorld {
         };
         if changed {
             self.reconcile_player_chunks()?;
+            self.prune_chunk_packet_cache();
         }
         Ok(())
     }
@@ -656,6 +1861,7 @@ impl PreparedPlayWorld {
             .is_some();
         if removed {
             self.reconcile_player_chunks()?;
+            self.prune_chunk_packet_cache();
         }
         Ok(())
     }
@@ -682,8 +1888,8 @@ impl PreparedPlayWorld {
             .resident_mut()
             .update_chunk_tickets(Some(ChunkTicketSources {
                 players,
-                view_distance: CHUNK_RADIUS,
-                simulation_distance: CHUNK_RADIUS,
+                view_distance: self.view_distance,
+                simulation_distance: self.simulation_distance,
                 ..ChunkTicketSources::default()
             }));
         let plan = dimension
@@ -713,12 +1919,12 @@ impl PreparedPlayWorld {
             .runtime
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let resident = runtime
+        let dimension = runtime
             .dimension("minecraft:overworld")
-            .expect("the Play Overworld is registered")
-            .resident();
+            .expect("the Play Overworld is registered");
         crate::play_collision::resolve_player_move(
-            resident.level(),
+            dimension.resident().level(),
+            dimension.border().geometry(),
             &self.resources,
             entity_id,
             from,
@@ -728,44 +1934,28 @@ impl PreparedPlayWorld {
         )
     }
 
-    fn prepare_player_view(&self, player: &PlayerSession, center: ChunkPos) -> Result<(), String> {
-        for z in center.z - CHUNK_RADIUS..=center.z + CHUNK_RADIUS {
-            for x in center.x - CHUNK_RADIUS..=center.x + CHUNK_RADIUS {
-                let position = ChunkPos::new(x, z);
-                if !player.sent_chunks.contains(&position) {
-                    self.prepare_chunk(position)?;
-                }
-            }
+    fn request_chunk(&self, position: ChunkPos) -> Result<(), String> {
+        if self
+            .chunk_packet_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(&position)
+        {
+            return Ok(());
         }
-        Ok(())
+        self.chunk_generation
+            .as_ref()
+            .ok_or_else(|| "server chunk-generation worker is unavailable".to_owned())?
+            .request(position)
     }
 
-    fn prepare_chunk(&self, position: ChunkPos) -> Result<(), String> {
-        if self
-            .chunk_packet_cache
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .contains_key(&position)
-        {
-            return Ok(());
+    fn load_saved_chunk_snapshots(
+        &self,
+        positions: HashSet<ChunkPos>,
+    ) -> Result<HashMap<ChunkPos, Option<horizon_world::chunk::ChunkData>>, String> {
+        if positions.is_empty() {
+            return Ok(HashMap::new());
         }
-        let Some(worker) = &self.generator_worker else {
-            return Err(format!(
-                "cannot stream missing chunk ({},{}): no server generator worker",
-                position.x, position.z
-            ));
-        };
-        let mut worker = worker.lock().unwrap_or_else(|error| error.into_inner());
-        if self
-            .chunk_packet_cache
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .contains_key(&position)
-        {
-            return Ok(());
-        }
-        let (mut packet, chunk_data) =
-            generate_center_chunk(&mut worker, position, &self.resources)?;
         let mut runtime = self
             .runtime
             .lock()
@@ -774,53 +1964,362 @@ impl PreparedPlayWorld {
         let dimension = runtime
             .dimension_mut("minecraft:overworld")
             .expect("the Play Overworld is registered");
-        let probe = BlockPos::new(position.x * 16, -64, position.z * 16);
-        if dimension.resident().level().is_loaded(probe) {
-            return Err(format!(
-                "resident chunk ({},{}) has no packet snapshot; refusing to send regenerated data",
-                position.x, position.z
-            ));
-        }
-        let loaded = dimension
-            .load_chunk_from_region(
-                position,
-                Limits::saved(),
-                game_time,
-                |name| resolve_block_tick(&self.resources, name),
-                resolve_fluid_tick,
-            )
-            .map_err(|error| {
-                format!(
-                    "load persisted streamed chunk ({},{}): {error}",
-                    position.x, position.z
-                )
-            })?;
-        if loaded {
-            let saved = dimension
-                .active_chunk_data(position)
-                .expect("loaded PLAY chunk retains its saved NBT");
-            play_chunk::overlay_saved_block_states(
-                &mut packet,
-                saved,
-                self.resources.registry,
-                &self.resources.behaviours,
-            )?;
-        } else {
+        let mut snapshots = HashMap::with_capacity(positions.len());
+        for position in positions {
             dimension
-                .insert_generated_chunk(
-                    chunk_data,
+                .load_chunk_from_region(
+                    position,
+                    Limits::saved(),
                     game_time,
                     |name| resolve_block_tick(&self.resources, name),
                     resolve_fluid_tick,
                 )
                 .map_err(|error| {
                     format!(
-                        "install streamed PLAY chunk ({},{}): {error}",
+                        "read saved neighbor chunk ({},{}): {error}",
                         position.x, position.z
                     )
                 })?;
+            let active = dimension.active_chunk_data(position).is_some();
+            let mut data = dimension.retained_chunk_data(position).cloned();
+            if active && let Some(data) = &mut data {
+                dimension
+                    .resident_mut()
+                    .save_chunk_data(
+                        data,
+                        game_time,
+                        |id| block_tick_name(&self.resources, id),
+                        fluid_tick_name,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "snapshot active saved neighbor ({},{}): {error}",
+                            position.x, position.z
+                        )
+                    })?;
+            }
+            snapshots.insert(position, data);
         }
+        Ok(snapshots)
+    }
+
+    fn apply_saved_final_writes(&self, writes: Vec<SavedFinalWrite>) -> Result<(), String> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let changes = {
+            let mut runtime = self
+                .runtime
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let game_time = runtime.game_time();
+            let dimension = runtime
+                .dimension_mut("minecraft:overworld")
+                .expect("the Play Overworld is registered");
+            let mut block_entity_updates =
+                HashMap::<ChunkPos, Vec<(BlockPos, Option<horizon_world::nbt::Compound>)>>::new();
+            for write in writes {
+                let position = write.position;
+                let chunk = position.chunk();
+                if dimension.is_chunk_parked(chunk) {
+                    dimension
+                        .activate_parked_chunk(
+                            chunk,
+                            game_time,
+                            |name| resolve_block_tick(&self.resources, name),
+                            resolve_fluid_tick,
+                        )
+                        .map_err(|error| {
+                            format!(
+                                "activate saved chunk for final write ({},{}): {error}",
+                                chunk.x, chunk.z
+                            )
+                        })?;
+                }
+                if !dimension.resident().level().is_loaded(position) {
+                    dimension
+                        .load_chunk_from_region(
+                            chunk,
+                            Limits::saved(),
+                            game_time,
+                            |name| resolve_block_tick(&self.resources, name),
+                            resolve_fluid_tick,
+                        )
+                        .map_err(|error| {
+                            format!(
+                                "load saved chunk for final write ({},{}): {error}",
+                                chunk.x, chunk.z
+                            )
+                        })?;
+                }
+                if dimension
+                    .resident_mut()
+                    .level_mut()
+                    .set_raw(position, write.state)
+                    .is_none()
+                {
+                    return Err(format!(
+                        "could not apply final worldgen write at ({},{},{})",
+                        position.x, position.y, position.z
+                    ));
+                }
+                block_entity_updates
+                    .entry(chunk)
+                    .or_default()
+                    .push((position, write.block_entity));
+            }
+            for (chunk, updates) in block_entity_updates {
+                dimension
+                    .update_block_entities(chunk, updates)
+                    .map_err(|error| {
+                        format!(
+                            "apply generated block entities for ({},{}): {error}",
+                            chunk.x, chunk.z
+                        )
+                    })?;
+            }
+            runtime.take_block_changes()
+        };
+        self.publish_block_changes(changes)
+    }
+
+    fn advance_chunk_generation(
+        &self,
+        generation: &ChunkGeneration,
+        centers: &[ChunkPos],
+        radius: i32,
+    ) -> Result<Vec<(ChunkPos, (Vec<u8>, horizon_world::chunk::ChunkData))>, String> {
+        let positions = generation.saved_snapshot_positions(centers, radius);
+        let snapshots = self.load_saved_chunk_snapshots(positions)?;
+        let (ready, final_writes) = generation.advance(centers, radius, snapshots)?;
+        self.apply_saved_final_writes(final_writes)?;
+        Ok(ready)
+    }
+
+    fn prepare_spawn_chunks(&mut self, center: ChunkPos) -> Result<(), String> {
+        let generation = self
+            .chunk_generation
+            .as_ref()
+            .ok_or_else(|| "server chunk-generation worker is unavailable".to_owned())?;
+        let expected = square_chunks(center, CHUNK_RADIUS);
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            for (position, (packet, chunk_data)) in
+                self.advance_chunk_generation(generation, &[center], CHUNK_RADIUS)?
+            {
+                self.install_chunk(position, packet, chunk_data)?;
+            }
+            let cache = self
+                .chunk_packet_cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if expected.iter().all(|position| cache.contains_key(position)) {
+                self.chunk_packets = region_positions(center)
+                    .iter()
+                    .map(|position| {
+                        cache
+                            .get(position)
+                            .cloned()
+                            .expect("all initial spawn chunks were prepared")
+                    })
+                    .collect();
+                break;
+            }
+            drop(cache);
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out preparing the initial 3×3 spawn chunks around ({},{})",
+                    center.x, center.z
+                ));
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        let mut runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         save_runtime_dirty_chunks(&mut runtime, &self.resources)?;
+        Ok(())
+    }
+
+    fn poll_chunk_generation(&self) -> Result<(), String> {
+        let Some(generation) = &self.chunk_generation else {
+            return Ok(());
+        };
+        let centers = self
+            .player_chunks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        for (position, (packet, chunk_data)) in
+            self.advance_chunk_generation(generation, &centers, self.view_distance)?
+        {
+            // A worker may finish a job after the last player moved away.
+            // Like the reference scheduler, do not make that stale result
+            // resident or keep its packet in the view cache.
+            if !centers.is_empty()
+                && !centers
+                    .iter()
+                    .any(|center| is_tracked(*center, self.view_distance, position))
+            {
+                continue;
+            }
+            self.install_chunk(position, packet, chunk_data)?;
+        }
+        Ok(())
+    }
+
+    fn prune_chunk_packet_cache(&self) {
+        let centers = self
+            .player_chunks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        self.chunk_packet_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|position, _| {
+                centers
+                    .iter()
+                    .any(|center| is_tracked(*center, self.view_distance, *position))
+            });
+    }
+
+    #[cfg(test)]
+    fn prepare_chunk(&self, position: ChunkPos) -> Result<(), String> {
+        self.request_chunk(position)?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            self.poll_chunk_generation()?;
+            if self
+                .chunk_packet_cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains_key(&position)
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out generating PLAY chunk ({},{})",
+                    position.x, position.z
+                ));
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn install_chunk(
+        &self,
+        position: ChunkPos,
+        mut packet: Vec<u8>,
+        chunk_data: horizon_world::chunk::ChunkData,
+    ) -> Result<(), String> {
+        if self
+            .chunk_packet_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(&position)
+        {
+            return Ok(());
+        }
+        let mut runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let game_time = runtime.game_time();
+        let level = runtime
+            .dimension("minecraft:overworld")
+            .expect("the Play Overworld is registered")
+            .resident()
+            .level();
+        let min_y = level.min_y();
+        let height = level.max_y() - min_y;
+        let probe = BlockPos::new(position.x * 16, min_y, position.z * 16);
+        let already_resident = runtime
+            .dimension("minecraft:overworld")
+            .expect("the Play Overworld is registered")
+            .resident()
+            .level()
+            .is_loaded(probe);
+        let dimension = runtime
+            .dimension_mut("minecraft:overworld")
+            .expect("the Play Overworld is registered");
+        if already_resident {
+            // A chunk can already be resident as a worldgen support chunk even
+            // when it has not yet been sent to this player. Snapshot current
+            // block/tick state without sweeping every dirty region to disk.
+            let mut snapshot = dimension
+                .active_chunk_data(position)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "resident streamed chunk ({},{}) has no active saved data",
+                        position.x, position.z
+                    )
+                })?;
+            dimension
+                .resident_mut()
+                .save_chunk_data(
+                    &mut snapshot,
+                    game_time,
+                    |id| block_tick_name(&self.resources, id),
+                    fluid_tick_name,
+                )
+                .map_err(|error| format!("snapshot resident streamed chunk: {error}"))?;
+            play_chunk::overlay_saved_chunk_data(
+                &mut packet,
+                &snapshot,
+                min_y,
+                height,
+                &self.resources,
+            )?;
+        } else {
+            let loaded = dimension
+                .load_chunk_from_region(
+                    position,
+                    Limits::saved(),
+                    game_time,
+                    |name| resolve_block_tick(&self.resources, name),
+                    resolve_fluid_tick,
+                )
+                .map_err(|error| {
+                    format!(
+                        "load persisted streamed chunk ({},{}): {error}",
+                        position.x, position.z
+                    )
+                })?;
+            if loaded {
+                let saved = dimension
+                    .active_chunk_data(position)
+                    .expect("loaded PLAY chunk retains its saved NBT");
+                play_chunk::overlay_saved_chunk_data(
+                    &mut packet,
+                    saved,
+                    min_y,
+                    height,
+                    &self.resources,
+                )?;
+            } else {
+                dimension
+                    .insert_generated_chunk(
+                        chunk_data,
+                        game_time,
+                        |name| resolve_block_tick(&self.resources, name),
+                        resolve_fluid_tick,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "install streamed PLAY chunk ({},{}): {error}",
+                            position.x, position.z
+                        )
+                    })?;
+            }
+        }
         drop(runtime);
         self.chunk_packet_cache
             .lock()
@@ -834,6 +2333,19 @@ impl PreparedPlayWorld {
         pos: BlockPos,
         state: horizon_world::registry::BlockStateId,
     ) -> Result<(), String> {
+        let (min_y, height) = {
+            let runtime = self
+                .runtime
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let level = runtime
+                .dimension("minecraft:overworld")
+                .expect("the Play Overworld is registered")
+                .resident()
+                .level();
+            let min_y = level.min_y();
+            (min_y, level.max_y() - min_y)
+        };
         let chunk = pos.chunk();
         let mut cache = self
             .chunk_packet_cache
@@ -842,7 +2354,89 @@ impl PreparedPlayWorld {
         let Some(packet) = cache.get_mut(&chunk) else {
             return Ok(());
         };
-        play_chunk::patch_cached_block_state(packet, pos, state, &self.resources.behaviours)
+        play_chunk::patch_cached_block_state(
+            packet,
+            pos,
+            state,
+            min_y,
+            height,
+            &self.resources.behaviours,
+        )
+    }
+
+    fn publish_block_changes(
+        &self,
+        changes: Vec<(String, BlockPos, horizon_world::registry::BlockStateId)>,
+    ) -> Result<(), String> {
+        let mut log = self
+            .block_updates
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for (dimension, pos, state) in changes {
+            if dimension == "minecraft:overworld" {
+                self.patch_cached_block_state(pos, state)?;
+            }
+            log.append(dimension, [pos.x, pos.y, pos.z], state.0 as i32)?;
+        }
+        Ok(())
+    }
+
+    fn block_updates_since(&self, cursor: u64) -> Result<(Vec<WorldBlockUpdate>, u64), String> {
+        self.block_updates
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .since(cursor)
+    }
+
+    fn latest_block_update(&self) -> u64 {
+        self.block_updates
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .latest_sequence()
+    }
+
+    fn publish_level_events(&self, events: Vec<(String, LevelEvent)>) -> Result<(), String> {
+        let mut log = self
+            .level_events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for (dimension, event) in events {
+            let event = match event {
+                LevelEvent::LevelEvent { id, pos, data } => PublishedLevelEvent::Level {
+                    pos: [pos.x, pos.y, pos.z],
+                    id,
+                    data,
+                },
+                LevelEvent::Sound {
+                    pos,
+                    sound,
+                    volume,
+                    pitch,
+                } => PublishedLevelEvent::Sound {
+                    pos: [pos.x, pos.y, pos.z],
+                    sound: sound.to_string(),
+                    volume,
+                    pitch,
+                },
+                _ => continue,
+            };
+            log.append(dimension, event)?;
+        }
+        Ok(())
+    }
+
+    fn level_events_since(&self, cursor: u64) -> Result<(Vec<WorldLevelEvent>, u64), String> {
+        self.level_events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .since(cursor)
+    }
+
+    fn latest_level_event_sequence(&self) -> u64 {
+        self.level_events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .latest_sequence()
     }
 
     fn update_client_chunk_view(
@@ -864,7 +2458,7 @@ impl PreparedPlayWorld {
             )
             .map_err(|error| format!("update client chunk cache center: {error}"))?;
 
-        let desired = chunks_in_view(center);
+        let desired = tracked_chunks(center, player.view_distance);
         let mut forgotten = player
             .sent_chunks
             .difference(&desired)
@@ -884,44 +2478,79 @@ impl PreparedPlayWorld {
                 })?;
         }
 
-        let mut added = desired
-            .difference(&player.sent_chunks)
+        player.sent_chunks.retain(|chunk| desired.contains(chunk));
+        requeue_chunks(player, center);
+        player.chunk_center = center;
+        Ok(())
+    }
+
+    fn stream_chunks(
+        &self,
+        writer: &mut horizon_protocol::connection::ConnWriter,
+        player: &mut PlayerSession,
+    ) -> Result<(), String> {
+        self.poll_chunk_generation()?;
+        self.prune_chunk_packet_cache();
+        let request_positions = player
+            .chunk_queue
+            .iter()
+            .filter(|chunk| !player.sent_chunks.contains(chunk))
+            .take(MAX_CHUNK_BATCH)
             .copied()
             .collect::<Vec<_>>();
-        added.sort_by_key(|chunk| (chunk.z, chunk.x));
-        if !added.is_empty() {
+        for position in request_positions {
+            self.request_chunk(position)?;
+        }
+
+        if player.unacknowledged_batches >= player.max_unacknowledged_batches {
+            return Ok(());
+        }
+        player.batch_quota =
+            (player.batch_quota + player.chunks_per_tick).min(player.chunks_per_tick.max(1.0));
+        let limit = (player.batch_quota.floor() as usize).min(MAX_CHUNK_BATCH);
+        if limit == 0 {
+            return Ok(());
+        }
+        let cache = self
+            .chunk_packet_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let ready = player
+            .chunk_queue
+            .iter()
+            .filter(|chunk| !player.sent_chunks.contains(chunk) && cache.contains_key(chunk))
+            .take(limit)
+            .copied()
+            .collect::<Vec<_>>();
+        if ready.is_empty() {
+            return Ok(());
+        }
+        writer
+            .send(&play::Clientbound::ChunkBatchStart(horizon_protocol::packets::Empty).encode())
+            .map_err(|error| format!("start streamed chunk batch: {error}"))?;
+        for chunk in &ready {
             writer
-                .send(
-                    &play::Clientbound::ChunkBatchStart(horizon_protocol::packets::Empty).encode(),
-                )
-                .map_err(|error| format!("start streamed chunk batch: {error}"))?;
-            let cache = self
-                .chunk_packet_cache
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            for chunk in &added {
-                let packet = cache.get(chunk).ok_or_else(|| {
-                    format!(
-                        "streamed chunk ({},{}) has no encoded packet",
-                        chunk.x, chunk.z
-                    )
-                })?;
-                writer.send(packet).map_err(|error| {
+                .send(cache.get(chunk).expect("ready chunk packet is cached"))
+                .map_err(|error| {
                     format!("send streamed chunk ({},{}): {error}", chunk.x, chunk.z)
                 })?;
-            }
-            drop(cache);
-            writer
-                .send(
-                    &play::Clientbound::ChunkBatchFinished(play::ChunkBatchFinished {
-                        size: added.len() as i32,
-                    })
-                    .encode(),
-                )
-                .map_err(|error| format!("finish streamed chunk batch: {error}"))?;
         }
-        player.sent_chunks = desired;
-        player.chunk_center = center;
+        drop(cache);
+        writer
+            .send(
+                &play::Clientbound::ChunkBatchFinished(play::ChunkBatchFinished {
+                    size: ready.len() as i32,
+                })
+                .encode(),
+            )
+            .map_err(|error| format!("finish streamed chunk batch: {error}"))?;
+        let ready_set = ready.iter().copied().collect::<HashSet<_>>();
+        player
+            .chunk_queue
+            .retain(|chunk| !ready_set.contains(chunk));
+        player.sent_chunks.extend(ready.iter().copied());
+        player.batch_quota -= ready.len() as f32;
+        player.unacknowledged_batches += 1;
         Ok(())
     }
 }
@@ -1036,12 +2665,86 @@ fn chunks_in_view(center: ChunkPos) -> HashSet<ChunkPos> {
     chunks
 }
 
+fn tracked_chunks(center: ChunkPos, radius: i32) -> HashSet<ChunkPos> {
+    // Vanilla's chunk map tracks a square centered on the player. Keep this
+    // in sync with SetChunkCacheRadius; a circular filter silently leaves the
+    // client without the corner chunks it was told to expect.
+    let radius = radius.max(2);
+    let mut chunks = HashSet::new();
+    for z in center.z - radius..=center.z + radius {
+        for x in center.x - radius..=center.x + radius {
+            chunks.insert(ChunkPos::new(x, z));
+        }
+    }
+    chunks
+}
+
+fn requeue_chunks(player: &mut PlayerSession, center: ChunkPos) {
+    player.chunk_queue.retain(|chunk| {
+        is_tracked(center, player.view_distance, *chunk) && !player.sent_chunks.contains(chunk)
+    });
+    let queued = player.chunk_queue.iter().copied().collect::<HashSet<_>>();
+    let radius = player.view_distance.max(2);
+    let mut added = Vec::new();
+    for z in center.z - radius..=center.z + radius {
+        for x in center.x - radius..=center.x + radius {
+            let chunk = ChunkPos::new(x, z);
+            if !player.sent_chunks.contains(&chunk) && !queued.contains(&chunk) {
+                added.push(chunk);
+            }
+        }
+    }
+    let vanilla_order =
+        horizon_world::worldgen::decoration_order::vanilla_order((center.x, center.z), radius);
+    let rank: HashMap<_, _> = vanilla_order
+        .into_iter()
+        .enumerate()
+        .map(|(rank, position)| (position, rank))
+        .collect();
+    added.sort_by_key(|chunk| {
+        let dx = i64::from(chunk.x - center.x);
+        let dz = i64::from(chunk.z - center.z);
+        (
+            rank.get(&(chunk.x, chunk.z)).copied().unwrap_or(usize::MAX),
+            dx * dx + dz * dz,
+            chunk.z,
+            chunk.x,
+        )
+    });
+    player.chunk_queue.extend(added);
+}
+
+fn is_tracked(center: ChunkPos, radius: i32, chunk: ChunkPos) -> bool {
+    let radius = radius.max(2);
+    (i64::from(chunk.x) - i64::from(center.x)).abs() <= i64::from(radius)
+        && (i64::from(chunk.z) - i64::from(center.z)).abs() <= i64::from(radius)
+}
+
+fn centers_distance_key(centers: &[ChunkPos], position: ChunkPos) -> i128 {
+    centers
+        .iter()
+        .map(|center| {
+            let dx = i128::from(position.x) - i128::from(center.x);
+            let dz = i128::from(position.z) - i128::from(center.z);
+            dx * dx + dz * dz
+        })
+        .min()
+        .unwrap_or(i128::MAX)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct PlayerSession {
     entity_id: i32,
+    name: String,
     position: [f64; 3],
     chunk_center: ChunkPos,
     sent_chunks: HashSet<ChunkPos>,
+    view_distance: i32,
+    chunk_queue: VecDeque<ChunkPos>,
+    chunks_per_tick: f32,
+    batch_quota: f32,
+    unacknowledged_batches: usize,
+    max_unacknowledged_batches: usize,
     yaw: f32,
     pitch: f32,
     on_ground: bool,
@@ -1050,10 +2753,18 @@ struct PlayerSession {
     awaiting_teleport: Option<(i32, [f64; 3])>,
     loaded: bool,
     position_packet_this_tick: bool,
+    game_mode: i32,
+    selected_slot: i16,
+    inventory: PlayerInventory,
+    input_flags: u8,
+    sprinting: bool,
     server_tick: u64,
     digging: Option<DiggingState>,
     delayed_dig: Option<DiggingState>,
     dig_clock: Option<([i32; 3], u64)>,
+    world_update_cursor: u64,
+    level_event_cursor: u64,
+    known_item_entities: HashMap<i32, DroppedItem>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1067,11 +2778,18 @@ struct DiggingState {
 impl PlayerSession {
     fn new(spawn: [f64; 3], teleport_id: i32, entity_id: i32) -> Self {
         let chunk_center = chunk_center(spawn);
-        Self {
+        let mut player = Self {
             entity_id,
+            name: "Player".into(),
             position: spawn,
             chunk_center,
             sent_chunks: chunks_in_view(chunk_center),
+            view_distance: DEFAULT_VIEW_DISTANCE,
+            chunk_queue: VecDeque::new(),
+            chunks_per_tick: CHUNKS_PER_TICK,
+            batch_quota: 0.0,
+            unacknowledged_batches: 1,
+            max_unacknowledged_batches: 1,
             yaw: 0.0,
             pitch: 0.0,
             on_ground: false,
@@ -1080,11 +2798,23 @@ impl PlayerSession {
             awaiting_teleport: Some((teleport_id, spawn)),
             loaded: false,
             position_packet_this_tick: false,
+            game_mode: 0,
+            selected_slot: 0,
+            inventory: PlayerInventory::default(),
+            input_flags: 0,
+            sprinting: false,
             server_tick: 0,
             digging: None,
             delayed_dig: None,
             dig_clock: None,
-        }
+            world_update_cursor: 0,
+            level_event_cursor: 0,
+            known_item_entities: HashMap::new(),
+        };
+        // The spawn batch is sent first, but the rest of the announced view
+        // must already be queued even if the player remains in this chunk.
+        requeue_chunks(&mut player, chunk_center);
+        player
     }
 
     fn accept_teleport(&mut self, packet: &play::AcceptTeleportation) -> Result<(), String> {
@@ -1193,7 +2923,11 @@ fn serve_until_disconnect(
     configured: ConfiguredConnection,
     spawn: [f64; 3],
     entity_id: i32,
+    player_name: String,
     world: Option<&PreparedPlayWorld>,
+    view_distance: i32,
+    simulation_distance: i32,
+    spawn_center: ChunkPos,
 ) -> Result<(), String> {
     let (reader, mut writer) = configured.connection.split();
     reader
@@ -1207,7 +2941,17 @@ fn serve_until_disconnect(
         .name("borizon-play-reader".into())
         .spawn(move || read_play_packets(reader, incoming))
         .map_err(|error| format!("start PLAY network reader: {error}"))?;
-    let result = run_play_session(&mut writer, received, spawn, entity_id, world);
+    let result = run_play_session(
+        &mut writer,
+        received,
+        spawn,
+        entity_id,
+        player_name,
+        world,
+        view_distance,
+        simulation_distance,
+        spawn_center,
+    );
     closer.close();
     let _ = network_reader.join();
     result
@@ -1259,7 +3003,11 @@ fn run_play_session(
     received: Receiver<Result<(i32, Vec<u8>), String>>,
     spawn: [f64; 3],
     entity_id: i32,
+    player_name: String,
     world: Option<&PreparedPlayWorld>,
+    view_distance: i32,
+    _simulation_distance: i32,
+    spawn_center: ChunkPos,
 ) -> Result<(), String> {
     const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
     const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1268,6 +3016,18 @@ fn run_play_session(
     let mut next_keepalive_id = 1_i64;
     let mut pending_keepalive: Option<(i64, Instant)> = None;
     let mut player = PlayerSession::new(spawn, 1, entity_id);
+    player.name = player_name;
+    player.game_mode = world.map_or(0, |world| world.game_mode);
+    player.view_distance = view_distance;
+    player.chunk_center = spawn_center;
+    requeue_chunks(&mut player, spawn_center);
+    writer
+        .send(&play::Clientbound::ContainerSetContent(player.inventory.content_packet()).encode())
+        .map_err(|error| format!("send initial player inventory: {error}"))?;
+    if let Some(world) = world {
+        player.world_update_cursor = world.latest_block_update();
+        player.level_event_cursor = world.latest_level_event_sequence();
+    }
     let mut inbox = PendingPackets::default();
     let mut next_tick = Instant::now() + SERVER_TICK;
     loop {
@@ -1308,6 +3068,10 @@ fn run_play_session(
                 )?;
             }
             advance_player_mining(writer, &mut player, world)?;
+            if let Some(world) = world {
+                world.stream_chunks(writer, &mut player)?;
+                sync_item_entities(writer, &mut player, world)?;
+            }
             next_tick += SERVER_TICK;
         }
     }
@@ -1338,6 +3102,100 @@ fn process_play_packet(
         },
         play::Serverbound::PlayerLoaded(_) => player.loaded = true,
         play::Serverbound::ClientTickEnd(_) => player.end_tick(),
+        play::Serverbound::PlayerInput(packet) => player.input_flags = packet.flags,
+        play::Serverbound::SetCarriedItem(packet) => {
+            if (0..9).contains(&packet.slot) {
+                player.selected_slot = packet.slot;
+            } else {
+                writer
+                    .send(
+                        &play::Clientbound::SetHeldSlot(play::SetHeldSlot {
+                            slot: i32::from(player.selected_slot),
+                        })
+                        .encode(),
+                    )
+                    .map_err(|error| format!("restore invalid carried-item slot: {error}"))?;
+            }
+        }
+        play::Serverbound::PlayerCommand(packet) if packet.id == player.entity_id => {
+            match packet.action {
+                1 => player.sprinting = true,
+                2 => player.sprinting = false,
+                _ => {}
+            }
+        }
+        play::Serverbound::UseItemOn(packet) => {
+            process_use_item_on(writer, player, packet, world)?;
+        }
+        play::Serverbound::UseItem(packet) => {
+            writer
+                .send(
+                    &play::Clientbound::BlockChangedAck(play::BlockChangedAck {
+                        sequence: packet.sequence,
+                    })
+                    .encode(),
+                )
+                .map_err(|error| format!("acknowledge empty-hand use: {error}"))?;
+        }
+        play::Serverbound::Chat(packet) => {
+            // Secure chat is disabled for this offline listener. Keep the
+            // session alive and echo the ordinary unsigned message as a
+            // vanilla system component until the shared chat owner is ported.
+            let content = format!("<{}> {}", player.name, packet.message);
+            writer
+                .send(
+                    &play::Clientbound::SystemChat(play::SystemChat {
+                        content: horizon_world::nbt::Tag::String(content.as_str().into()),
+                        overlay: false,
+                    })
+                    .encode(),
+                )
+                .map_err(|error| format!("echo offline PLAY chat: {error}"))?;
+        }
+        play::Serverbound::ChatAck(_) => {}
+        play::Serverbound::RecipeBookChangeSettings(_) => {}
+        play::Serverbound::ContainerClick(packet) if packet.container == 0 => {
+            if packet.state == player.inventory.state_id() {
+                player
+                    .inventory
+                    .click_storage(packet.slot, packet.button, packet.input, |item| {
+                        world
+                            .and_then(|world| {
+                                world
+                                    .resources
+                                    .item_ids
+                                    .name(item)
+                                    .map(|name| world.resources.loot.max_stack(name))
+                            })
+                            .unwrap_or(64)
+                    });
+            }
+            writer
+                .send(
+                    &play::Clientbound::ContainerSetContent(player.inventory.content_packet())
+                        .encode(),
+                )
+                .map_err(|error| format!("sync player inventory after click: {error}"))?;
+        }
+        play::Serverbound::SetCreativeModeSlot(packet) => {
+            if player.game_mode == 1 {
+                player.inventory.set_creative_slot(packet.slot, packet.item);
+            }
+            writer
+                .send(
+                    &play::Clientbound::ContainerSetContent(player.inventory.content_packet())
+                        .encode(),
+                )
+                .map_err(|error| format!("resync player inventory after creative slot: {error}"))?;
+        }
+        play::Serverbound::Punch(_)
+        | play::Serverbound::ClientCommand(_)
+        | play::Serverbound::ChatSessionUpdate(_)
+        | play::Serverbound::RecipeBookSeenRecipe(_)
+        | play::Serverbound::SeenAdvancements(_)
+        | play::Serverbound::ContainerClose(_)
+        | play::Serverbound::ContainerClick(_)
+        | play::Serverbound::Interact(_) => {}
         play::Serverbound::MovePlayerPos(packet) => {
             update_player_movement(
                 writer,
@@ -1369,7 +3227,19 @@ fn process_play_packet(
         play::Serverbound::MovePlayerStatus(packet) => {
             update_player_movement(writer, player, None, None, packet.flags, world)?;
         }
-        play::Serverbound::ClientInformation(_) | play::Serverbound::ChunkBatchReceived(_) => {}
+        play::Serverbound::ClientInformation(_) => {}
+        play::Serverbound::ChunkBatchReceived(batch) => {
+            player.unacknowledged_batches = player.unacknowledged_batches.saturating_sub(1);
+            player.chunks_per_tick = if batch.chunks_per_tick.is_finite() {
+                batch.chunks_per_tick.clamp(0.01, 64.0)
+            } else {
+                0.01
+            };
+            if player.unacknowledged_batches == 0 {
+                player.batch_quota = player.batch_quota.max(1.0);
+                player.max_unacknowledged_batches = 10;
+            }
+        }
         play::Serverbound::PingRequest(ping) => writer
             .send(&play::Clientbound::PongResponse(ping).encode())
             .map_err(|error| format!("reply to PLAY ping: {error}"))?,
@@ -1381,6 +3251,169 @@ fn process_play_packet(
         }
     }
     Ok(())
+}
+
+fn process_use_item_on(
+    writer: &mut horizon_protocol::connection::ConnWriter,
+    player: &mut PlayerSession,
+    action: play::UseItemOn,
+    world: Option<&PreparedPlayWorld>,
+) -> Result<(), String> {
+    writer
+        .send(
+            &play::Clientbound::BlockChangedAck(play::BlockChangedAck {
+                sequence: action.sequence,
+            })
+            .encode(),
+        )
+        .map_err(|error| format!("acknowledge block-use action: {error}"))?;
+
+    // Match the reference's hit-point and reach checks before item/block behaviour.
+    if action.hand < 0 || action.hand > 1 || !(0..=5).contains(&action.face) {
+        return Ok(());
+    }
+    let hit_is_near_block = action
+        .cursor
+        .iter()
+        .all(|coordinate| (f64::from(*coordinate) - 0.5).abs() < 1.0000001);
+    if !hit_is_near_block || !player.loaded || player.awaiting_teleport.is_some() {
+        return Ok(());
+    }
+    let Some(world) = world else {
+        return Ok(());
+    };
+    let eye = [
+        player.position[0],
+        player.position[1] + 1.62,
+        player.position[2],
+    ];
+    if !player_mining::within_block_range(eye, 5.5, action.pos) {
+        return Ok(());
+    }
+    let pos = BlockPos::new(action.pos[0], action.pos[1], action.pos[2]);
+    let face = Direction::ALL[action.face as usize];
+    let hit = Vec3::new(
+        f64::from(action.pos[0]) + f64::from(action.cursor[0]),
+        f64::from(action.pos[1]) + f64::from(action.cursor[1]),
+        f64::from(action.pos[2]) + f64::from(action.cursor[2]),
+    );
+    let mut runtime = world
+        .runtime
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let dimension = runtime
+        .dimension_mut("minecraft:overworld")
+        .expect("the Play Overworld is registered");
+    {
+        let resident = dimension.resident();
+        if !resident.level().is_loaded(pos)
+            || !(resident.level().min_y()..resident.level().max_y()).contains(&pos.y)
+        {
+            return Ok(());
+        }
+    }
+
+    let held_item = player
+        .inventory
+        .hand(action.hand, player.selected_slot)
+        .and_then(|stack| world.resources.item_ids.name(stack.item))
+        .map(str::to_owned);
+    // Block interaction gets first refusal. A Pass continues to vanilla
+    // BlockItem placement if the selected stack has a registered block item.
+    let interaction = dimension.resident_mut().use_without_item(
+        &world.resources.behaviours,
+        pos,
+        face,
+        hit,
+        PlayerContext {
+            yaw: player.yaw,
+            pitch: player.pitch,
+            may_build: true,
+            can_eat: false,
+            game_master: false,
+        },
+    );
+    let mut placed = false;
+    if interaction == horizon_world::level::InteractionResult::Pass {
+        if let Some(item) = held_item.as_deref()
+            && world.resources.behaviours.item_binding(item).is_some()
+        {
+            let outcome = dimension.resident_mut().place_block(
+                &world.resources.behaviours,
+                &PlaceContext {
+                    clicked_pos: pos,
+                    face,
+                    hit,
+                    inside: action.inside,
+                    yaw: player.yaw,
+                    pitch: player.pitch,
+                    sneaking: player.input_flags & 0x20 != 0,
+                    item: item.to_owned(),
+                    can_use_game_master_blocks: player.game_mode == 1,
+                },
+            );
+            if matches!(outcome, PlaceOutcome::Placed { .. }) {
+                placed = true;
+                if player.game_mode != 1 {
+                    player
+                        .inventory
+                        .consume_hand(action.hand, player.selected_slot);
+                }
+            }
+        }
+    }
+    let changes = runtime.take_block_changes();
+    let events = runtime.take_level_events();
+    drop(runtime);
+    world.publish_block_changes(changes)?;
+    world.publish_level_events(events)?;
+    if placed {
+        writer
+            .send(
+                &play::Clientbound::ContainerSetContent(player.inventory.content_packet()).encode(),
+            )
+            .map_err(|error| format!("sync inventory after placing block: {error}"))?;
+    }
+    Ok(())
+}
+
+/// The reference's `Game::destroy_progress` order, using the held item's
+/// vanilla default `Tool` component. Stack-level component patches, effects,
+/// attributes and water modifiers still need their own session owners.
+fn player_destroy_progress(
+    player: &PlayerSession,
+    world: &PreparedPlayWorld,
+    state: horizon_world::registry::BlockStateId,
+    hardness: f32,
+    flags: u32,
+) -> f32 {
+    let block = world
+        .resources
+        .registry
+        .state(state)
+        .map(|state| state.name.as_str())
+        .unwrap_or("minecraft:air");
+    let held_item = player
+        .inventory
+        .hotbar(player.selected_slot)
+        .and_then(|stack| world.resources.item_ids.name(stack.item));
+    let harvest = flags & state_flags::REQUIRES_TOOL == 0
+        || world
+            .resources
+            .loot
+            .correct_tool_for_drops(held_item, block);
+    let tool_speed = world.resources.loot.mining_speed(held_item, block);
+    player_mining::destroy_progress(
+        hardness,
+        harvest,
+        player_mining::destroy_speed(
+            tool_speed,
+            &DestroySpeedModifiers {
+                on_ground: player.on_ground,
+                ..DestroySpeedModifiers::default()
+            },
+        ),
+    )
 }
 
 fn process_player_action(
@@ -1440,17 +3473,24 @@ fn process_player_action(
             return Ok(());
         }
         let state = resident.level().block_state(pos);
+        if player.game_mode == 1 {
+            player.digging = None;
+            drop(runtime);
+            destroy_player_block(
+                writer,
+                player,
+                world,
+                DiggingState {
+                    pos: action.pos,
+                    started_at: player.server_tick,
+                    per_tick: 1.0,
+                    progress: 1.0,
+                },
+            )?;
+            return Ok(());
+        }
         let facts = world.resources.behaviours.facts(state);
-        let correct_tool = facts.flags & state_flags::REQUIRES_TOOL == 0;
-        let modifiers = DestroySpeedModifiers {
-            on_ground: player.on_ground,
-            ..DestroySpeedModifiers::default()
-        };
-        let per_tick = player_mining::destroy_progress(
-            facts.hardness,
-            correct_tool,
-            player_mining::destroy_speed(1.0, &modifiers),
-        );
+        let per_tick = player_destroy_progress(player, world, state, facts.hardness, facts.flags);
         let digging = DiggingState {
             pos: action.pos,
             started_at: player.server_tick,
@@ -1460,7 +3500,7 @@ fn process_player_action(
         if per_tick >= 1.0 {
             player.digging = None;
             drop(runtime);
-            destroy_player_block(writer, player.entity_id, world, digging)?;
+            destroy_player_block(writer, player, world, digging)?;
         } else {
             player.dig_clock = Some((action.pos, player.server_tick));
             player.digging = Some(digging);
@@ -1537,7 +3577,7 @@ fn process_player_action(
     digging.progress =
         dig_progress_at_tick(digging.per_tick, player.server_tick, digging.started_at);
     if stop_dig_breaks(digging.progress) {
-        destroy_player_block(writer, player.entity_id, world, digging)?;
+        destroy_player_block(writer, player, world, digging)?;
     } else if player.delayed_dig.is_none() {
         player.delayed_dig = Some(digging);
     }
@@ -1584,7 +3624,7 @@ fn send_crack_progress(
 
 fn destroy_player_block(
     writer: &mut horizon_protocol::connection::ConnWriter,
-    entity_id: i32,
+    player: &mut PlayerSession,
     world: &PreparedPlayWorld,
     digging: DiggingState,
 ) -> Result<(), String> {
@@ -1593,7 +3633,7 @@ fn destroy_player_block(
         .runtime
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let (destroyed, state) = {
+    let (destroyed, old_state, correct_tool, block_drops) = {
         let resident = runtime
             .dimension_mut("minecraft:overworld")
             .expect("the Play Overworld is registered")
@@ -1602,22 +3642,366 @@ fn destroy_player_block(
             return Ok(());
         }
         let state = resident.level().block_state(pos);
-        let correct_tool =
-            world.resources.behaviours.facts(state).flags & state_flags::REQUIRES_TOOL == 0;
-        let destroyed =
-            resident.destroy_block_by_player(&world.resources.behaviours, pos, false, correct_tool);
-        (destroyed, resident.level().block_state(pos))
+        let block = world
+            .resources
+            .registry
+            .state(state)
+            .ok_or("resident block state is absent from the registry")?;
+        let flags = world.resources.behaviours.facts(state).flags;
+        let held_item = player
+            .inventory
+            .hotbar(player.selected_slot)
+            .and_then(|stack| world.resources.item_ids.name(stack.item));
+        let correct_tool = flags & state_flags::REQUIRES_TOOL == 0
+            || world
+                .resources
+                .loot
+                .correct_tool_for_drops(held_item, &block.name);
+        let block = block.clone();
+        let creative = player.game_mode == 1;
+        let destroyed = resident.destroy_block_by_player(
+            &world.resources.behaviours,
+            pos,
+            creative,
+            correct_tool,
+        );
+        let block_drops = runtime.game_rules().bool("block_drops");
+        (destroyed, block, correct_tool, block_drops)
     };
-    if destroyed {
+    let (changes, events) = if destroyed {
         save_runtime_dirty_chunks(&mut runtime, &world.resources)?;
-    }
+        (runtime.take_block_changes(), runtime.take_level_events())
+    } else {
+        (Vec::new(), Vec::new())
+    };
     drop(runtime);
     if destroyed {
-        world.patch_cached_block_state(pos, state)?;
-        send_block_update(writer, digging.pos, state.0 as i32)?;
-        send_crack_progress(writer, entity_id, digging.pos, -1)?;
+        world.publish_block_changes(changes)?;
+        world.publish_level_events(events)?;
+        if player.game_mode != 1 && correct_tool && block_drops {
+            spawn_block_loot(player, world, &old_state, pos)?;
+        }
+        send_crack_progress(writer, player.entity_id, digging.pos, -1)?;
     }
     Ok(())
+}
+
+fn spawn_block_loot(
+    player: &PlayerSession,
+    world: &PreparedPlayWorld,
+    block: &horizon_world::chunk::BlockState,
+    pos: BlockPos,
+) -> Result<(), String> {
+    let Some((namespace, name)) = block.name.split_once(':') else {
+        return Ok(());
+    };
+    let table = format!("{namespace}:blocks/{name}");
+    let held_tool = player
+        .inventory
+        .hotbar(player.selected_slot)
+        .and_then(|stack| world.resources.item_ids.name(stack.item))
+        .map(LootStack::new);
+    let mut context = BlockLootContext {
+        block: block.name.clone(),
+        tool: held_tool,
+        ..BlockLootContext::default()
+    };
+    for (key, value) in &block.properties {
+        context.properties.insert(key.clone(), value.clone());
+    }
+
+    let mut random = world
+        .loot_random
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let drops = world
+        .resources
+        .loot
+        .roll_block(&table, &mut *random, &context);
+    for drop in drops {
+        let Some(item_id) = world.resources.item_ids.id(&drop.item) else {
+            return Err(format!("loot table produced unknown item {}", drop.item));
+        };
+        let mut stack = Stack::new(item_id, drop.count);
+        if drop.damage > 0 {
+            stack.added.push((
+                horizon_protocol::item::component::DAMAGE,
+                ItemComponent::Int(drop.damage),
+            ));
+        }
+        let enchantments: Vec<(i32, i32)> = drop
+            .enchantments
+            .iter()
+            .filter_map(|(name, level)| {
+                world
+                    .resources
+                    .builtin_registries
+                    .get("minecraft:enchantment")?
+                    .id(name)
+                    .map(|id| (id, *level))
+            })
+            .collect();
+        if !enchantments.is_empty() {
+            stack.added.push((
+                horizon_protocol::item::component::ENCHANTMENTS,
+                ItemComponent::Enchantments(enchantments),
+            ));
+        }
+
+        // Match Block.popResource's randomized point; the item's own random
+        // stream supplies the small constructor velocity until entity ticking
+        // and independent per-entity RNG are ported.
+        let position = horizon_world::level::removal::pop_resource_position(&mut *random, pos);
+        let velocity = [
+            random.next_double() * 0.2 - 0.1,
+            0.2,
+            random.next_double() * 0.2 - 0.1,
+        ];
+        world.item_entities.spawn(stack, position, velocity)?;
+    }
+    Ok(())
+}
+
+fn send_pending_block_updates(
+    writer: &mut horizon_protocol::connection::ConnWriter,
+    player: &mut PlayerSession,
+    world: &PreparedPlayWorld,
+) -> Result<(), String> {
+    let (updates, latest) = world.block_updates_since(player.world_update_cursor)?;
+    for update in updates {
+        if update.dimension == "minecraft:overworld"
+            && player.sent_chunks.contains(&ChunkPos::new(
+                update.pos[0].div_euclid(16),
+                update.pos[2].div_euclid(16),
+            ))
+        {
+            send_block_update(writer, update.pos, update.state)?;
+        }
+    }
+    player.world_update_cursor = latest;
+    send_pending_level_events(writer, player, world)?;
+    Ok(())
+}
+
+fn send_pending_level_events(
+    writer: &mut horizon_protocol::connection::ConnWriter,
+    player: &mut PlayerSession,
+    world: &PreparedPlayWorld,
+) -> Result<(), String> {
+    let (events, latest) = world.level_events_since(player.level_event_cursor)?;
+    for event in events {
+        if event.dimension != "minecraft:overworld" {
+            continue;
+        }
+        let pos = event_pos(&event.event);
+        let chunk = ChunkPos::new(pos[0].div_euclid(16), pos[2].div_euclid(16));
+        if !player.sent_chunks.contains(&chunk) {
+            continue;
+        }
+        let distance_squared = (0..3)
+            .map(|axis| {
+                let center = f64::from(pos[axis]) + 0.5;
+                (player.position[axis] - center).powi(2)
+            })
+            .sum::<f64>();
+        match event.event {
+            PublishedLevelEvent::Level { pos, id, data } => {
+                if distance_squared > 64.0 * 64.0 {
+                    continue;
+                }
+                writer
+                    .send(
+                        &play::Clientbound::LevelEvent(play::LevelEvent {
+                            kind: id,
+                            pos,
+                            data,
+                            global: false,
+                        })
+                        .encode(),
+                    )
+                    .map_err(|error| format!("send PLAY level event: {error}"))?;
+            }
+            PublishedLevelEvent::Sound {
+                pos,
+                sound,
+                volume,
+                pitch,
+            } => {
+                let range = if volume > 1.0 { volume * 16.0 } else { 16.0 };
+                if distance_squared > f64::from(range).powi(2) {
+                    continue;
+                }
+                writer
+                    .send(
+                        &play::Clientbound::Sound(play::Sound {
+                            sound: (-1, Some((sound, None))),
+                            source: 4,
+                            x: pos[0] * 8 + 4,
+                            y: pos[1] * 8 + 4,
+                            z: pos[2] * 8 + 4,
+                            volume,
+                            pitch,
+                            seed: event.sequence as i64,
+                        })
+                        .encode(),
+                    )
+                    .map_err(|error| format!("send PLAY block sound: {error}"))?;
+            }
+        }
+    }
+    player.level_event_cursor = latest;
+    Ok(())
+}
+
+fn sync_item_entities(
+    writer: &mut horizon_protocol::connection::ConnWriter,
+    player: &mut PlayerSession,
+    world: &PreparedPlayWorld,
+) -> Result<(), String> {
+    if !player.loaded {
+        return Ok(());
+    }
+    let pickups =
+        world
+            .item_entities
+            .collect_near(player.position, &mut player.inventory, |stack| {
+                world
+                    .resources
+                    .item_ids
+                    .name(stack.item)
+                    .map(|name| world.resources.loot.max_stack(name))
+                    .unwrap_or(64)
+            });
+    for pickup in &pickups {
+        writer
+            .send(
+                &play::Clientbound::TakeItemEntity(play::TakeItemEntity {
+                    item: pickup.id,
+                    player: player.entity_id,
+                    amount: pickup.amount,
+                })
+                .encode(),
+            )
+            .map_err(|error| format!("send collected item animation: {error}"))?;
+    }
+    if !pickups.is_empty() {
+        writer
+            .send(
+                &play::Clientbound::ContainerSetContent(player.inventory.content_packet()).encode(),
+            )
+            .map_err(|error| format!("sync inventory after item pickup: {error}"))?;
+    }
+    let items = world.item_entities.all();
+    let mut visible = HashSet::new();
+    for item in items {
+        let chunk = ChunkPos::new(
+            (item.position[0].floor() as i32).div_euclid(16),
+            (item.position[2].floor() as i32).div_euclid(16),
+        );
+        if !player.sent_chunks.contains(&chunk) {
+            continue;
+        }
+        visible.insert(item.id);
+        if let Some(previous) = player.known_item_entities.get(&item.id) {
+            if previous.position != item.position {
+                writer
+                    .send(
+                        &play::Clientbound::EntityPositionSync(play::EntityPositionSync {
+                            id: item.id,
+                            path: play::PositionPath::Linear(item.position),
+                            yaw: 0.0,
+                            pitch: 0.0,
+                            on_ground: item.on_ground,
+                        })
+                        .encode(),
+                    )
+                    .map_err(|error| format!("sync dropped item position: {error}"))?;
+            }
+            if previous.velocity != item.velocity {
+                writer
+                    .send(
+                        &play::Clientbound::SetEntityMotion(play::SetEntityMotion {
+                            id: item.id,
+                            velocity: item.velocity,
+                        })
+                        .encode(),
+                    )
+                    .map_err(|error| format!("sync dropped item velocity: {error}"))?;
+            }
+            if previous.stack != item.stack {
+                send_item_entity_stack(writer, &item)?;
+            }
+            player.known_item_entities.insert(item.id, item);
+            continue;
+        }
+        let entity_kind = world
+            .resources
+            .builtin_registries
+            .get("minecraft:entity_type")
+            .and_then(|ids| ids.id("minecraft:item"))
+            .ok_or("registries.json has no minecraft:item entity type")?;
+        writer
+            .send(
+                &play::Clientbound::AddEntity(play::AddEntity {
+                    id: item.id,
+                    uuid: item.uuid,
+                    kind: entity_kind,
+                    position: item.position,
+                    velocity: item.velocity,
+                    pitch: 0,
+                    yaw: 0,
+                    head_yaw: 0,
+                    data: 0,
+                })
+                .encode(),
+            )
+            .map_err(|error| format!("send dropped item entity spawn: {error}"))?;
+        send_item_entity_stack(writer, &item)?;
+        player.known_item_entities.insert(item.id, item);
+    }
+    let stale: Vec<i32> = player
+        .known_item_entities
+        .keys()
+        .copied()
+        .filter(|id| !visible.contains(id))
+        .collect();
+    if !stale.is_empty() {
+        writer
+            .send(
+                &play::Clientbound::RemoveEntities(play::RemoveEntities { ids: stale.clone() })
+                    .encode(),
+            )
+            .map_err(|error| format!("remove stale dropped item entities: {error}"))?;
+        for id in stale {
+            player.known_item_entities.remove(&id);
+        }
+    }
+    Ok(())
+}
+
+fn send_item_entity_stack(
+    writer: &mut horizon_protocol::connection::ConnWriter,
+    item: &DroppedItem,
+) -> Result<(), String> {
+    writer
+        .send(
+            &play::Clientbound::SetEntityData(play::SetEntityData {
+                id: item.id,
+                values: vec![(
+                    entity_data::ITEM_ENTITY_ITEM,
+                    entity_data::serializer::ITEM_STACK,
+                    EntityDataValue::Item(Some(item.stack.clone())),
+                )],
+            })
+            .encode(),
+        )
+        .map_err(|error| format!("send dropped item entity stack: {error}"))
+}
+
+fn event_pos(event: &PublishedLevelEvent) -> [i32; 3] {
+    match event {
+        PublishedLevelEvent::Level { pos, .. } | PublishedLevelEvent::Sound { pos, .. } => *pos,
+    }
 }
 
 fn advance_player_mining(
@@ -1646,18 +4030,8 @@ fn advance_player_mining(
             let state = resident.level().block_state(pos);
             let facts = world.resources.behaviours.facts(state);
             if facts.flags & state_flags::AIR == 0 {
-                let correct_tool = facts.flags & state_flags::REQUIRES_TOOL == 0;
-                digging.per_tick = player_mining::destroy_progress(
-                    facts.hardness,
-                    correct_tool,
-                    player_mining::destroy_speed(
-                        1.0,
-                        &DestroySpeedModifiers {
-                            on_ground: player.on_ground,
-                            ..DestroySpeedModifiers::default()
-                        },
-                    ),
-                );
+                digging.per_tick =
+                    player_destroy_progress(player, world, state, facts.hardness, facts.flags);
                 digging.progress = (digging.progress + digging.per_tick).min(1.0);
                 player.digging = Some(digging);
             }
@@ -1671,18 +4045,8 @@ fn advance_player_mining(
             let state = resident.level().block_state(pos);
             let facts = world.resources.behaviours.facts(state);
             if facts.flags & state_flags::AIR == 0 {
-                let correct_tool = facts.flags & state_flags::REQUIRES_TOOL == 0;
-                digging.per_tick = player_mining::destroy_progress(
-                    facts.hardness,
-                    correct_tool,
-                    player_mining::destroy_speed(
-                        1.0,
-                        &DestroySpeedModifiers {
-                            on_ground: player.on_ground,
-                            ..DestroySpeedModifiers::default()
-                        },
-                    ),
-                );
+                digging.per_tick =
+                    player_destroy_progress(player, world, state, facts.hardness, facts.flags);
                 digging.progress =
                     dig_progress_at_tick(digging.per_tick, player.server_tick, digging.started_at);
                 if digging.progress >= 1.0 {
@@ -1695,9 +4059,10 @@ fn advance_player_mining(
     }
     drop(runtime);
     if let Some(digging) = delayed_completion {
-        destroy_player_block(writer, player.entity_id, world, digging)?;
+        destroy_player_block(writer, player, world, digging)?;
     }
     player.server_tick = player.server_tick.wrapping_add(1);
+    send_pending_block_updates(writer, player, world)?;
     Ok(())
 }
 
@@ -1722,11 +4087,6 @@ fn update_player_movement(
     if exceeds_base_movement_limit(start, requested) {
         return player.send_correction(writer, start);
     }
-    let requested_center = chunk_center(requested);
-    if let Err(error) = world.prepare_player_view(player, requested_center) {
-        eprintln!("Horizon: refusing movement because chunk streaming failed: {error}");
-        return player.send_correction(writer, start);
-    }
     match world.resolve_player_move(
         player.entity_id,
         start,
@@ -1747,6 +4107,7 @@ fn update_player_movement(
             }
             let center = chunk_center(resolved);
             world.update_client_chunk_view(writer, player, center)?;
+            requeue_chunks(player, center);
             world.set_player_chunk(player.entity_id, center)?;
         }
         Err(_) => player.send_correction(writer, start)?,
@@ -1793,6 +4154,28 @@ mod tests {
     use super::*;
     use crate::login::OfflineProfile;
     use horizon_protocol::connection::{Connection, Pipe};
+
+    #[test]
+    fn block_update_log_delivers_ordered_updates_from_each_cursor() {
+        let mut log = BlockUpdateLog::default();
+        log.append("minecraft:overworld".into(), [1, 2, 3], 4)
+            .unwrap();
+        log.append("minecraft:overworld".into(), [1, 2, 3], 0)
+            .unwrap();
+
+        let (all, latest) = log.since(0).unwrap();
+        assert_eq!(latest, 2);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].sequence, 1);
+        assert_eq!(all[0].state, 4);
+        assert_eq!(all[1].sequence, 2);
+        assert_eq!(all[1].state, 0);
+
+        let (after_first, latest) = log.since(1).unwrap();
+        assert_eq!(latest, 2);
+        assert_eq!(after_first.len(), 1);
+        assert_eq!(after_first[0].pos, [1, 2, 3]);
+    }
 
     fn receive_clientbound(client: &mut Connection) -> play::Clientbound {
         let (id, payload) = client.recv().unwrap();
@@ -1946,6 +4329,204 @@ mod tests {
     }
 
     #[test]
+    fn container_clicks_move_player_items_using_menu_state() {
+        let (server_pipe, client_pipe) = Pipe::pair();
+        let (_, mut writer) = Connection::local(server_pipe).split();
+        let mut client = Connection::local(client_pipe);
+        let mut player = PlayerSession::new([0.5, 64.0, 0.5], 1, 9);
+        player.inventory.insert_stack(&Stack::new(4, 5), 64);
+        player.inventory.content_packet();
+        let mut pending_keepalive = None;
+        let mut last_keepalive = Instant::now();
+
+        process_play_packet(
+            &mut writer,
+            play::Serverbound::ContainerClick(play::ContainerClick {
+                container: 0,
+                state: player.inventory.state_id(),
+                slot: 9,
+                button: 0,
+                input: 0,
+                changed: Vec::new(),
+                carried: None,
+            }),
+            &mut player,
+            &mut pending_keepalive,
+            &mut last_keepalive,
+            None,
+        )
+        .unwrap();
+        let snapshot = receive_clientbound(&mut client);
+        assert!(matches!(
+            snapshot,
+            play::Clientbound::ContainerSetContent(play::ContainerSetContent { items, carried: Some(stack), .. })
+                if items[9].is_none() && stack == Stack::new(4, 5)
+        ));
+
+        process_play_packet(
+            &mut writer,
+            play::Serverbound::ContainerClick(play::ContainerClick {
+                container: 0,
+                state: player.inventory.state_id(),
+                slot: 36,
+                button: 1,
+                input: 0,
+                changed: Vec::new(),
+                carried: None,
+            }),
+            &mut player,
+            &mut pending_keepalive,
+            &mut last_keepalive,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            receive_clientbound(&mut client),
+            play::Clientbound::ContainerSetContent(play::ContainerSetContent { items, carried: Some(stack), .. })
+                if items[36].as_ref().is_some_and(|stack| stack.count == 1)
+                    && stack.count == 4
+        ));
+    }
+
+    #[test]
+    fn offline_chat_is_echoed_without_ending_the_play_session() {
+        let (server_pipe, client_pipe) = Pipe::pair();
+        let (_, mut writer) = Connection::local(server_pipe).split();
+        let mut client = Connection::local(client_pipe);
+        let mut player = PlayerSession::new([0.5, 64.0, 0.5], 1, 9);
+        player.name = "BorizonTest".into();
+        let mut pending_keepalive = None;
+        let mut last_keepalive = Instant::now();
+
+        process_play_packet(
+            &mut writer,
+            play::Serverbound::Chat(play::Chat {
+                message: "hello".into(),
+                timestamp: 0,
+                salt: 0,
+                signature: None,
+                last_seen: play::LastSeenUpdate {
+                    offset: 0,
+                    acknowledged: [0; 3],
+                    checksum: 0,
+                },
+            }),
+            &mut player,
+            &mut pending_keepalive,
+            &mut last_keepalive,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            receive_clientbound(&mut client),
+            play::Clientbound::SystemChat(play::SystemChat {
+                content: horizon_world::nbt::Tag::String("<BorizonTest> hello".into()),
+                overlay: false,
+            })
+        );
+    }
+
+    #[test]
+    fn ordinary_empty_hand_play_packets_are_processed_without_dropping_session() {
+        let (server_pipe, client_pipe) = Pipe::pair();
+        let (_, mut writer) = Connection::local(server_pipe).split();
+        let mut client = Connection::local(client_pipe);
+        let mut player = PlayerSession::new([0.5, 64.0, 0.5], 1, 9);
+        player.loaded = true;
+        player.awaiting_teleport = None;
+        let mut pending_keepalive = None;
+        let mut last_keepalive = Instant::now();
+
+        process_play_packet(
+            &mut writer,
+            play::Serverbound::PlayerInput(play::PlayerInput { flags: 0x51 }),
+            &mut player,
+            &mut pending_keepalive,
+            &mut last_keepalive,
+            None,
+        )
+        .unwrap();
+        process_play_packet(
+            &mut writer,
+            play::Serverbound::PlayerCommand(play::PlayerCommand {
+                id: 9,
+                action: 1,
+                data: 0,
+            }),
+            &mut player,
+            &mut pending_keepalive,
+            &mut last_keepalive,
+            None,
+        )
+        .unwrap();
+        process_play_packet(
+            &mut writer,
+            play::Serverbound::SetCarriedItem(play::SetCarriedItem { slot: 4 }),
+            &mut player,
+            &mut pending_keepalive,
+            &mut last_keepalive,
+            None,
+        )
+        .unwrap();
+        assert_eq!(player.input_flags, 0x51);
+        assert!(player.sprinting);
+        assert_eq!(player.selected_slot, 4);
+
+        process_play_packet(
+            &mut writer,
+            play::Serverbound::UseItemOn(play::UseItemOn {
+                hand: 0,
+                pos: [0, 64, 0],
+                face: 1,
+                cursor: [0.5, 0.5, 0.5],
+                inside: true,
+                world_border: true,
+                sequence: 70,
+            }),
+            &mut player,
+            &mut pending_keepalive,
+            &mut last_keepalive,
+            None,
+        )
+        .unwrap();
+        process_play_packet(
+            &mut writer,
+            play::Serverbound::UseItem(play::UseItem {
+                hand: 0,
+                sequence: 71,
+                yaw: 0.0,
+                pitch: 0.0,
+            }),
+            &mut player,
+            &mut pending_keepalive,
+            &mut last_keepalive,
+            None,
+        )
+        .unwrap();
+        for sequence in [70, 71] {
+            assert_eq!(
+                receive_clientbound(&mut client),
+                play::Clientbound::BlockChangedAck(play::BlockChangedAck { sequence })
+            );
+        }
+
+        process_play_packet(
+            &mut writer,
+            play::Serverbound::SetCarriedItem(play::SetCarriedItem { slot: 9 }),
+            &mut player,
+            &mut pending_keepalive,
+            &mut last_keepalive,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            receive_clientbound(&mut client),
+            play::Clientbound::SetHeldSlot(play::SetHeldSlot { slot: 4 })
+        );
+    }
+
+    #[test]
     fn official_resources_build_complete_play_spawn_view() {
         let Some(resources_path) = std::env::var_os("BORIZON_SERVER_RESOURCES") else {
             eprintln!(
@@ -2007,6 +4588,25 @@ mod tests {
                 .expect("target belongs to a loaded generated chunk");
             save_runtime_dirty_chunks(&mut runtime, &resources).expect("save changed block state");
         }
+        world
+            .chunk_packet_cache
+            .lock()
+            .unwrap()
+            .remove(&target.chunk());
+        world
+            .prepare_chunk(target.chunk())
+            .expect("rebuild a missing packet snapshot for a resident chunk");
+        let rebuilt = world
+            .chunk_packet_cache
+            .lock()
+            .unwrap()
+            .get(&target.chunk())
+            .unwrap()
+            .clone();
+        assert_eq!(
+            packet_block_state(&rebuilt, target),
+            i32::try_from(air.0).unwrap()
+        );
         drop(world);
 
         let reopened = PreparedPlayWorld::build(resources, 0, &root)
@@ -2063,7 +4663,8 @@ mod tests {
         let proto = generator_worker
             .generate_proto(ChunkPos::new(0, 0))
             .expect("generate fixture chunk NBT");
-        let mut data = generated_chunk_data(&proto, &resources).expect("encode fixture chunk NBT");
+        let mut data = generated_chunk_data(&proto, &resources, None, false)
+            .expect("encode fixture chunk NBT");
         let air_tag = horizon_world::nbt::Tag::compound([(
             "id",
             horizon_world::nbt::Tag::String(horizon_world::nbt::JavaString::from("minecraft:air")),
@@ -2107,18 +4708,106 @@ mod tests {
             spawn,
             chunk_packets: Vec::new(),
             chunk_packet_cache: Mutex::new(HashMap::new()),
-            generator_worker: Some(Mutex::new(generator_worker)),
+            chunk_generation: None,
+            view_distance: DEFAULT_VIEW_DISTANCE,
+            simulation_distance: DEFAULT_SIMULATION_DISTANCE,
+            game_mode: 0,
+            difficulty: 1,
+            max_players: 20,
+            hardcore: false,
             runtime: Mutex::new(runtime),
             player_chunks: Mutex::new(HashMap::new()),
+            block_updates: Mutex::new(BlockUpdateLog::default()),
+            level_events: Mutex::new(LevelEventLog::default()),
+            item_entities: ItemEntityStore::default(),
+            loot_random: Mutex::new(LegacyRandom::new(0)),
         };
         PlayServer::tick_shared_world(&world, false)
             .expect("advance global and daylight clocks once through the server owner");
+        let (updates, _) = world
+            .block_updates_since(0)
+            .expect("initial resident block changes are published");
+        assert!(updates.iter().any(|update| update.pos == [0, 64, 0]));
         {
             let runtime = world.runtime.lock().unwrap();
             let dimension = runtime.dimension("minecraft:overworld").unwrap();
             assert_eq!(runtime.game_time(), 1);
             assert_eq!(dimension.day_time(), 1);
         }
+
+        // A Java client uses UseItemOn for an empty-hand door interaction.
+        // Exercise the real behaviour table through the PLAY packet path and
+        // verify the resulting state reaches the session's block-update stream.
+        let door_pos = BlockPos::new(0, 65, 1);
+        let door = world
+            .resources
+            .registry
+            .default_state("minecraft:oak_door")
+            .expect("vanilla oak-door state");
+        {
+            let mut runtime = world.runtime.lock().unwrap();
+            let resident = runtime
+                .dimension_mut("minecraft:overworld")
+                .unwrap()
+                .resident_mut();
+            assert_eq!(
+                resident.level_mut().set_raw(BlockPos::new(0, 64, 1), stone),
+                Some(air)
+            );
+            assert_eq!(resident.level_mut().set_raw(door_pos, door), Some(air));
+        }
+        let fixture_changes = world.runtime.lock().unwrap().take_block_changes();
+        world
+            .publish_block_changes(fixture_changes)
+            .expect("publish test door fixture state");
+        let (interaction_server_pipe, interaction_client_pipe) = Pipe::pair();
+        let (_, mut interaction_writer) = Connection::local(interaction_server_pipe).split();
+        let mut interaction_client = Connection::local(interaction_client_pipe);
+        let mut interactor = PlayerSession::new(spawn, 4, 12);
+        interactor.loaded = true;
+        interactor.awaiting_teleport = None;
+        interactor.sent_chunks.insert(ChunkPos::new(0, 0));
+        interactor.world_update_cursor = world.latest_block_update();
+        interactor.level_event_cursor = world.latest_level_event_sequence();
+        process_use_item_on(
+            &mut interaction_writer,
+            &mut interactor,
+            play::UseItemOn {
+                hand: 0,
+                pos: [door_pos.x, door_pos.y, door_pos.z],
+                face: 1,
+                cursor: [0.5, 0.5, 0.5],
+                inside: false,
+                world_border: false,
+                sequence: 42,
+            },
+            Some(&world),
+        )
+        .expect("process an empty-hand door interaction");
+        let (ack_id, ack_payload) = interaction_client.recv().unwrap();
+        assert_eq!(
+            play::Clientbound::decode(ack_id, &ack_payload).unwrap(),
+            play::Clientbound::BlockChangedAck(play::BlockChangedAck { sequence: 42 })
+        );
+        send_pending_block_updates(&mut interaction_writer, &mut interactor, &world)
+            .expect("publish the changed door state to its viewer");
+        let (update_id, update_payload) = interaction_client.recv().unwrap();
+        let opened_door = match play::Clientbound::decode(update_id, &update_payload).unwrap() {
+            play::Clientbound::BlockUpdate(update) => update,
+            packet => panic!("expected the door block update, got {packet:?}"),
+        };
+        assert_eq!(opened_door.pos, [door_pos.x, door_pos.y, door_pos.z]);
+        assert_ne!(opened_door.state, i32::try_from(door.0).unwrap());
+        let (sound_id, sound_payload) = interaction_client.recv().unwrap();
+        assert!(matches!(
+            play::Clientbound::decode(sound_id, &sound_payload).unwrap(),
+            play::Clientbound::Sound(play::Sound {
+                sound: (-1, Some((ref sound, None))),
+                source: 4,
+                ..
+            }) if sound == "minecraft:block.wooden_door.open"
+        ));
+
         PlayServer::tick_shared_world(&world, true)
             .expect("autosave chunks and SavedData through the server owner");
         let (movement_server_pipe, movement_client_pipe) = Pipe::pair();
@@ -2192,7 +4881,7 @@ mod tests {
         let mut blocked_streamer = PlayerSession::new([47.5, 65.0, 0.5], 3, 11);
         blocked_streamer.loaded = true;
         blocked_streamer.awaiting_teleport = None;
-        drop(world.generator_worker.take());
+        drop(world.chunk_generation.take());
         update_player_movement(
             &mut movement_writer,
             &mut blocked_streamer,
@@ -2242,6 +4931,7 @@ mod tests {
             through_powder_snow[0] > 2.49,
             "an empty-handed player without leather boots must not stand on powder snow: {through_powder_snow:?}"
         );
+        world.runtime.lock().unwrap().take_block_changes(); // fixture-only fluid placement, already present in the client view
         let facts = world.resources.behaviours.facts(stone);
         let correct_tool = facts.flags & state_flags::REQUIRES_TOOL == 0;
         let per_tick = player_mining::destroy_progress(
@@ -2255,6 +4945,8 @@ mod tests {
         let (_, mut writer) = Connection::local(server_pipe).split();
         let mut client = Connection::local(client_pipe);
         let mut player = PlayerSession::new(spawn, 1, 9);
+        player.world_update_cursor = world.latest_block_update();
+        player.level_event_cursor = world.latest_level_event_sequence();
         player.loaded = true;
         player.on_ground = true;
         player.awaiting_teleport = None;
@@ -2296,21 +4988,26 @@ mod tests {
             play::Clientbound::decode(ack_id, &ack_payload).unwrap(),
             play::Clientbound::BlockChangedAck(play::BlockChangedAck { sequence: 42 })
         );
-        let (update_id, update_payload) = client.recv().unwrap();
-        assert!(matches!(
-            play::Clientbound::decode(update_id, &update_payload).unwrap(),
-            play::Clientbound::BlockUpdate(_)
-        ));
         let (stage_id, stage_payload) = client.recv().unwrap();
         assert!(matches!(
             play::Clientbound::decode(stage_id, &stage_payload).unwrap(),
             play::Clientbound::BlockDestruction(play::BlockDestruction { progress: 255, .. })
+        ));
+        advance_player_mining(&mut writer, &mut player, Some(&world)).unwrap();
+        assert!(matches!(
+            receive_clientbound(&mut client),
+            play::Clientbound::BlockUpdate(_)
+        ));
+        assert!(matches!(
+            receive_clientbound(&mut client),
+            play::Clientbound::LevelEvent(play::LevelEvent { kind: 2001, .. })
         ));
         let after = world_block_state(&world, target);
         assert_eq!(after, air, "the PlayerAction flow must destroy the block");
         assert_ne!(stone, after);
 
         assert_eq!(set_world_block_state(&world, target, stone), Some(air));
+        world.runtime.lock().unwrap().take_block_changes(); // fixture reset before the next simulated client action
         process_player_action(
             &mut writer,
             &mut player,
@@ -2433,12 +5130,210 @@ mod tests {
         assert_eq!(world_block_state(&world, target), air);
         assert!(matches!(
             receive_clientbound(&mut client),
-            play::Clientbound::BlockUpdate(_)
+            play::Clientbound::BlockDestruction(play::BlockDestruction { progress: 255, .. })
         ));
         assert!(matches!(
             receive_clientbound(&mut client),
+            play::Clientbound::BlockUpdate(_)
+        ));
+
+        // A block with an ordinary loot table must create a server-owned item
+        // entity and replicate both its spawn and item stack to a loaded viewer.
+        let dirt = world
+            .resources
+            .registry
+            .default_state("minecraft:dirt")
+            .expect("vanilla dirt state");
+        assert_eq!(
+            set_world_block_state(&world, BlockPos::new(0, 63, 0), stone),
+            Some(air)
+        );
+        assert_eq!(set_world_block_state(&world, target, dirt), Some(air));
+        world.runtime.lock().unwrap().take_block_changes();
+        let (drop_server_pipe, drop_client_pipe) = Pipe::pair();
+        let (_, mut drop_writer) = Connection::local(drop_server_pipe).split();
+        let mut drop_client = Connection::local(drop_client_pipe);
+        let mut drop_viewer = PlayerSession::new(spawn, 5, 13);
+        drop_viewer.loaded = true;
+        drop_viewer.awaiting_teleport = None;
+        drop_viewer.world_update_cursor = world.latest_block_update();
+        drop_viewer.level_event_cursor = world.latest_level_event_sequence();
+        destroy_player_block(
+            &mut drop_writer,
+            &mut drop_viewer,
+            &world,
+            DiggingState {
+                pos: [target.x, target.y, target.z],
+                started_at: 0,
+                per_tick: 1.0,
+                progress: 1.0,
+            },
+        )
+        .expect("destroy dirt through the server loot path");
+        assert_eq!(world_block_state(&world, target), air);
+        assert_eq!(world.item_entities.all().len(), 1);
+        assert!(matches!(
+            receive_clientbound(&mut drop_client),
             play::Clientbound::BlockDestruction(play::BlockDestruction { progress: 255, .. })
         ));
+        sync_item_entities(&mut drop_writer, &mut drop_viewer, &world)
+            .expect("replicate dropped item to its loaded viewer");
+        let item_id = match receive_clientbound(&mut drop_client) {
+            play::Clientbound::AddEntity(packet) => packet.id,
+            packet => panic!("expected dropped item spawn, got {packet:?}"),
+        };
+        let item_stack_id = match receive_clientbound(&mut drop_client) {
+            play::Clientbound::SetEntityData(packet) if packet.id == item_id => {
+                match &packet.values[0].2 {
+                    EntityDataValue::Item(Some(stack)) => stack.item,
+                    value => panic!("expected item stack metadata, got {value:?}"),
+                }
+            }
+            packet => panic!("expected dropped item metadata, got {packet:?}"),
+        };
+        assert_eq!(
+            item_stack_id,
+            world.resources.item_ids.id("minecraft:dirt").unwrap()
+        );
+
+        for _ in 0..40 {
+            let runtime = world.runtime.lock().unwrap();
+            let resident = runtime.dimension("minecraft:overworld").unwrap().resident();
+            world
+                .item_entities
+                .tick(|item, wanted| {
+                    if !resident.level().is_loaded(BlockPos::new(
+                        item.position[0].floor() as i32,
+                        item.position[1].floor() as i32,
+                        item.position[2].floor() as i32,
+                    )) {
+                        return Ok(None);
+                    }
+                    match crate::play_collision::resolve_item_move(
+                        resident.level(),
+                        runtime
+                            .dimension("minecraft:overworld")
+                            .unwrap()
+                            .border()
+                            .geometry(),
+                        &world.resources,
+                        item.id,
+                        item.position,
+                        wanted,
+                        item.on_ground,
+                    ) {
+                        Ok(moved) => Ok(Some(moved)),
+                        Err(error) if error.contains("unloaded chunk") => Ok(None),
+                        Err(error) => Err(error),
+                    }
+                })
+                .expect("simulate a dropped item using official block collisions");
+        }
+        assert!(world.item_entities.all()[0].on_ground);
+        sync_item_entities(&mut drop_writer, &mut drop_viewer, &world)
+            .expect("collect the grounded item and synchronize inventory");
+        assert!(matches!(
+            receive_clientbound(&mut drop_client),
+            play::Clientbound::TakeItemEntity(play::TakeItemEntity {
+                item,
+                player: 13,
+                amount: 1,
+            }) if item == item_id
+        ));
+        assert!(matches!(
+            receive_clientbound(&mut drop_client),
+            play::Clientbound::ContainerSetContent(play::ContainerSetContent { items, .. })
+                if items[9].as_ref().is_some_and(|stack| {
+                    stack.item == item_stack_id && stack.count == 1
+                })
+        ));
+        assert!(matches!(
+            receive_clientbound(&mut drop_client),
+            play::Clientbound::RemoveEntities(play::RemoveEntities { ids })
+                if ids == vec![item_id]
+        ));
+        let mut click_keepalive = None;
+        let mut click_last_keepalive = Instant::now();
+        process_play_packet(
+            &mut drop_writer,
+            play::Serverbound::ContainerClick(play::ContainerClick {
+                container: 0,
+                state: drop_viewer.inventory.state_id(),
+                slot: 9,
+                button: 0,
+                input: 0,
+                changed: Vec::new(),
+                carried: None,
+            }),
+            &mut drop_viewer,
+            &mut click_keepalive,
+            &mut click_last_keepalive,
+            Some(&world),
+        )
+        .expect("pick up the collected block stack from storage");
+        assert!(matches!(
+            receive_clientbound(&mut drop_client),
+            play::Clientbound::ContainerSetContent(play::ContainerSetContent {
+                items,
+                carried: Some(stack),
+                ..
+            }) if items[9].is_none() && stack.item == item_stack_id
+        ));
+        process_play_packet(
+            &mut drop_writer,
+            play::Serverbound::ContainerClick(play::ContainerClick {
+                container: 0,
+                state: drop_viewer.inventory.state_id(),
+                slot: 36,
+                button: 0,
+                input: 0,
+                changed: Vec::new(),
+                carried: None,
+            }),
+            &mut drop_viewer,
+            &mut click_keepalive,
+            &mut click_last_keepalive,
+            Some(&world),
+        )
+        .expect("move the block stack to the selected hotbar slot");
+        assert!(matches!(
+            receive_clientbound(&mut drop_client),
+            play::Clientbound::ContainerSetContent(play::ContainerSetContent {
+                items,
+                carried: None,
+                ..
+            }) if items[36].as_ref().is_some_and(|stack| stack.item == item_stack_id)
+        ));
+        process_use_item_on(
+            &mut drop_writer,
+            &mut drop_viewer,
+            play::UseItemOn {
+                hand: 0,
+                pos: [0, 63, 0],
+                face: 5,
+                cursor: [0.5, 0.5, 0.5],
+                inside: false,
+                world_border: false,
+                sequence: 43,
+            },
+            Some(&world),
+        )
+        .expect("place the collected vanilla block item");
+        assert_eq!(
+            world_block_state(&world, BlockPos::new(1, 63, 0)),
+            dirt,
+            "BlockItem placement must use the vanilla behaviour table"
+        );
+        assert!(matches!(
+            receive_clientbound(&mut drop_client),
+            play::Clientbound::BlockChangedAck(play::BlockChangedAck { sequence: 43 })
+        ));
+        assert!(matches!(
+            receive_clientbound(&mut drop_client),
+            play::Clientbound::ContainerSetContent(play::ContainerSetContent { items, .. })
+                if items[36].is_none()
+        ));
+        assert!(world.item_entities.all().is_empty());
 
         // The fixture used several independent PlayerSession owners. Release
         // their ticket sources before the lifecycle assertions below.
@@ -2660,7 +5555,11 @@ mod tests {
                 },
                 [0.5, 64.0, 0.5],
                 1,
+                "TickClient".into(),
                 None,
+                DEFAULT_VIEW_DISTANCE,
+                DEFAULT_SIMULATION_DISTANCE,
+                ChunkPos::new(0, 0),
             )
         });
         let mut client = Connection::local(client_pipe);
@@ -2676,6 +5575,16 @@ mod tests {
                 .encode(),
             )
             .unwrap();
+        let (id, payload) = client.recv().unwrap();
+        assert!(matches!(
+            play::Clientbound::decode(id, &payload).unwrap(),
+            play::Clientbound::ContainerSetContent(play::ContainerSetContent {
+                container: 0,
+                items,
+                carried: None,
+                ..
+            }) if items.len() == crate::inventory::PLAYER_MENU_SLOTS
+        ));
         let (id, payload) = client.recv().unwrap();
         assert_eq!(
             play::Clientbound::decode(id, &payload).unwrap(),
@@ -2752,7 +5661,11 @@ mod tests {
                 },
                 [0.5, 64.0, 0.5],
                 1,
+                "IdleClient".into(),
                 None,
+                DEFAULT_VIEW_DISTANCE,
+                DEFAULT_SIMULATION_DISTANCE,
+                ChunkPos::new(0, 0),
             )
         });
         std::thread::sleep(Duration::from_millis(1200));

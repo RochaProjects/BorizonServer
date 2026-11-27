@@ -4,7 +4,10 @@
 //! entities, lighting, region-file ownership and durability policy remain with the
 //! caller. It makes it harder for the resident block store and scheduled tick owner
 //! to disagree about which chunks are loaded.
-use super::{Behaviours, LevelAccess, ResidentLevel, Ticks};
+use super::{
+    Behaviours, InteractionResult, LevelAccess, PlaceContext, PlaceOutcome, PlayerContext,
+    ResidentLevel, Ticks,
+};
 use crate::{
     chunk::ChunkData,
     compression::Compression,
@@ -13,6 +16,7 @@ use crate::{
     ticket_levels::{ChunkTickets, Sources},
 };
 use horizon_core::{
+    geometry::{Direction, Vec3},
     position::{BlockPos, ChunkPos},
     ticks::{SavedTick, TickTypeId},
 };
@@ -71,6 +75,36 @@ impl<'registry> ResidentDimension<'registry> {
 
     pub fn level_mut(&mut self) -> &mut ResidentLevel<'registry> {
         &mut self.level
+    }
+
+    /// Drain block mutations produced by this dimension since its last
+    /// publication pass.
+    pub fn take_block_changes(&mut self) -> Vec<(BlockPos, crate::registry::BlockStateId)> {
+        self.level.take_block_changes()
+    }
+
+    /// Drain simulation side effects from this dimension.
+    pub fn take_events(&mut self) -> Vec<super::LevelEvent> {
+        self.level.take_events()
+    }
+
+    /// Run a block's vanilla empty-hand interaction against this dimension's
+    /// paired level and scheduled-tick owner.
+    pub fn use_without_item(
+        &mut self,
+        behaviours: &Behaviours,
+        pos: BlockPos,
+        face: Direction,
+        hit: Vec3,
+        player: PlayerContext,
+    ) -> InteractionResult {
+        behaviours.use_without_item(&mut self.level, &mut self.ticks, pos, face, hit, player)
+    }
+
+    /// Run vanilla `BlockItem.place` against this dimension's paired resident
+    /// level and scheduled-tick owner.
+    pub fn place_block(&mut self, behaviours: &Behaviours, context: &PlaceContext) -> PlaceOutcome {
+        behaviours.place_block(&mut self.level, &mut self.ticks, context)
     }
 
     pub fn ticks(&self) -> &Ticks {

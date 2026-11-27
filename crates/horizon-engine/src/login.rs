@@ -1,16 +1,17 @@
-//! Vanilla offline-mode LOGIN and the CONFIGURATION exchange.
+//! Vanilla online/offline LOGIN and the CONFIGURATION exchange.
 //!
-//! This module stops before PLAY: world ownership, player admission and the
-//! initial chunk/light stream are still not implemented by the engine.
+//! PLAY starts after this module returns: world ownership, player admission
+//! and the initial chunk/light stream are handled by the extracted engine.
 
 use crate::registry_sync::RegistryBundle;
 use horizon_protocol::{
     connection::Connection,
-    crypto::offline_uuid,
+    crypto::{self, offline_uuid},
     packets::{
         configuration, handshake,
-        login::{self, GameProfile, Property},
+        login::{self, GameProfile},
     },
+    rsa::RsaPrivateKey,
 };
 
 const PROTOCOL_VERSION: i32 = 777;
@@ -28,9 +29,30 @@ pub struct ConfiguredConnection {
     pub client_information: Option<configuration::ClientInformation>,
 }
 
-/// Complete the 26.3 handshake, offline LOGIN and vanilla CONFIGURATION.
-/// This is only a connection primitive; callers must not announce the player
-/// as joined until a PLAY runtime has admitted and initialized the session.
+/// Minecraft's online-mode RSA key and session-service verification policy.
+pub struct OnlineAuthenticator {
+    key: RsaPrivateKey,
+    public_key: Vec<u8>,
+    prevent_proxy_connections: bool,
+}
+
+impl OnlineAuthenticator {
+    pub fn generate(prevent_proxy_connections: bool) -> Result<Self, String> {
+        let key = RsaPrivateKey::generate(1024)
+            .map_err(|error| format!("generate online-mode RSA key: {error}"))?;
+        let public_key = key.public_der();
+        Ok(Self {
+            key,
+            public_key,
+            prevent_proxy_connections,
+        })
+    }
+}
+
+/// Complete the 26.3 handshake, LOGIN and vanilla CONFIGURATION. When an
+/// online authenticator is configured, verify the account through Mojang's
+/// session service before returning the connection. Callers must not announce
+/// the player as joined until a PLAY runtime has admitted the session.
 pub fn login_and_configure(
     mut connection: Connection,
     registries: &RegistryBundle,
@@ -38,7 +60,7 @@ pub fn login_and_configure(
     let (id, payload) = connection.recv().map_err(|error| error.to_string())?;
     let intention = handshake::decode_intention(id, &payload, 255)
         .map_err(|error| format!("decode Minecraft handshake: {error}"))?;
-    login_after_intention(connection, intention, registries)
+    login_after_intention(connection, intention, registries, None, None)
 }
 
 /// Continue a real TCP session after its handshake has been consumed by a
@@ -47,6 +69,8 @@ pub(crate) fn login_after_intention(
     mut connection: Connection,
     intention: handshake::Intention,
     registries: &RegistryBundle,
+    online: Option<&OnlineAuthenticator>,
+    remote_ip: Option<std::net::IpAddr>,
 ) -> Result<ConfiguredConnection, String> {
     if intention.protocol != PROTOCOL_VERSION {
         return Err(format!(
@@ -66,9 +90,83 @@ pub(crate) fn login_after_intention(
         packet => return Err(format!("expected login hello, got {}", packet.name())),
     };
     validate_username(&hello.name)?;
-    let profile = OfflineProfile {
-        uuid: offline_uuid(&hello.name),
-        name: hello.name,
+    let (profile, properties) = if let Some(online) = online {
+        let mut challenge = [0u8; 4];
+        crypto::random_bytes(&mut challenge).map_err(|error| error.to_string())?;
+        connection
+            .send(
+                &login::Clientbound::Hello(login::Hello {
+                    server_id: String::new(),
+                    public_key: online.public_key.clone(),
+                    challenge: challenge.to_vec(),
+                    should_authenticate: true,
+                })
+                .encode(),
+            )
+            .map_err(|error| format!("send online-mode encryption request: {error}"))?;
+        let (id, payload) = connection
+            .recv()
+            .map_err(|error| format!("receive online-mode encryption response: {error}"))?;
+        let key = match login::Serverbound::decode(id, &payload)
+            .map_err(|error| format!("decode online-mode encryption response: {error}"))?
+        {
+            login::Serverbound::Key(key) => key,
+            packet => {
+                return Err(format!(
+                    "expected online-mode encryption response, got {}",
+                    packet.name()
+                ));
+            }
+        };
+        let decrypted_challenge = online
+            .key
+            .decrypt(&key.challenge)
+            .map_err(|_| "online-mode challenge decryption failed".to_owned())?;
+        if decrypted_challenge != challenge {
+            return Err("online-mode challenge did not match".into());
+        }
+        let secret: [u8; 16] = online
+            .key
+            .decrypt(&key.key)
+            .map_err(|_| "online-mode secret decryption failed".to_owned())?
+            .try_into()
+            .map_err(|_| "online-mode secret had an invalid length".to_owned())?;
+        let server_hash = crypto::server_hash("", &secret, &online.public_key);
+        connection.enable_encryption(&secret);
+        let ip = online
+            .prevent_proxy_connections
+            .then_some(remote_ip)
+            .flatten();
+        let joined = match horizon_server_files::profiles::has_joined(&hello.name, &server_hash, ip)
+        {
+            Ok(Some(profile)) => profile,
+            Ok(None) => {
+                send_login_disconnect(
+                    &mut connection,
+                    "multiplayer.disconnect.unverified_username",
+                );
+                return Err("Minecraft session service did not verify this player".into());
+            }
+            Err(error) => {
+                send_login_disconnect(&mut connection, "multiplayer.disconnect.authservers_down");
+                return Err(error);
+            }
+        };
+        (
+            OfflineProfile {
+                uuid: joined.id,
+                name: joined.name,
+            },
+            joined.properties,
+        )
+    } else {
+        (
+            OfflineProfile {
+                uuid: offline_uuid(&hello.name),
+                name: hello.name,
+            },
+            Vec::new(),
+        )
     };
     let session_id = random_session_uuid();
     connection
@@ -77,7 +175,7 @@ pub(crate) fn login_after_intention(
                 profile: GameProfile {
                     uuid: profile.uuid,
                     name: profile.name.clone(),
-                    properties: Vec::<Property>::new(),
+                    properties,
                 },
                 session: session_id,
             })
@@ -166,6 +264,12 @@ pub(crate) fn login_after_intention(
         }
     }
     Err("too many CONFIGURATION packets before client finished".into())
+}
+
+fn send_login_disconnect(connection: &mut Connection, translation: &str) {
+    let reason_json = serde_json::json!({"translate": translation}).to_string();
+    let packet = login::Clientbound::Disconnect(login::Disconnect { reason_json });
+    let _ = connection.send(&packet.encode());
 }
 
 fn validate_username(name: &str) -> Result<(), String> {

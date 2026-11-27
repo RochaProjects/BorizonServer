@@ -251,6 +251,47 @@ impl<'registry> WorldDimension<'registry> {
         self.active.get(&position)
     }
 
+    /// Read the complete saved NBT payload owned by this dimension, whether
+    /// the chunk is resident or parked outside its current FULL tickets.
+    pub fn retained_chunk_data(&self, position: ChunkPos) -> Option<&ChunkData> {
+        self.active
+            .get(&position)
+            .or_else(|| self.parked.get(&position))
+    }
+
+    /// Apply persisted block-entity changes to a retained chunk and ensure an
+    /// active resident chunk is included in the next dirty save sweep.
+    pub fn update_block_entities(
+        &mut self,
+        position: ChunkPos,
+        updates: impl IntoIterator<
+            Item = (
+                horizon_core::position::BlockPos,
+                Option<crate::nbt::Compound>,
+            ),
+        >,
+    ) -> io::Result<()> {
+        let active = if let Some(data) = self.active.get_mut(&position) {
+            data.set_block_entity_updates(updates)?;
+            true
+        } else if let Some(data) = self.parked.get_mut(&position) {
+            data.set_block_entity_updates(updates)?;
+            false
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "chunk is not retained",
+            ));
+        };
+        if active && !self.resident.level_mut().mark_chunk_dirty(position) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "chunk is not resident",
+            ));
+        }
+        Ok(())
+    }
+
     /// Insert a newly generated chunk into resident block/tick state and retain
     /// its NBT record as dirty for a later caller-triggered region save.
     pub fn insert_generated_chunk(
@@ -650,6 +691,9 @@ impl<'registry> LocalWorldRuntime<'registry> {
     pub fn advance_game_time(&mut self) -> i64 {
         let game_time = self.game_time().wrapping_add(1);
         self.set_game_time(game_time);
+        for dimension in self.dimensions.values_mut() {
+            dimension.border.tick();
+        }
         game_time
     }
 
@@ -689,6 +733,52 @@ impl<'registry> LocalWorldRuntime<'registry> {
         for dimension in self.dimensions.values_mut() {
             dimension.resident_mut().run_block_events(behaviours);
         }
+    }
+
+    /// Drain authoritative block-state mutations from all dimensions in
+    /// deterministic dimension order. Server transports publish this after
+    /// each world tick so every connected client observes the same state.
+    pub fn take_block_changes(
+        &mut self,
+    ) -> Vec<(
+        String,
+        horizon_core::position::BlockPos,
+        crate::registry::BlockStateId,
+    )> {
+        let mut changes = Vec::new();
+        let mut keys = self.dimensions.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        for key in keys {
+            if let Some(dimension) = self.dimensions.get_mut(&key) {
+                changes.extend(
+                    dimension
+                        .resident_mut()
+                        .take_block_changes()
+                        .into_iter()
+                        .map(|(pos, state)| (key.clone(), pos, state)),
+                );
+            }
+        }
+        changes
+    }
+
+    /// Drain level events in deterministic dimension and emission order.
+    pub fn take_level_events(&mut self) -> Vec<(String, crate::level::LevelEvent)> {
+        let mut events = Vec::new();
+        let mut keys = self.dimensions.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        for key in keys {
+            if let Some(dimension) = self.dimensions.get_mut(&key) {
+                events.extend(
+                    dimension
+                        .resident_mut()
+                        .take_events()
+                        .into_iter()
+                        .map(|event| (key.clone(), event)),
+                );
+            }
+        }
+        events
     }
 
     pub fn dimension(&self, key: &str) -> Option<&WorldDimension<'registry>> {

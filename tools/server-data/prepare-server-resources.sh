@@ -36,6 +36,7 @@ PY
 "$tool_dir/export-server-block-data.sh" "$server_jar" "$libraries_dir" "$resources_dir"
 "$tool_dir/export-registry-sync.sh" "$server_jar" "$libraries_dir" "$resources_dir"
 "$tool_dir/export-worldgen-blocks.sh" "$server_jar" "$libraries_dir" "$resources_dir"
+"$tool_dir/export-gameplay-data.py" "$server_jar" "$resources_dir"
 cp "$resources_dir/worldgen/blocks/cached-collision.nbt" "$resources_dir/cached-collision.nbt"
 
 echo "Vanilla 26.3 server resource inputs prepared at $resources_dir"

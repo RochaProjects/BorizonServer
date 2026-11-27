@@ -2,6 +2,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -11,9 +12,13 @@ import net.minecraft.SharedConstants;
 import net.minecraft.commands.Commands;
 import net.minecraft.core.Registry;
 import net.minecraft.core.RegistrySynchronization;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtIo;
 import net.minecraft.nbt.NbtOps;
+import com.mojang.serialization.DynamicOps;
+import com.mojang.serialization.JsonOps;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.tags.TagNetworkSerialization;
 import net.minecraft.server.Bootstrap;
@@ -22,6 +27,9 @@ import net.minecraft.server.WorldLoader;
 import net.minecraft.server.packs.repository.PackRepository;
 import net.minecraft.server.packs.repository.ServerPacksSource;
 import net.minecraft.server.permissions.PermissionSet;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.enchantment.Enchantable;
+import net.minecraft.world.item.component.Tool;
 import net.minecraft.world.level.WorldDataConfiguration;
 
 /** Emits the exact dynamic registry payloads used by the 26.3 server's config packets. */
@@ -74,6 +82,10 @@ public final class RegistryBundleExporter {
                     "expected " + EXPECTED_REGISTRIES + " synchronized registries, found "
                         + registryPayloads.size());
               }
+
+              exportItemDefaults(
+                  output,
+                  registries.compositeAccess().createSerializationContext(JsonOps.INSTANCE));
 
               int entryCount = 0;
               JsonObject registryOrder = new JsonObject();
@@ -139,5 +151,46 @@ public final class RegistryBundleExporter {
             Runnable::run,
             Runnable::run)
         .join();
+  }
+
+  /**
+   * Uses component defaults bound by the same WorldLoader pass as the live
+   * server. The engine needs these gameplay values for item stacks and loot;
+   * visual item models and assets are deliberately excluded.
+   */
+  private static void exportItemDefaults(Path output, DynamicOps<JsonElement> ops) {
+    var items = new java.util.TreeMap<String, JsonObject>();
+    for (var id : BuiltInRegistries.ITEM.keySet()) {
+      ItemStack stack = BuiltInRegistries.ITEM.getValue(id).getDefaultInstance();
+      var components = new JsonObject();
+      Integer maxStack = stack.get(DataComponents.MAX_STACK_SIZE);
+      Integer maxDamage = stack.get(DataComponents.MAX_DAMAGE);
+      Enchantable enchantable = stack.get(DataComponents.ENCHANTABLE);
+      Tool tool = stack.get(DataComponents.TOOL);
+      if (maxStack != null) components.addProperty("minecraft:max_stack_size", maxStack);
+      if (maxDamage != null) components.addProperty("minecraft:max_damage", maxDamage);
+      if (enchantable != null) {
+        var value = new JsonObject();
+        value.addProperty("value", enchantable.value());
+        components.add("minecraft:enchantable", value);
+      }
+      if (tool != null) {
+        components.add(
+            "minecraft:tool",
+            Tool.CODEC.encodeStart(ops, tool)
+                .getOrThrow(exception -> new IllegalStateException(
+                    "could not encode the default tool component for " + id + ": " + exception)));
+      }
+      items.put(id.toString(), components);
+    }
+    if (items.isEmpty() || !items.containsKey("minecraft:air")) {
+      throw new IllegalStateException("vanilla item registry did not bind default components");
+    }
+    try {
+      Files.writeString(output.resolve("items.json"), new Gson().toJson(items));
+    } catch (java.io.IOException exception) {
+      throw new RuntimeException("could not write vanilla item defaults", exception);
+    }
+    System.out.println("Exported default gameplay components for " + items.size() + " vanilla items");
   }
 }

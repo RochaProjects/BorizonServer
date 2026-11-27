@@ -116,7 +116,8 @@ impl ExplorationMap {
     }
 }
 impl LootStack {
-    fn new(item: &str) -> Self {
+    /// A plain stack used as a tool context by server gameplay owners.
+    pub fn new(item: &str) -> Self {
         Self {
             item: item.to_owned(),
             count: 1,
@@ -140,11 +141,34 @@ impl LootStack {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct ItemFacts {
     max_stack: i32,
     max_damage: i32,
     enchantable: Option<i32>,
+    tool: Option<ToolFacts>,
+}
+#[derive(Clone, Debug, Default)]
+struct ToolFacts {
+    rules: Vec<ToolRule>,
+    default_mining_speed: f32,
+    damage_per_block: i32,
+}
+#[derive(Clone, Debug)]
+struct ToolRule {
+    blocks: Vec<String>,
+    speed: Option<f32>,
+    correct_for_drops: Option<bool>,
+}
+impl ToolFacts {
+    fn matching_rule<'a>(&'a self, data: &LootData, block: &str) -> Option<&'a ToolRule> {
+        self.rules.iter().find(|rule| {
+            rule.blocks.iter().any(|spec| match spec.strip_prefix('#') {
+                Some(tag) => data.in_tag("block", tag, block),
+                None => spec == block,
+            })
+        })
+    }
 }
 #[derive(Debug)]
 struct Enchantment {
@@ -237,6 +261,17 @@ pub struct LootDamage {
     pub source: Option<LootEntity>,
     /// `getDirectEntity`: the projectile, or the attacker itself.
     pub direct: Option<LootEntity>,
+}
+/// Server context for a block loot table, sourced from the authoritative
+/// block state, biome, held stack and optional explosion.
+#[derive(Clone, Debug, Default)]
+pub struct BlockLootContext {
+    pub block: String,
+    pub properties: HashMap<String, String>,
+    pub tool: Option<LootStack>,
+    pub biome: Option<String>,
+    /// `None` means the block was not destroyed by an explosion.
+    pub explosion_radius: Option<f32>,
 }
 /// The parameters of `LivingEntity.dropFromLootTable`.
 #[derive(Clone, Debug, Default)]
@@ -666,6 +701,31 @@ impl LootData {
                         enchantable: c["minecraft:enchantable"]["value"]
                             .as_i64()
                             .map(|v| v as i32),
+                        tool: c.get("minecraft:tool").map(|tool| ToolFacts {
+                            rules: tool["rules"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .map(|rule| ToolRule {
+                                    blocks: match &rule["blocks"] {
+                                        Value::String(block) => vec![block.clone()],
+                                        Value::Array(blocks) => blocks
+                                            .iter()
+                                            .filter_map(Value::as_str)
+                                            .map(str::to_owned)
+                                            .collect(),
+                                        _ => Vec::new(),
+                                    },
+                                    speed: rule["speed"].as_f64().map(|speed| speed as f32),
+                                    correct_for_drops: rule["correct_for_drops"].as_bool(),
+                                })
+                                .collect(),
+                            default_mining_speed: tool["default_mining_speed"]
+                                .as_f64()
+                                .unwrap_or(1.0)
+                                as f32,
+                            damage_per_block: tool["damage_per_block"].as_i64().unwrap_or(1) as i32,
+                        }),
                     },
                 )
             })
@@ -706,6 +766,7 @@ impl LootData {
         let mut tags = HashMap::new();
         for registry in [
             "item",
+            "block",
             "enchantment",
             "instrument",
             "entity_type",
@@ -765,6 +826,10 @@ impl LootData {
     pub fn has_table(&self, table: &str) -> bool {
         self.tables.contains_key(table)
     }
+    /// Number of vanilla/data-pack loot tables loaded from the resource stack.
+    pub fn table_count(&self) -> usize {
+        self.tables.len()
+    }
     /// The table's `random_sequence` (where `getRandomItems` draws from).
     pub fn random_sequence(&self, table: &str) -> Option<&str> {
         self.tables.get(table)?["random_sequence"].as_str()
@@ -774,6 +839,33 @@ impl LootData {
     }
     pub fn max_damage(&self, item: &str) -> i32 {
         self.facts(item).max_damage
+    }
+    /// The default `Tool.getMiningSpeed` behavior for this item's vanilla
+    /// component, resolving item rules against the loaded vanilla block tags.
+    /// Stack-level component overrides are applied by the player inventory
+    /// layer when it is connected to PLAY.
+    pub fn mining_speed(&self, item: Option<&str>, block: &str) -> f32 {
+        let Some(tool) = item.and_then(|item| self.facts(item).tool) else {
+            return 1.0;
+        };
+        tool.matching_rule(self, block)
+            .and_then(|rule| rule.speed)
+            .unwrap_or(tool.default_mining_speed)
+    }
+    /// `Tool.isCorrectForDrops` for the item's vanilla default component.
+    pub fn correct_tool_for_drops(&self, item: Option<&str>, block: &str) -> bool {
+        item.and_then(|item| self.facts(item).tool)
+            .and_then(|tool| {
+                tool.matching_rule(self, block)
+                    .and_then(|rule| rule.correct_for_drops)
+            })
+            .unwrap_or(false)
+    }
+    /// `Tool.damage_per_block`, defaulting to one for tool components.
+    pub fn tool_damage_per_block(&self, item: &str) -> Option<i32> {
+        self.facts(item)
+            .tool
+            .map(|tool| tool.damage_per_block.max(0))
     }
     /// Whether a registry tag (`entity_type`, `damage_type`, `item`...) holds `id`.
     pub fn in_tag(&self, registry: &str, tag: &str, id: &str) -> bool {
@@ -822,6 +914,7 @@ impl LootData {
             luck: 0.0,
             open_water: None,
             entity: Some(&damage_params),
+            block: None,
         };
         let mut chance = chance;
         c.equipment_drops(&params.this, "victim", &mut chance);
@@ -881,7 +974,7 @@ impl LootData {
         self.holder_set("item", set).iter().any(|i| i == item)
     }
     fn facts(&self, item: &str) -> ItemFacts {
-        self.items.get(item).copied().unwrap_or(ItemFacts {
+        self.items.get(item).cloned().unwrap_or(ItemFacts {
             max_stack: 64,
             ..ItemFacts::default()
         })
@@ -908,6 +1001,7 @@ impl LootData {
             luck,
             open_water,
             entity: None,
+            block: None,
         };
         let mut items = Vec::new();
         c.table_raw(table, json, &mut |c, stack| c.data.split(stack, &mut items));
@@ -934,6 +1028,7 @@ impl LootData {
             luck: params.luck,
             open_water: None,
             entity: Some(params),
+            block: None,
         };
         let mut items = Vec::new();
         c.table_raw(table, json, &mut |c, stack| c.data.split(stack, &mut items));
@@ -959,6 +1054,33 @@ impl LootData {
             luck: 0.0,
             open_water: None,
             entity: None,
+            block: None,
+        };
+        let mut items = Vec::new();
+        c.table_raw(table, json, &mut |c, stack| c.data.split(stack, &mut items));
+        *random = c.random;
+        items
+    }
+    /// `Block.getDrops`: evaluate a block loot table with its live state and
+    /// tool instead of the empty context used by generic table rolls.
+    pub fn roll_block<R: RandomSource + Clone>(
+        &self,
+        table: &str,
+        random: &mut R,
+        block: &BlockLootContext,
+    ) -> Vec<LootStack> {
+        let Some(json) = self.tables.get(table) else {
+            return Vec::new();
+        };
+        let mut c = Context {
+            data: self,
+            random: random.clone(),
+            biome: block.biome.as_deref(),
+            visited: Vec::new(),
+            luck: 0.0,
+            open_water: None,
+            entity: None,
+            block: Some(block),
         };
         let mut items = Vec::new();
         c.table_raw(table, json, &mut |c, stack| c.data.split(stack, &mut items));
@@ -1013,6 +1135,7 @@ impl LootData {
             luck: 0.0,
             open_water: None,
             entity: None,
+            block: None,
         };
         let mut items = Vec::new();
         c.table_raw(table, json, &mut |c, stack| c.data.split(stack, &mut items));
@@ -1105,6 +1228,7 @@ struct Context<'a, R> {
     open_water: Option<bool>,
     /// The entity, damage source and killer parameters.
     entity: Option<&'a EntityLootParams>,
+    block: Option<&'a BlockLootContext>,
 }
 type Sink<'s, R> = dyn FnMut(&mut Context<'_, R>, LootStack) + 's;
 
@@ -1305,6 +1429,32 @@ impl<R: RandomSource> Context<'_, R> {
                             .any(|b| b == biome),
                     }
                 }
+                "minecraft:match_tool" => self
+                    .block
+                    .and_then(|block| block.tool.as_ref())
+                    .is_some_and(|tool| data.item_matches(&c["predicate"], tool)),
+                "minecraft:block_state_property" => {
+                    let Some(block) = self.block else {
+                        return false;
+                    };
+                    c["block"].as_str().is_none_or(|id| id == block.block)
+                        && c["properties"].as_object().is_none_or(|properties| {
+                            properties.iter().all(|(name, value)| {
+                                value.as_str().is_some_and(|value| {
+                                    block
+                                        .properties
+                                        .get(name)
+                                        .is_some_and(|actual| actual == value)
+                                })
+                            })
+                        })
+                }
+                "minecraft:survives_explosion" => {
+                    let Some(radius) = self.block.and_then(|block| block.explosion_radius) else {
+                        return true;
+                    };
+                    radius <= 1.0 || self.random.next_float() <= 1.0 / radius
+                }
                 // An unknown type fails, as in items.rs `condition`.
                 _ => false,
             },
@@ -1345,6 +1495,15 @@ impl<R: RandomSource> Context<'_, R> {
                     0
                 };
                 stack.count = base + self.int(&f["count"]);
+            }
+            "minecraft:explosion_decay" => {
+                if let Some(radius) = self.block.and_then(|block| block.explosion_radius)
+                    && radius > 1.0
+                {
+                    stack.count = (0..stack.get_count())
+                        .filter(|_| self.random.next_float() <= 1.0 / radius)
+                        .count() as i32;
+                }
             }
             "minecraft:limit_count" => {
                 let limit = &f["limit"];
@@ -2124,6 +2283,112 @@ mod namespace_tests {
         let count: i32 = filled.iter().flatten().map(|s| s.count).sum();
         assert_eq!(count, 3);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn block_loot_uses_tool_and_live_block_state_context() {
+        let root = std::env::temp_dir().join(format!("horizon-block-loot-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let files = [
+            (
+                "items.json",
+                r#"{"minecraft:air":{},"minecraft:stone":{"minecraft:max_stack_size":64},"minecraft:cobblestone":{"minecraft:max_stack_size":64},"minecraft:oak_log":{"minecraft:max_stack_size":64}}"#,
+            ),
+            (
+                "data/minecraft/loot_table/blocks/stone.json",
+                r#"{"pools":[{"rolls":1,"entries":[{"type":"minecraft:alternatives","children":[{"type":"minecraft:item","condition":"minecraft:tool/can_silk_touch","name":"minecraft:stone"},{"type":"minecraft:item","condition":{"type":"minecraft:survives_explosion"},"name":"minecraft:cobblestone"}]}]}]}"#,
+            ),
+            (
+                "data/minecraft/loot_table/blocks/oak_log.json",
+                r#"{"pools":[{"rolls":1,"entries":[{"type":"minecraft:item","condition":{"type":"minecraft:block_state_property","block":"minecraft:oak_log","properties":{"axis":"y"}},"name":"minecraft:oak_log"}]}]}"#,
+            ),
+            (
+                "data/minecraft/predicate/tool/can_silk_touch.json",
+                r#"{"type":"minecraft:match_tool","predicate":{"predicates":{"minecraft:enchantments":[{"enchantments":"minecraft:silk_touch","levels":{"min":1}}]}}}"#,
+            ),
+        ];
+        for (name, text) in files {
+            let path = root.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        let data = LootData::load(&root, &PackOverlay::NONE).unwrap();
+        let mut random = LegacyRandom::new(41);
+        let empty_hand = BlockLootContext {
+            block: "minecraft:stone".into(),
+            ..BlockLootContext::default()
+        };
+        assert_eq!(
+            data.roll_block("minecraft:blocks/stone", &mut random, &empty_hand)[0].item,
+            "minecraft:cobblestone"
+        );
+
+        let mut silk_tool = LootStack::new("minecraft:diamond_pickaxe");
+        silk_tool
+            .enchantments
+            .push(("minecraft:silk_touch".into(), 1));
+        let silk_hand = BlockLootContext {
+            block: "minecraft:stone".into(),
+            tool: Some(silk_tool),
+            ..BlockLootContext::default()
+        };
+        assert_eq!(
+            data.roll_block("minecraft:blocks/stone", &mut random, &silk_hand)[0].item,
+            "minecraft:stone"
+        );
+
+        let log = BlockLootContext {
+            block: "minecraft:oak_log".into(),
+            properties: [("axis".into(), "y".into())].into(),
+            ..BlockLootContext::default()
+        };
+        assert_eq!(
+            data.roll_block("minecraft:blocks/oak_log", &mut random, &log)[0].item,
+            "minecraft:oak_log"
+        );
+        let wrong_axis = BlockLootContext {
+            properties: [("axis".into(), "x".into())].into(),
+            ..log
+        };
+        assert!(
+            data.roll_block("minecraft:blocks/oak_log", &mut random, &wrong_axis)
+                .is_empty()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn official_26_3_stone_loot_uses_real_vanilla_predicates() {
+        let Some(root) = std::env::var_os("BORIZON_SERVER_RESOURCES") else {
+            return;
+        };
+        let data = LootData::load(&Path::new(&root), &PackOverlay::NONE).unwrap();
+        assert_eq!(
+            data.mining_speed(Some("minecraft:diamond_pickaxe"), "minecraft:stone"),
+            8.0
+        );
+        assert!(data.correct_tool_for_drops(Some("minecraft:diamond_pickaxe"), "minecraft:stone"));
+        assert_eq!(data.mining_speed(None, "minecraft:stone"), 1.0);
+        assert!(!data.correct_tool_for_drops(None, "minecraft:stone"));
+        let mut random = LegacyRandom::new(41);
+        let hand = BlockLootContext {
+            block: "minecraft:stone".into(),
+            ..BlockLootContext::default()
+        };
+        assert_eq!(
+            data.roll_block("minecraft:blocks/stone", &mut random, &hand)[0].item,
+            "minecraft:cobblestone"
+        );
+        let mut silk = LootStack::new("minecraft:diamond_pickaxe");
+        silk.enchantments.push(("minecraft:silk_touch".into(), 1));
+        let hand = BlockLootContext {
+            tool: Some(silk),
+            ..hand
+        };
+        assert_eq!(
+            data.roll_block("minecraft:blocks/stone", &mut random, &hand)[0].item,
+            "minecraft:stone"
+        );
     }
 
     /// `SetCustomModelDataFunction`: each of the model data's four lists goes

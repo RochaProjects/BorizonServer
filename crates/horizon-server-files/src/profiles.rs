@@ -6,7 +6,7 @@ use crate::{
     json::{self, Json},
     user_lists::NameAndId,
 };
-use horizon_protocol::rsa::RsaPublicKey;
+use horizon_protocol::{packets::login::Property, rsa::RsaPublicKey};
 use std::time::Duration;
 
 /// Mojang's services discovery document.
@@ -71,6 +71,173 @@ pub fn find_by_id(discovery: &str, id: u128) -> Option<NameAndId> {
         .ok()?;
     let name = json::parse(&answer, true).ok()?.get("name")?.as_string()?;
     found(&answer, &name).filter(|user| user.id == id)
+}
+
+/// A profile verified by Minecraft's session service after an online-mode
+/// encryption challenge.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JoinedProfile {
+    pub id: u128,
+    pub name: String,
+    pub properties: Vec<Property>,
+}
+
+enum VerificationError {
+    Unavailable(String),
+    InvalidResponse(String),
+}
+
+/// MinecraftServicesSessionService.hasJoinedServer. A missing profile means
+/// the client did not authenticate this username for this server hash; an
+/// error means the service could not be reached or its response was invalid.
+pub fn has_joined(
+    name: &str,
+    server_hash: &str,
+    ip: Option<std::net::IpAddr>,
+) -> Result<Option<JoinedProfile>, String> {
+    match has_joined_once(name, server_hash, ip) {
+        Err(VerificationError::Unavailable(_)) => {
+            std::thread::sleep(Duration::from_millis(500));
+            has_joined_once(name, server_hash, ip).map_err(VerificationError::message)
+        }
+        Ok(profile) => Ok(profile),
+        Err(error) => Err(error.message()),
+    }
+}
+
+fn has_joined_once(
+    name: &str,
+    server_hash: &str,
+    ip: Option<std::net::IpAddr>,
+) -> Result<Option<JoinedProfile>, VerificationError> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(15))
+        .user_agent(&format!("Horizon/{}", horizon_core::release::VERSION))
+        .build();
+    let discovery = json::parse(
+        &agent
+            .get(&discovery_url())
+            .call()
+            .map_err(|error| {
+                VerificationError::Unavailable(format!(
+                    "Minecraft Services discovery request failed: {error}"
+                ))
+            })?
+            .into_string()
+            .map_err(|error| {
+                VerificationError::Unavailable(format!(
+                    "read Minecraft Services discovery response: {error}"
+                ))
+            })?,
+        true,
+    )
+    .map_err(|error| {
+        VerificationError::InvalidResponse(format!(
+            "parse Minecraft Services discovery response: {error}"
+        ))
+    })?;
+    let endpoint = endpoint(&discovery, "session", "verify").ok_or_else(|| {
+        VerificationError::InvalidResponse(
+            "Minecraft Services discovery has no session verification endpoint".into(),
+        )
+    })?;
+    let mut query = format!(
+        "username={}&serverId={}",
+        url_encode(name),
+        url_encode(server_hash)
+    );
+    if let Some(ip) = ip {
+        query.push_str(&format!("&ip={}", url_encode(&ip.to_string())));
+    }
+    let separator = if endpoint.contains('?') { '&' } else { '?' };
+    let response = match agent.get(&format!("{endpoint}{separator}{query}")).call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(204, _)) => return Ok(None),
+        Err(ureq::Error::Status(status, response)) if matches!(status, 401 | 403) => {
+            let _ = response.into_string();
+            return Ok(None);
+        }
+        Err(ureq::Error::Status(status, response)) if status < 500 => {
+            let body = response.into_string().unwrap_or_default();
+            return Err(VerificationError::InvalidResponse(format!(
+                "Minecraft session verification returned HTTP {status}: {body}"
+            )));
+        }
+        Err(error) => {
+            return Err(VerificationError::Unavailable(format!(
+                "Minecraft session verification failed: {error}"
+            )));
+        }
+    };
+    let body = response.into_string().map_err(|error| {
+        VerificationError::Unavailable(format!(
+            "read Minecraft session verification response: {error}"
+        ))
+    })?;
+    if body.trim().is_empty() {
+        return Ok(None);
+    }
+    let profile = json::parse(&body, true).map_err(|error| {
+        VerificationError::InvalidResponse(format!("parse Minecraft session profile: {error}"))
+    })?;
+    let Some(id) = profile
+        .get("id")
+        .and_then(Json::as_string)
+        .map(|id| id.replace('-', ""))
+        .and_then(|id| {
+            (id.len() == 32)
+                .then(|| u128::from_str_radix(&id, 16).ok())
+                .flatten()
+        })
+    else {
+        return Ok(None);
+    };
+    let Some(player_name) = profile.get("name").and_then(Json::as_string) else {
+        return Ok(None);
+    };
+    if !player_name.eq_ignore_ascii_case(name) {
+        return Ok(None);
+    }
+    let properties = match profile.get("properties") {
+        Some(Json::Array(properties)) => properties
+            .iter()
+            .filter_map(|property| {
+                Some(Property {
+                    name: property.get("name")?.as_string()?,
+                    value: property.get("value")?.as_string()?,
+                    signature: property.get("signature").and_then(Json::as_string),
+                })
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    Ok(Some(JoinedProfile {
+        id,
+        name: player_name,
+        properties,
+    }))
+}
+
+impl VerificationError {
+    fn message(self) -> String {
+        match self {
+            Self::Unavailable(message) | Self::InvalidResponse(message) => message,
+        }
+    }
+}
+
+fn url_encode(text: &str) -> String {
+    let mut encoded = String::new();
+    for byte in text.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'-' | b'*' | b'_' => {
+                encoded.push(char::from(byte));
+            }
+            b' ' => encoded.push('+'),
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 /// MinecraftServicesKeyInfo.get: the services' public keys from the

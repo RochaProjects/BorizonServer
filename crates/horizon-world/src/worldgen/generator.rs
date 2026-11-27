@@ -53,7 +53,7 @@ use horizon_core::{
 use serde_json::Value;
 use std::{
     any::Any,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs, io,
     path::Path,
     sync::{Arc, Mutex, OnceLock},
@@ -923,6 +923,16 @@ pub struct ProtoChunk {
     /// change it. Not saved.
     full: bool,
 }
+
+/// A feature-stage mutation to a restored final chunk, including the block
+/// entity payload at the same position when the feature creates one.
+#[derive(Clone, Debug)]
+pub struct SavedFinalWrite {
+    pub position: BlockPos,
+    pub state: BlockStateId,
+    pub block_entity: Option<crate::nbt::Compound>,
+}
+
 impl ProtoChunk {
     /// Its own heap bytes by part (`horizon-ctl memory`): packed blocks,
     /// section palettes and lists, heightmaps, other terrain data, biomes,
@@ -979,6 +989,68 @@ impl ProtoChunk {
     /// Encode structure/template block entities with their absolute positions.
     pub fn block_entities_nbt(&self) -> crate::nbt::Tag {
         proto_block_entities_nbt(&self.block_entities)
+    }
+    /// Complete pending vanilla block entities after FEATURES, matching the
+    /// server-safe portion of `VanillaTerrain::finish`: resolve missing IDs
+    /// from the final block state and create default records for BE blocks
+    /// placed without explicit structure NBT.
+    pub fn finalize_block_entities(&mut self) {
+        let data = &self.data;
+        let terrain = &self.terrain;
+        let mut present = self
+            .block_entities
+            .iter()
+            .map(|(position, _)| *position)
+            .collect::<HashSet<_>>();
+        for (position, payload) in &mut self.block_entities {
+            if payload.contains_key(&crate::nbt::JavaString::from("id")) {
+                continue;
+            }
+            let state = terrain.block(position[0], position[1], position[2]);
+            let block_name = &data
+                .registry
+                .state(state)
+                .expect("terrain state is registered")
+                .name;
+            if let Some(kind) = crate::block_entities::block_entity_type(block_name) {
+                payload.insert("id".into(), crate::nbt::Tag::String(kind.into()));
+            }
+        }
+
+        let mut defaults = Vec::new();
+        let mut states = [0_u32; 4096];
+        let chunk = self.position();
+        for section in self.terrain.filled_sections() {
+            let section_y = self.terrain.min_y() + section as i32 * 16;
+            if !self.terrain.section_states(section_y, &mut states) {
+                continue;
+            }
+            for (index, &state) in states.iter().enumerate() {
+                let index = index as i32;
+                let position = [
+                    chunk.x * 16 + (index & 15),
+                    section_y + (index >> 8),
+                    chunk.z * 16 + ((index >> 4) & 15),
+                ];
+                if present.contains(&position) {
+                    continue;
+                }
+                let Some(kind) = crate::block_entities::block_entity_type(
+                    data.registry
+                        .state(BlockStateId(state))
+                        .expect("terrain state is registered")
+                        .name
+                        .as_str(),
+                ) else {
+                    continue;
+                };
+                present.insert(position);
+                let mut payload = crate::nbt::Compound::new();
+                payload.insert("id".into(), crate::nbt::Tag::String(kind.into()));
+                defaults.push((position, payload));
+            }
+        }
+        self.block_entities.extend(defaults);
     }
     /// Encode generated entity payloads already represented in vanilla NBT.
     pub fn entities_nbt(&self) -> crate::nbt::Tag {
@@ -1081,6 +1153,145 @@ impl ProtoChunk {
     /// with `allowWrites` false): ordinary feature writes leave it as it is.
     pub fn set_full(&mut self) {
         self.full = true;
+    }
+    /// Restore a persisted final chunk over freshly generated terrain before
+    /// using it as a neighbor during FEATURES, matching the server-side part of
+    /// `VanillaTerrain::proto_beside_final` in the reference. Biomes, structure
+    /// starts and references remain generated from the current worldgen data;
+    /// saved block states and block entities replace the regenerated values.
+    pub fn restore_saved_final(
+        &mut self,
+        saved: &crate::chunk::ChunkData,
+    ) -> Result<(), GeneratorError> {
+        if self.position() != saved.position() {
+            return Err(resource(format!(
+                "saved chunk ({},{}) does not match generated proto ({},{})",
+                saved.position().x,
+                saved.position().z,
+                self.position().x,
+                self.position().z
+            )));
+        }
+
+        for (position, state) in self.saved_block_states(saved)? {
+            if self.block(position.x, position.y, position.z) != state {
+                self.terrain
+                    .set_block_raw(position.x, position.y, position.z, state)
+                    .map_err(|error| resource(format!("restore saved block state: {error}")))?;
+            }
+        }
+
+        self.terrain
+            .set_generation_stage(PreLightChunkStage::Features);
+        self.terrain
+            .prime_heightmaps(PreLightChunkStage::Features.heightmaps())
+            .map_err(|error| resource(format!("rebuild restored chunk heightmaps: {error}")))?;
+        self.set_decorated();
+        self.set_full();
+
+        self.block_entities.clear();
+        if let Some(crate::nbt::Tag::List(entities)) = saved.root().tag.get("block_entities") {
+            for entity in entities {
+                let crate::nbt::Tag::Compound(fields) = entity else {
+                    continue;
+                };
+                let coordinate = |key: &str| match fields.get(&crate::nbt::JavaString::from(key)) {
+                    Some(crate::nbt::Tag::Int(value)) => Some(*value),
+                    _ => None,
+                };
+                let (Some(x), Some(y), Some(z)) =
+                    (coordinate("x"), coordinate("y"), coordinate("z"))
+                else {
+                    continue;
+                };
+                let mut data = fields.clone();
+                for key in ["x", "y", "z"] {
+                    data.remove(&crate::nbt::JavaString::from(key));
+                }
+                self.block_entities.push(([x, y, z], data));
+            }
+        }
+        Ok(())
+    }
+
+    /// Block writes FEATURES made to a restored final chunk, matching
+    /// `VanillaTerrain::final_writes`. Ordinary writes are blocked by `full`;
+    /// the remaining section writes are collected for the world owner to apply
+    /// to the persisted chunk.
+    pub fn saved_final_writes(
+        &self,
+        saved: &crate::chunk::ChunkData,
+    ) -> Result<Vec<SavedFinalWrite>, GeneratorError> {
+        if self.position() != saved.position() {
+            return Err(resource("saved chunk does not match generated proto"));
+        }
+        let mut writes = Vec::new();
+        for (position, saved_state) in self.saved_block_states(saved)? {
+            let generated = self.block(position.x, position.y, position.z);
+            if generated != saved_state {
+                writes.push(SavedFinalWrite {
+                    position,
+                    state: generated,
+                    block_entity: self
+                        .block_entities
+                        .iter()
+                        .find(|(at, _)| *at == [position.x, position.y, position.z])
+                        .map(|(_, data)| data.clone()),
+                });
+            }
+        }
+        Ok(writes)
+    }
+
+    fn saved_block_states(
+        &self,
+        saved: &crate::chunk::ChunkData,
+    ) -> Result<Vec<(BlockPos, BlockStateId)>, GeneratorError> {
+        let registry = self.data.registry;
+        let air = registry
+            .default_state("minecraft:air")
+            .ok_or_else(|| resource("block registry has no minecraft:air"))?;
+        let saved_sections = saved
+            .section_block_states()?
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let min_y = self.terrain.min_y();
+        let min_section_y = min_y.div_euclid(16);
+        let section_count = usize::try_from(self.terrain.height().div_euclid(16))
+            .map_err(|_| resource("saved chunk has an invalid vertical range"))?;
+        let (block_x, block_z) = (self.position().x * 16, self.position().z * 16);
+        let mut blocks = Vec::with_capacity(section_count * 4096);
+
+        // A missing section in a saved full chunk is all air. Clear the newly
+        // generated terrain first, then restore only sections present on disk.
+        for section_index in 0..section_count {
+            let section_y = min_section_y + section_index as i32;
+            let palette = saved_sections
+                .get(&section_y)
+                .and_then(|states| *states)
+                .map(|tag| crate::chunk::PalettedContainer::from_nbt(tag, 4096, 4))
+                .transpose()?;
+            for index in 0..4096 {
+                let state = if let Some(palette) = &palette {
+                    registry
+                        .saved_state_id(palette.get(index)?)
+                        .ok_or_else(|| {
+                            resource(format!(
+                                "saved chunk contains an unknown block state at section Y={section_y}"
+                            ))
+                        })?
+                } else {
+                    air
+                };
+                let position = BlockPos::new(
+                    block_x + (index & 15) as i32,
+                    section_y * 16 + (index >> 8) as i32,
+                    block_z + ((index >> 4) & 15) as i32,
+                );
+                blocks.push((position, state));
+            }
+        }
+        Ok(blocks)
     }
     /// Highest non-air block + 1 in the column (WORLD_SURFACE).
     pub fn surface_height(&self, x: i32, z: i32) -> i32 {

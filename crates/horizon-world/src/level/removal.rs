@@ -83,6 +83,18 @@ pub fn drop_item_stack<R: RandomSource>(random: &mut R, pos: BlockPos, count: u3
     )
 }
 
+/// `Block.popResource`: the vanilla randomized position around a broken
+/// block's center. The item entity's own constructor chooses its motion.
+pub fn pop_resource_position<R: RandomSource>(random: &mut R, pos: BlockPos) -> [f64; 3] {
+    let mut offset = || -0.25 + random.next_double() * 0.5;
+    let half_height = f64::from(0.25f32) / 2.0;
+    [
+        f64::from(pos.x) + 0.5 + offset(),
+        f64::from(pos.y) + 0.5 + offset() - half_height,
+        f64::from(pos.z) + 0.5 + offset(),
+    ]
+}
+
 /// `Containers.dropItemStack(Level, double, double, double, ItemStack)`:
 /// entity origins are floored before the same per-slot random draws.
 pub fn drop_item_stack_at<R: RandomSource>(

@@ -15,10 +15,6 @@ use serde_json::Value;
 use std::{collections::VecDeque, fs, path::Path};
 
 const REGION_SIDE: usize = 48;
-const WORLD_MIN_Y: i32 = -64;
-const WORLD_HEIGHT: usize = 384;
-const WORLD_MAX_Y: i32 = WORLD_MIN_Y + WORLD_HEIGHT as i32;
-const GRID_VOLUME: usize = REGION_SIDE * REGION_SIDE * WORLD_HEIGHT;
 
 #[derive(Clone, Debug)]
 pub(crate) struct LightOcclusion {
@@ -121,28 +117,70 @@ impl LightOcclusion {
         self.state_faces.len()
     }
 
-    /// Calculate Overworld block and sky light for the center chunk of a 3×3
+    /// Calculate block and dimension-appropriate sky light for a 3×3
     /// generated region. A one-chunk border is sufficient because light can
     /// attenuate at most 15 levels before it has no effect at the center.
-    pub(crate) fn light_overworld_region(
+    pub(crate) fn light_region(
         &self,
         chunks: &[ProtoChunk; 9],
         registry: &BlockRegistry,
         behaviours: &Behaviours,
+        has_skylight: bool,
+    ) -> Result<[LightData; 9], String> {
+        let refs: [&ProtoChunk; 9] = std::array::from_fn(|index| &chunks[index]);
+        self.light_region_refs(&refs, registry, behaviours, has_skylight)
+    }
+
+    /// Shared-proto form used by the server status pipeline: lighting reads
+    /// immutable FEATURES chunks while retaining the owners for adjacent jobs.
+    pub(crate) fn light_region_refs(
+        &self,
+        chunks: &[&ProtoChunk; 9],
+        registry: &BlockRegistry,
+        behaviours: &Behaviours,
+        has_skylight: bool,
     ) -> Result<[LightData; 9], String> {
         if self.state_count() != registry.len() {
             return Err("light table and block registry state counts differ".into());
         }
-        let mut states = vec![0_u32; GRID_VOLUME];
+        let center = &chunks[4].terrain;
+        let min_y = center.min_y();
+        let height = usize::try_from(center.height())
+            .map_err(|_| "generated dimension has a negative build height")?;
+        if height == 0 || height % 16 != 0 {
+            return Err(format!(
+                "generated dimension has invalid light height {height}"
+            ));
+        }
+        let max_y = min_y
+            .checked_add(center.height())
+            .ok_or("generated dimension build height overflows")?;
+        for (index, chunk) in chunks.iter().enumerate() {
+            if chunk.terrain.min_y() != min_y || chunk.terrain.height() != height as i32 {
+                return Err("light region mixes chunks with different build heights".into());
+            }
+            let expected = horizon_core::position::ChunkPos::new(
+                chunks[4].position().x + index as i32 % 3 - 1,
+                chunks[4].position().z + index as i32 / 3 - 1,
+            );
+            if chunk.position() != expected {
+                return Err("light region is not a row-major 3×3 neighborhood".into());
+            }
+        }
+        let grid_volume = REGION_SIDE
+            .checked_mul(REGION_SIDE)
+            .and_then(|area| area.checked_mul(height))
+            .ok_or("dimension light volume overflows address space")?;
+        let mut states = vec![0_u32; grid_volume];
         for chunk_z in 0..3 {
             for chunk_x in 0..3 {
                 let chunk = &chunks[chunk_z * 3 + chunk_x];
-                for y in WORLD_MIN_Y..WORLD_MAX_Y {
+                for y in min_y..max_y {
                     for z in 0..16 {
                         for x in 0..16 {
                             let gx = chunk_x * 16 + x;
                             let gz = chunk_z * 16 + z;
-                            states[grid_index(gx, (y - WORLD_MIN_Y) as usize, gz)] =
+                            states[grid_index(gx, (y - min_y) as usize, gz)] =
                                 chunk.block(x as i32, y, z as i32).0;
                         }
                     }
@@ -168,7 +206,7 @@ impl LightOcclusion {
             ));
         }
 
-        let mut block = vec![0_u8; GRID_VOLUME];
+        let mut block = vec![0_u8; grid_volume];
         let mut block_queue = VecDeque::new();
         for (index, &state) in states.iter().enumerate() {
             let value = emission[state as usize];
@@ -177,40 +215,49 @@ impl LightOcclusion {
                 block_queue.push_back(index);
             }
         }
-        propagate(&states, &opacity, &mut block, &mut block_queue, self);
+        propagate(
+            &states,
+            &opacity,
+            &mut block,
+            &mut block_queue,
+            self,
+            height,
+        );
 
         let air = registry
             .default_state("minecraft:air")
             .ok_or("block registry is missing minecraft:air")?
             .0;
-        let mut sky = vec![0_u8; GRID_VOLUME];
+        let mut sky = vec![0_u8; grid_volume];
         let mut sky_queue = VecDeque::new();
-        for z in 0..REGION_SIDE {
-            for x in 0..REGION_SIDE {
-                let mut above = air;
-                let mut incoming = 15_u8;
-                for y in (0..WORLD_HEIGHT).rev() {
-                    let index = grid_index(x, y, z);
-                    let state = states[index];
-                    if self.occludes(above, state, Direction::Down) {
-                        break;
+        if has_skylight {
+            for z in 0..REGION_SIDE {
+                for x in 0..REGION_SIDE {
+                    let mut above = air;
+                    let mut incoming = 15_u8;
+                    for y in (0..height).rev() {
+                        let index = grid_index(x, y, z);
+                        let state = states[index];
+                        if self.occludes(above, state, Direction::Down) {
+                            break;
+                        }
+                        // A vertical sky ray loses the state's actual opacity; air-like
+                        // states have opacity zero and therefore preserve level 15.
+                        incoming = incoming.saturating_sub(dampening[state as usize].min(15));
+                        if incoming == 0 {
+                            break;
+                        }
+                        sky[index] = incoming;
+                        sky_queue.push_back(index);
+                        above = state;
                     }
-                    // A vertical sky ray loses the state's actual opacity; air-like
-                    // states have opacity zero and therefore preserve level 15.
-                    incoming = incoming.saturating_sub(dampening[state as usize].min(15));
-                    if incoming == 0 {
-                        break;
-                    }
-                    sky[index] = incoming;
-                    sky_queue.push_back(index);
-                    above = state;
                 }
             }
+            propagate(&states, &opacity, &mut sky, &mut sky_queue, self, height);
         }
-        propagate(&states, &opacity, &mut sky, &mut sky_queue, self);
 
         Ok(std::array::from_fn(|index| {
-            encode_region_light(&sky, &block, index % 3, index / 3)
+            encode_region_light(&sky, &block, index % 3, index / 3, height, has_skylight)
         }))
     }
 }
@@ -239,6 +286,7 @@ fn propagate(
     light: &mut [u8],
     queue: &mut VecDeque<usize>,
     occlusion: &LightOcclusion,
+    height: usize,
 ) {
     const NEIGHBORS: [(i32, i32, i32, Direction); 6] = [
         (0, -1, 0, Direction::Down),
@@ -262,7 +310,7 @@ fn propagate(
             let ny = y as i32 + dy;
             let nz = z as i32 + dz;
             if !(0..REGION_SIDE as i32).contains(&nx)
-                || !(0..WORLD_HEIGHT as i32).contains(&ny)
+                || !(0..height as i32).contains(&ny)
                 || !(0..REGION_SIDE as i32).contains(&nz)
             {
                 continue;
@@ -281,7 +329,14 @@ fn propagate(
     }
 }
 
-fn encode_region_light(sky: &[u8], block: &[u8], chunk_x: usize, chunk_z: usize) -> LightData {
+fn encode_region_light(
+    sky: &[u8],
+    block: &[u8],
+    chunk_x: usize,
+    chunk_z: usize,
+    height: usize,
+    has_skylight: bool,
+) -> LightData {
     let mut data = LightData {
         sky_mask: Vec::new(),
         block_mask: Vec::new(),
@@ -290,18 +345,26 @@ fn encode_region_light(sky: &[u8], block: &[u8], chunk_x: usize, chunk_z: usize)
         sky: Vec::new(),
         block: Vec::new(),
     };
-    // Light section 0 is below the Overworld; 25 is above its 24 block sections.
-    for light_section in 0..26 {
-        let (sky_layer, block_layer) = match light_section {
-            0 => (vec![0_u8; 2048], vec![0_u8; 2048]),
-            25 => (vec![0xff_u8; 2048], vec![0_u8; 2048]),
-            section => {
-                let block_section = section - 1;
-                (
-                    pack_region_layer(sky, block_section, chunk_x, chunk_z),
-                    pack_region_layer(block, block_section, chunk_x, chunk_z),
-                )
-            }
+    // Light section 0 is below the build range; the last is above it.
+    let block_sections = height / 16;
+    for light_section in 0..=block_sections + 1 {
+        let (sky_layer, block_layer) = if light_section == 0 {
+            (vec![0_u8; 2048], vec![0_u8; 2048])
+        } else if light_section == block_sections + 1 {
+            (
+                if has_skylight {
+                    vec![0xff_u8; 2048]
+                } else {
+                    vec![0_u8; 2048]
+                },
+                vec![0_u8; 2048],
+            )
+        } else {
+            let section = light_section - 1;
+            (
+                pack_region_layer(sky, section, chunk_x, chunk_z),
+                pack_region_layer(block, section, chunk_x, chunk_z),
+            )
         };
         let sky_has_values = sky_layer.iter().any(|&byte| byte != 0);
         let block_has_values = block_layer.iter().any(|&byte| byte != 0);

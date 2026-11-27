@@ -1,11 +1,11 @@
 //! Server-side PLAY movement over the prepared vanilla collision registry.
 //!
 //! This adapter owns only the callbacks available in the current bootstrap. It
-//! refuses movement when the scan touches an unloaded chunk; entity collisions,
-//! border state, and active block-entity snapshots remain separate runtime work.
+//! refuses movement when the scan touches an unloaded chunk; entity collisions
+//! and active block-entity snapshots remain separate runtime work.
 use crate::resources::ServerResources;
 use horizon_core::{
-    geometry::{Aabb, Vec3, VoxelShape},
+    geometry::{Aabb, Vec3, VoxelShape, border::BorderGeometry},
     position::{BlockPos, ChunkPos},
 };
 use horizon_world::{
@@ -25,6 +25,7 @@ const COLLISION_CANDIDATE_BUDGET: usize = 16_384;
 
 pub(crate) fn resolve_player_move(
     level: &ResidentLevel<'_>,
+    border: &BorderGeometry,
     resources: &ServerResources,
     entity_id: i32,
     from: [f64; 3],
@@ -32,7 +33,61 @@ pub(crate) fn resolve_player_move(
     fall_distance: f64,
     on_ground: bool,
 ) -> Result<([f64; 3], bool), String> {
-    let identity = EntityIdentity(entity_id as u32 as u64);
+    resolve_entity_move(
+        level,
+        resources,
+        EntityIdentity(entity_id as u32 as u64),
+        EntityContextKind::Player,
+        from,
+        requested,
+        fall_distance,
+        on_ground,
+        0.3,
+        1.8,
+        0.6,
+        border,
+    )
+}
+
+pub(crate) fn resolve_item_move(
+    level: &ResidentLevel<'_>,
+    border: &BorderGeometry,
+    resources: &ServerResources,
+    entity_id: i32,
+    from: [f64; 3],
+    requested: [f64; 3],
+    on_ground: bool,
+) -> Result<([f64; 3], bool), String> {
+    resolve_entity_move(
+        level,
+        resources,
+        EntityIdentity(entity_id as u32 as u64),
+        EntityContextKind::Item,
+        from,
+        requested,
+        0.0,
+        on_ground,
+        0.125,
+        0.25,
+        0.0,
+        border,
+    )
+}
+
+fn resolve_entity_move(
+    level: &ResidentLevel<'_>,
+    resources: &ServerResources,
+    identity: EntityIdentity,
+    kind: EntityContextKind,
+    from: [f64; 3],
+    requested: [f64; 3],
+    fall_distance: f64,
+    on_ground: bool,
+    half_width: f64,
+    height: f64,
+    max_step: f32,
+    border: &BorderGeometry,
+) -> Result<([f64; 3], bool), String> {
     let movement = Vec3::new(
         requested[0] - from[0],
         requested[1] - from[1],
@@ -40,16 +95,19 @@ pub(crate) fn resolve_player_move(
     );
     let context_entity = CollisionEntity {
         identity,
-        kind: EntityContextKind::Player,
+        kind,
         y: from[1],
-        descending: false,
-        main_hand: Some(CollisionItem::EMPTY),
+        descending: movement.y < 0.0,
+        main_hand: (kind == EntityContextKind::Player).then_some(CollisionItem::EMPTY),
     };
     let context = CollisionContext::for_entity(context_entity, false);
     let mut world = ResidentMovementWorld {
         level,
         resources,
         fall_distance,
+        half_width,
+        height,
+        border,
         unloaded_chunk_seen: false,
     };
     let resolved = resolve_world_movement(
@@ -57,9 +115,9 @@ pub(crate) fn resolve_player_move(
         MovementRequest {
             entity: identity,
             context,
-            bounds: player_box(from),
+            bounds: entity_box(from, half_width, height),
             movement,
-            max_step: 0.6,
+            max_step,
             on_ground,
             candidate_budget: COLLISION_CANDIDATE_BUDGET,
         },
@@ -77,10 +135,18 @@ pub(crate) fn resolve_player_move(
     Ok((position, grounded))
 }
 
-fn player_box(position: [f64; 3]) -> Aabb {
+fn entity_box(position: [f64; 3], half_width: f64, height: f64) -> Aabb {
     Aabb::new(
-        Vec3::new(position[0] - 0.3, position[1], position[2] - 0.3),
-        Vec3::new(position[0] + 0.3, position[1] + 1.8, position[2] + 0.3),
+        Vec3::new(
+            position[0] - half_width,
+            position[1],
+            position[2] - half_width,
+        ),
+        Vec3::new(
+            position[0] + half_width,
+            position[1] + height,
+            position[2] + half_width,
+        ),
     )
 }
 
@@ -88,6 +154,9 @@ struct ResidentMovementWorld<'a, 'r> {
     level: &'a ResidentLevel<'r>,
     resources: &'a ServerResources,
     fall_distance: f64,
+    half_width: f64,
+    height: f64,
+    border: &'a BorderGeometry,
     unloaded_chunk_seen: bool,
 }
 impl DynamicSupportWorld for ResidentMovementWorld<'_, '_> {
@@ -119,8 +188,11 @@ impl LiquidCollisionWorld for ResidentMovementWorld<'_, '_> {
     type Error = String;
 
     fn entity_liquid_shape(&mut self, _entity: EntityIdentity) -> Result<VoxelShape, Self::Error> {
-        VoxelShape::from_box(Aabb::new(Vec3::ZERO, Vec3::new(0.6, 1.8, 0.6)))
-            .map_err(|error| error.to_string())
+        VoxelShape::from_box(Aabb::new(
+            Vec3::ZERO,
+            Vec3::new(self.half_width * 2.0, self.height, self.half_width * 2.0),
+        ))
+        .map_err(|error| error.to_string())
     }
 
     fn fluid(&mut self, position: BlockPos) -> Result<FluidState, Self::Error> {
@@ -227,9 +299,18 @@ impl EntityMovementWorld for ResidentMovementWorld<'_, '_> {
     fn movement_border(
         &mut self,
         _entity: EntityIdentity,
-        _bounds: Aabb,
+        bounds: Aabb,
     ) -> Result<Option<VoxelShape>, Self::Error> {
-        // A saved/ticking WorldBorder is not yet attached to this prepared world.
-        Ok(None)
+        let center = bounds.bottom_center();
+        if !self
+            .border
+            .is_inside_close_to_border(center.x, center.z, bounds)
+        {
+            return Ok(None);
+        }
+        self.border
+            .collision_shape()
+            .map(Some)
+            .map_err(|error| format!("build world-border collision shape: {error}"))
     }
 }

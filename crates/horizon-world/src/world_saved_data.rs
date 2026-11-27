@@ -6,7 +6,7 @@
 use crate::{
     DATA_VERSION,
     datafix::{
-        files::{read_dat, write_dat},
+        files::{current_world_gen_settings, read_dat, write_dat},
         schema::Ty,
         update_saved_data,
     },
@@ -20,6 +20,7 @@ use crate::{
 use std::{
     io,
     path::{Component as PathComponent, Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 /// The local SavedData files belonging to one vanilla world directory.
@@ -28,11 +29,200 @@ pub struct WorldSavedData {
     world_root: PathBuf,
 }
 
+/// World-generation seed and shared spawn read from the vanilla world files.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WorldBasics {
+    pub seed: Option<i64>,
+    pub spawn: Option<[i32; 3]>,
+}
+
 impl WorldSavedData {
     pub fn new(world_root: impl Into<PathBuf>) -> Self {
         Self {
             world_root: world_root.into(),
         }
+    }
+
+    /// DedicatedServer's level.dat fallback: restore a readable `level.dat_old`
+    /// only when the current file is missing or unreadable, keeping the broken
+    /// file under a timestamped name as the vanilla loader does.
+    pub fn restore_level_dat_old(&self) -> io::Result<bool> {
+        let current = self.world_root.join("level.dat");
+        if read_dat(&current).is_ok_and(|data| data.is_some()) {
+            return Ok(false);
+        }
+        let old = self.world_root.join("level.dat_old");
+        if !read_dat(&old).is_ok_and(|data| data.is_some()) {
+            return Ok(false);
+        }
+        if current.exists() {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let corrupted = self.world_root.join(format!("level.dat_corrupted_{stamp}"));
+            std::fs::rename(&current, &corrupted)?;
+            if let Err(error) = std::fs::rename(&old, &current) {
+                let _ = std::fs::rename(corrupted, &current);
+                return Err(error);
+            }
+        } else {
+            std::fs::rename(old, current)?;
+        }
+        Ok(true)
+    }
+
+    /// Read the seed and spawn exactly where 26.3 stores them. New worlds may
+    /// have neither yet and use server.properties until their first save.
+    pub fn load_world_basics(&self) -> io::Result<WorldBasics> {
+        let root = read_dat(&self.world_root.join("level.dat"))?;
+        let data = root.as_ref().and_then(|root| root.get("Data"));
+        let settings = current_world_gen_settings(&self.world_root)?;
+        let seed = settings
+            .as_ref()
+            .and_then(|settings| integer(settings.get("seed")))
+            .or_else(|| {
+                data.and_then(|data| {
+                    integer(
+                        data.get("WorldGenSettings")
+                            .and_then(|settings| settings.get("seed")),
+                    )
+                })
+            });
+        let spawn =
+            data.and_then(
+                |data| match data.get("spawn").and_then(|spawn| spawn.get("pos")) {
+                    Some(Tag::IntArray(position)) if position.len() == 3 => {
+                        Some([position[0], position[1], position[2]])
+                    }
+                    _ if data.get("SpawnX").is_some() => Some([
+                        integer(data.get("SpawnX"))? as i32,
+                        integer(data.get("SpawnY"))? as i32,
+                        integer(data.get("SpawnZ"))? as i32,
+                    ]),
+                    _ => None,
+                },
+            );
+        Ok(WorldBasics { seed, spawn })
+    }
+
+    /// Persist the 26.3 world-generation seed and shared Overworld spawn while
+    /// preserving unrelated saved generator dimensions and level.dat fields.
+    pub fn save_world_basics(
+        &self,
+        seed: i64,
+        spawn: [i32; 3],
+        level_name: &str,
+        game_mode: i32,
+        difficulty: &str,
+        hardcore: bool,
+    ) -> io::Result<()> {
+        let settings = current_world_gen_settings(&self.world_root)?
+            .unwrap_or_else(|| default_noise_world_settings(seed));
+        let mut settings = settings;
+        if let Tag::Compound(fields) = &mut settings {
+            fields.insert("seed".into(), Tag::Long(seed));
+        }
+        let settings_path = self
+            .world_root
+            .join("data/minecraft/world_gen_settings.dat");
+        if let Some(parent) = settings_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_saved_data(&settings_path, settings)?;
+
+        let path = self.world_root.join("level.dat");
+        let had_level_file = path.exists();
+        let mut root = read_dat(&path)?.unwrap_or_else(empty_compound);
+        if !matches!(root, Tag::Compound(_)) {
+            root = empty_compound();
+        }
+        let mut data = root.get("Data").cloned().unwrap_or_else(empty_compound);
+        if !matches!(data, Tag::Compound(_)) {
+            data = empty_compound();
+        }
+        if let Tag::Compound(fields) = &mut data {
+            if !had_level_file {
+                fields.insert("DataVersion".into(), Tag::Int(crate::DATA_VERSION));
+            }
+            fields.insert(
+                "Version".into(),
+                Tag::compound([
+                    (
+                        "Name",
+                        Tag::String(JavaString::from(horizon_core::version::VANILLA_VERSION)),
+                    ),
+                    ("Id", Tag::Int(crate::DATA_VERSION)),
+                    ("Snapshot", Tag::Byte(0)),
+                    ("Series", Tag::String(JavaString::from("main"))),
+                ]),
+            );
+            fields.insert("version".into(), Tag::Int(19_133));
+            fields.insert(
+                "LevelName".into(),
+                Tag::String(JavaString::from(level_name)),
+            );
+            fields.insert("GameType".into(), Tag::Int(game_mode.clamp(0, 3)));
+            fields.insert(
+                "LastPlayed".into(),
+                Tag::Long(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64,
+                ),
+            );
+            let mut history = match fields.get(&JavaString::from("version_history")) {
+                Some(Tag::List(items)) => items.clone(),
+                _ => Vec::new(),
+            };
+            let current_version = Tag::Int(crate::DATA_VERSION);
+            if history.last() != Some(&current_version) {
+                history.push(current_version);
+            }
+            fields.insert("version_history".into(), Tag::List(history));
+            let mut brands = match fields.get(&JavaString::from("ServerBrands")) {
+                Some(Tag::List(items)) => items.clone(),
+                _ => Vec::new(),
+            };
+            let horizon_brand = Tag::String(JavaString::from("horizon"));
+            if !brands.contains(&horizon_brand) {
+                brands.push(horizon_brand);
+            }
+            fields.insert("ServerBrands".into(), Tag::List(brands));
+            let mut difficulty_settings = fields
+                .get(&JavaString::from("difficulty_settings"))
+                .cloned()
+                .unwrap_or_else(empty_compound);
+            if !matches!(difficulty_settings, Tag::Compound(_)) {
+                difficulty_settings = empty_compound();
+            }
+            if let Tag::Compound(settings) = &mut difficulty_settings {
+                settings.insert(
+                    "difficulty".into(),
+                    Tag::String(JavaString::from(difficulty)),
+                );
+                settings.insert("hardcore".into(), Tag::Byte(i8::from(hardcore)));
+                settings.entry("locked".into()).or_insert(Tag::Byte(0));
+            }
+            fields.insert("difficulty_settings".into(), difficulty_settings);
+            fields.insert(
+                "spawn".into(),
+                Tag::compound([
+                    ("pos", Tag::IntArray(spawn.to_vec())),
+                    (
+                        "dimension",
+                        Tag::String(JavaString::from("minecraft:overworld")),
+                    ),
+                    ("yaw", Tag::Float(0.0_f32.to_bits())),
+                    ("pitch", Tag::Float(0.0_f32.to_bits())),
+                ]),
+            );
+        }
+        if let Tag::Compound(fields) = &mut root {
+            fields.insert("Data".into(), data);
+        }
+        write_dat(&path, &root)
     }
 
     /// Load `Data.Time`, vanilla's world game-time counter. A missing or
@@ -361,6 +551,63 @@ fn write_saved_data(path: &Path, data: Tag) -> io::Result<()> {
 
 fn empty_compound() -> Tag {
     Tag::Compound(Compound::new())
+}
+
+fn default_noise_world_settings(seed: i64) -> Tag {
+    let string = |value: &str| Tag::String(JavaString::from(value));
+    let preset = |value: &str| {
+        Tag::compound([
+            ("type", string("minecraft:multi_noise")),
+            ("preset", string(value)),
+        ])
+    };
+    let dimension = |kind: &str, settings: &str, biome_source: Tag| {
+        Tag::compound([
+            ("type", string(kind)),
+            (
+                "generator",
+                Tag::compound([
+                    ("type", string("minecraft:noise")),
+                    ("settings", string(settings)),
+                    ("biome_source", biome_source),
+                ]),
+            ),
+        ])
+    };
+    Tag::compound([
+        ("seed", Tag::Long(seed)),
+        ("generate_structures", Tag::Byte(1)),
+        ("bonus_chest", Tag::Byte(0)),
+        (
+            "dimensions",
+            Tag::compound([
+                (
+                    "minecraft:overworld",
+                    dimension(
+                        "minecraft:overworld",
+                        "minecraft:overworld",
+                        preset("minecraft:overworld"),
+                    ),
+                ),
+                (
+                    "minecraft:the_nether",
+                    dimension(
+                        "minecraft:the_nether",
+                        "minecraft:nether",
+                        preset("minecraft:nether"),
+                    ),
+                ),
+                (
+                    "minecraft:the_end",
+                    dimension(
+                        "minecraft:the_end",
+                        "minecraft:end",
+                        Tag::compound([("type", string("minecraft:the_end"))]),
+                    ),
+                ),
+            ]),
+        ),
+    ])
 }
 
 #[cfg(test)]

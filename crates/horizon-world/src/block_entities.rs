@@ -7,6 +7,69 @@ use std::{
     io,
 };
 
+/// Vanilla block-entity type accepted by each corresponding block. Kept in
+/// `horizon-world` so dedicated worldgen/save code does not depend on the
+/// mixed client renderer's chunk encoder.
+pub fn block_entity_type(block_name: &str) -> Option<&'static str> {
+    let name = block_name.strip_prefix("minecraft:")?;
+    Some(match name {
+        "chest" => "minecraft:chest",
+        "trapped_chest" => "minecraft:trapped_chest",
+        "ender_chest" => "minecraft:ender_chest",
+        "barrel" => "minecraft:barrel",
+        "furnace" => "minecraft:furnace",
+        "blast_furnace" => "minecraft:blast_furnace",
+        "smoker" => "minecraft:smoker",
+        "hopper" => "minecraft:hopper",
+        "dispenser" => "minecraft:dispenser",
+        "dropper" => "minecraft:dropper",
+        "brewing_stand" => "minecraft:brewing_stand",
+        "beacon" => "minecraft:beacon",
+        "bell" => "minecraft:bell",
+        "campfire" | "soul_campfire" => "minecraft:campfire",
+        "enchanting_table" => "minecraft:enchanting_table",
+        "jukebox" => "minecraft:jukebox",
+        "lectern" => "minecraft:lectern",
+        "spawner" => "minecraft:mob_spawner",
+        "comparator" => "minecraft:comparator",
+        "daylight_detector" => "minecraft:daylight_detector",
+        "conduit" => "minecraft:conduit",
+        "decorated_pot" => "minecraft:decorated_pot",
+        "moving_piston" => "minecraft:piston",
+        "structure_block" => "minecraft:structure_block",
+        "jigsaw" => "minecraft:jigsaw",
+        "command_block" | "chain_command_block" | "repeating_command_block" => {
+            "minecraft:command_block"
+        }
+        "end_portal" => "minecraft:end_portal",
+        "end_gateway" => "minecraft:end_gateway",
+        "sculk_sensor" => "minecraft:sculk_sensor",
+        "calibrated_sculk_sensor" => "minecraft:calibrated_sculk_sensor",
+        "sculk_catalyst" => "minecraft:sculk_catalyst",
+        "sculk_shrieker" => "minecraft:sculk_shrieker",
+        "crafter" => "minecraft:crafter",
+        "potent_sulfur" => "minecraft:potent_sulfur",
+        "chiseled_bookshelf" => "minecraft:chiseled_bookshelf",
+        "trial_spawner" => "minecraft:trial_spawner",
+        "vault" => "minecraft:vault",
+        "beehive" | "bee_nest" => "minecraft:beehive",
+        "suspicious_sand" | "suspicious_gravel" => "minecraft:brushable_block",
+        "creaking_heart" => "minecraft:creaking_heart",
+        "test_block" => "minecraft:test_block",
+        "test_instance_block" => "minecraft:test_instance_block",
+        value if value.ends_with("shulker_box") => "minecraft:shulker_box",
+        value if value.ends_with("_wall_hanging_sign") || value.ends_with("_hanging_sign") => {
+            "minecraft:hanging_sign"
+        }
+        value if value.ends_with("_sign") => "minecraft:sign",
+        value if value.ends_with("_banner") => "minecraft:banner",
+        value if value.ends_with("_head") || value.ends_with("_skull") => "minecraft:skull",
+        value if value.ends_with("_shelf") => "minecraft:shelf",
+        value if value.ends_with("copper_golem_statue") => "minecraft:copper_golem_statue",
+        _ => return None,
+    })
+}
+
 /// Resolve native block-entity coordinates, relocating mismatched X/Z into the
 /// owning chunk while retaining local offsets and the full Y coordinate. The
 /// supplied tag is not rewritten. NumericTag float/double reads use Mth.floor.

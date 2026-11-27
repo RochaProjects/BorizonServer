@@ -30,7 +30,7 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Accept vanilla status pings indefinitely. Without a PLAY server, only
 /// status is enabled and the response reports zero connected players.
 pub(crate) fn listen(address: impl ToSocketAddrs) -> io::Result<()> {
-    listen_inner(address, None, None)
+    listen_inner(address, None, None, None, None)
 }
 
 /// Serve STATUS and offline LOGIN/CONFIGURATION. Connections close after
@@ -39,20 +39,24 @@ pub(crate) fn listen_with_login(
     address: impl ToSocketAddrs,
     registries: Arc<RegistryBundle>,
 ) -> io::Result<()> {
-    listen_inner(address, Some(registries), None)
+    listen_inner(address, Some(registries), None, None, None)
 }
 
 /// Serve STATUS and initialize a basic Overworld PLAY session. The simulation
 /// remains incomplete; the prepared region is shared by all connecting clients.
-pub(crate) fn listen_with_play(
+pub(crate) fn listen_with_play_and_motd(
     address: impl ToSocketAddrs,
     registries: Arc<RegistryBundle>,
     world: Arc<PreparedPlayWorld>,
+    motd: String,
+    online: Option<Arc<login::OnlineAuthenticator>>,
 ) -> io::Result<()> {
     listen_inner(
         address,
         Some(registries),
         Some(Arc::new(PlayServer::new(world))),
+        Some(motd),
+        online,
     )
 }
 
@@ -60,6 +64,8 @@ fn listen_inner(
     address: impl ToSocketAddrs,
     registries: Option<Arc<RegistryBundle>>,
     play_server: Option<Arc<PlayServer>>,
+    motd: Option<String>,
+    online: Option<Arc<login::OnlineAuthenticator>>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(address)?;
     if let Some(server) = &play_server {
@@ -74,10 +80,12 @@ fn listen_inner(
             Ok(stream) => {
                 let registries = registries.clone();
                 let play_server = play_server.clone();
+                let motd = motd.clone();
+                let online = online.clone();
                 thread::Builder::new()
                     .name("horizon-protocol-client".into())
                     .spawn(move || {
-                        if let Err(error) = handle(stream, registries, play_server) {
+                        if let Err(error) = handle(stream, registries, play_server, motd, online) {
                             eprintln!("Horizon protocol connection: {error}");
                         }
                     })?;
@@ -92,6 +100,8 @@ fn handle(
     mut stream: TcpStream,
     registries: Option<Arc<RegistryBundle>>,
     play_server: Option<Arc<PlayServer>>,
+    motd: Option<String>,
+    online: Option<Arc<login::OnlineAuthenticator>>,
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(CONNECTION_TIMEOUT))?;
     stream.set_write_timeout(Some(CONNECTION_TIMEOUT))?;
@@ -106,9 +116,16 @@ fn handle(
                 "LOGIN is disabled on the status-only listener",
             ));
         };
+        let remote_ip = stream.peer_addr().ok().map(|address| address.ip());
         let connection = Connection::from_stream(stream).map_err(protocol_error)?;
-        let configured = login::login_after_intention(connection, intention, &registries)
-            .map_err(protocol_error)?;
+        let configured = login::login_after_intention(
+            connection,
+            intention,
+            &registries,
+            online.as_deref(),
+            remote_ip,
+        )
+        .map_err(protocol_error)?;
         if let Some(server) = play_server {
             return server.initialize(configured).map_err(protocol_error);
         }
@@ -130,9 +147,16 @@ fn handle(
             let online = play_server
                 .as_ref()
                 .map_or(0, |server| server.online_players());
-            let json = format!(
-                "{{\"version\":{{\"name\":\"{VERSION_NAME}\",\"protocol\":{PROTOCOL_VERSION}}},\"players\":{{\"max\":20,\"online\":{online},\"sample\":[]}},\"description\":{{\"text\":\"Borizon Server\"}},\"enforcesSecureChat\":false}}"
-            );
+            let max_players = play_server
+                .as_ref()
+                .map_or(20, |server| server.max_players());
+            let json = serde_json::json!({
+                "version": {"name": VERSION_NAME, "protocol": PROTOCOL_VERSION},
+                "players": {"max": max_players, "online": online, "sample": []},
+                "description": {"text": motd.as_deref().unwrap_or("Borizon Server")},
+                "enforcesSecureChat": false,
+            })
+            .to_string();
             write_packet(
                 &mut stream,
                 &status::Clientbound::StatusResponse(StatusResponse { json }),
@@ -262,7 +286,7 @@ mod tests {
         ));
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            handle(stream, Some(registries), None).unwrap();
+            handle(stream, Some(registries), None, None, None).unwrap();
         });
 
         let stream = TcpStream::connect(address).unwrap();

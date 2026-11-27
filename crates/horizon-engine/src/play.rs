@@ -539,6 +539,22 @@ impl PreparedPlayWorld {
         Ok(())
     }
 
+    fn patch_cached_block_state(
+        &self,
+        pos: BlockPos,
+        state: horizon_world::registry::BlockStateId,
+    ) -> Result<(), String> {
+        let chunk = pos.chunk();
+        let mut cache = self
+            .chunk_packet_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(packet) = cache.get_mut(&chunk) else {
+            return Ok(());
+        };
+        play_chunk::patch_cached_block_state(packet, pos, state, &self.resources.behaviours)
+    }
+
     fn update_client_chunk_view(
         &self,
         writer: &mut horizon_protocol::connection::ConnWriter,
@@ -1286,6 +1302,7 @@ fn destroy_player_block(
     let state = resident.level().block_state(pos);
     drop(resident);
     if destroyed {
+        world.patch_cached_block_state(pos, state)?;
         send_block_update(writer, digging.pos, state.0 as i32)?;
         send_crack_progress(writer, entity_id, digging.pos, -1)?;
     }

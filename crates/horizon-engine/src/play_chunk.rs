@@ -1,10 +1,15 @@
 //! Conversion of generated server chunks into the vanilla 26.3 PLAY payload.
 
-use horizon_protocol::chunk::{self, Paletted, Section, Strategy};
+use horizon_core::position::BlockPos;
+use horizon_protocol::{
+    buf::Reader,
+    chunk::{self, Paletted, Section, Strategy},
+    packets::play,
+};
 use horizon_world::{
     level::{Behaviours, data::state_flags},
     nbt::{JavaString, Tag},
-    registry::BlockRegistry,
+    registry::{BlockRegistry, BlockStateId},
     worldgen::generator::ProtoChunk,
 };
 
@@ -146,4 +151,152 @@ pub(crate) fn encode_generated_chunk(
         // registry-backed network type IDs are not wired up yet.
         block_entities: Vec::new(),
     })
+}
+
+/// Keep a cached client chunk's block palette coherent with one resident
+/// block mutation. The packet's light and heightmaps are retained as-is; the
+/// caller must separately schedule their vanilla recomputation.
+pub(crate) fn patch_cached_block_state(
+    packet: &mut Vec<u8>,
+    pos: BlockPos,
+    state: BlockStateId,
+    behaviours: &Behaviours,
+) -> Result<(), String> {
+    let mut reader = Reader::new(packet);
+    let packet_id = reader
+        .varint()
+        .map_err(|error| format!("read cached chunk packet ID: {error}"))?;
+    let decoded = play::Clientbound::decode(packet_id, reader.rest())
+        .map_err(|error| format!("decode cached chunk packet: {error}"))?;
+    let play::Clientbound::LevelChunkWithLight(mut chunk_packet) = decoded else {
+        return Err("cached packet is not LevelChunkWithLight".into());
+    };
+    let expected_chunk = pos.chunk();
+    if (chunk_packet.x, chunk_packet.z) != (expected_chunk.x, expected_chunk.z) {
+        return Err("cached LevelChunkWithLight coordinates do not match block".into());
+    }
+    let mut sections = chunk_packet
+        .chunk
+        .sections(SECTION_COUNT, BLOCK_BITS, BIOME_BITS)
+        .map_err(|error| format!("decode cached chunk sections: {error}"))?;
+    let section_y = pos.y.div_euclid(16);
+    let section_index = usize::try_from(section_y - MIN_SECTION_Y)
+        .ok()
+        .filter(|&index| index < SECTION_COUNT)
+        .ok_or_else(|| format!("block y={} is outside the cached Overworld", pos.y))?;
+    let local_y = pos.y.rem_euclid(16) as usize;
+    let index =
+        (local_y << 8) | ((pos.z.rem_euclid(16) as usize) << 4) | pos.x.rem_euclid(16) as usize;
+    let section = &mut sections[section_index];
+    let old_id = section.states.get(index);
+    let new_id = i32::try_from(state.0)
+        .map_err(|_| format!("block state ID {} does not fit the wire format", state.0))?;
+    if old_id == new_id {
+        return Ok(());
+    }
+
+    let old_facts = behaviours.facts(BlockStateId(old_id as u32));
+    let new_facts = behaviours.facts(state);
+    match (
+        old_facts.flags & state_flags::AIR != 0,
+        new_facts.flags & state_flags::AIR != 0,
+    ) {
+        (true, false) => section.non_empty = section.non_empty.saturating_add(1),
+        (false, true) => section.non_empty = section.non_empty.saturating_sub(1),
+        _ => {}
+    }
+    match (
+        old_facts.fluid != horizon_world::fluid::FluidState::EMPTY,
+        new_facts.fluid != horizon_world::fluid::FluidState::EMPTY,
+    ) {
+        (true, false) => section.fluids = section.fluids.saturating_sub(1),
+        (false, true) => section.fluids = section.fluids.saturating_add(1),
+        _ => {}
+    }
+    let mut values = (0..chunk::BLOCKS)
+        .map(|index| section.states.get(index))
+        .collect::<Vec<_>>();
+    values[index] = new_id;
+    section.states = Paletted::from_values(&values, Strategy::Blocks, BLOCK_BITS);
+    chunk_packet.chunk.buffer = chunk::ChunkData::from_sections(&sections);
+    *packet = play::Clientbound::LevelChunkWithLight(chunk_packet).encode();
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_chunk_packet_reflects_block_state_mutation() {
+        let Some(resources_path) = std::env::var_os("BORIZON_SERVER_RESOURCES") else {
+            eprintln!("skipped: set BORIZON_SERVER_RESOURCES for cached chunk packet test");
+            return;
+        };
+        let resources = crate::resources::load(std::path::Path::new(&resources_path))
+            .expect("load official server resources");
+        let stone = resources
+            .registry
+            .default_state("minecraft:stone")
+            .expect("vanilla stone state");
+        let air = resources
+            .registry
+            .default_state("minecraft:air")
+            .expect("vanilla air state");
+        let sections = (0..SECTION_COUNT)
+            .map(|_| Section {
+                non_empty: 4096,
+                fluids: 0,
+                states: Paletted::from_values(
+                    &vec![stone.0 as i32; chunk::BLOCKS],
+                    Strategy::Blocks,
+                    BLOCK_BITS,
+                ),
+                biomes: Paletted::from_values(&[0; chunk::BIOMES], Strategy::Biomes, BIOME_BITS),
+            })
+            .collect::<Vec<_>>();
+        let chunk_data = chunk::ChunkData {
+            heightmaps: Vec::new(),
+            buffer: chunk::ChunkData::from_sections(&sections),
+            block_entities: Vec::new(),
+        };
+        let mut packet = play::Clientbound::LevelChunkWithLight(play::LevelChunkWithLight {
+            x: 0,
+            z: 0,
+            chunk: chunk_data,
+            light: chunk::LightData {
+                sky_mask: Vec::new(),
+                block_mask: Vec::new(),
+                empty_sky_mask: Vec::new(),
+                empty_block_mask: Vec::new(),
+                sky: Vec::new(),
+                block: Vec::new(),
+            },
+        })
+        .encode();
+
+        patch_cached_block_state(
+            &mut packet,
+            BlockPos::new(0, 0, 0),
+            air,
+            &resources.behaviours,
+        )
+        .expect("patch the cached wire chunk");
+
+        let mut reader = Reader::new(&packet);
+        let id = reader.varint().unwrap();
+        let play::Clientbound::LevelChunkWithLight(updated) =
+            play::Clientbound::decode(id, reader.rest()).unwrap()
+        else {
+            panic!("cached chunk packet changed type");
+        };
+        let updated_sections = updated
+            .chunk
+            .sections(SECTION_COUNT, BLOCK_BITS, BIOME_BITS)
+            .unwrap();
+        let target_section = &updated_sections[4];
+        assert_eq!(target_section.states.get(0), air.0 as i32);
+        assert_eq!(target_section.non_empty, 4095);
+        assert_eq!(updated_sections[5].non_empty, 4096);
+    }
 }

@@ -13,7 +13,7 @@ use crate::{
     ticket_levels::{ChunkTickets, Sources},
 };
 use horizon_core::{
-    position::ChunkPos,
+    position::{BlockPos, ChunkPos},
     ticks::{SavedTick, TickTypeId},
 };
 use std::{collections::HashMap, io};
@@ -106,6 +106,25 @@ impl<'registry> ResidentDimension<'registry> {
     /// later phases for the owning engine.
     pub fn tick_scheduled(&mut self, behaviours: &Behaviours) {
         behaviours.tick_scheduled(&mut self.level, &mut self.ticks);
+    }
+
+    /// Apply player-driven destruction using this dimension's paired resident
+    /// level and tick owners. This mirrors the existing `Behaviours` contract
+    /// while keeping the borrow boundary server-owned and atomic.
+    pub fn destroy_block_by_player(
+        &mut self,
+        behaviours: &Behaviours,
+        pos: BlockPos,
+        creative: bool,
+        correct_tool: bool,
+    ) -> bool {
+        behaviours.player_destroy_block(
+            &mut self.level,
+            &mut self.ticks,
+            pos,
+            creative,
+            correct_tool,
+        )
     }
 
     /// Load a persisted chunk into both owners. If either tick list cannot be

@@ -14,6 +14,7 @@ use horizon_protocol::packets::{configuration::KeepAlive, play};
 use horizon_world::{
     fluid::{FluidKind, FluidState},
     level::{BlockId, LevelAccess, ResidentDimension, ResidentLevel, Ticks, data::state_flags},
+    player_mining::{self, DestroySpeedModifiers},
     worldgen::generator::{OverworldGenerator, ProtoChunk},
 };
 use std::{
@@ -371,7 +372,7 @@ impl PreparedPlayWorld {
             "Horizon: entered initial PLAY for {} at ({:.1}, {:.1}, {:.1}); gameplay simulation is incomplete",
             configured.profile.name, self.spawn[0], self.spawn[1], self.spawn[2]
         );
-        serve_until_disconnect(configured, self.spawn, Some(self))
+        serve_until_disconnect(configured, self.spawn, player_id, Some(self))
     }
 
     fn resolve_player_move(
@@ -528,6 +529,7 @@ fn find_spawn(
 
 #[derive(Clone, Debug, PartialEq)]
 struct PlayerSession {
+    entity_id: i32,
     position: [f64; 3],
     yaw: f32,
     pitch: f32,
@@ -536,11 +538,24 @@ struct PlayerSession {
     awaiting_teleport: Option<(i32, [f64; 3])>,
     loaded: bool,
     position_packet_this_tick: bool,
+    server_tick: u64,
+    digging: Option<DiggingState>,
+    delayed_dig: Option<DiggingState>,
+    dig_clock: Option<([i32; 3], u64)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DiggingState {
+    pos: [i32; 3],
+    started_at: u64,
+    per_tick: f32,
+    progress: f32,
 }
 
 impl PlayerSession {
-    fn new(spawn: [f64; 3], teleport_id: i32) -> Self {
+    fn new(spawn: [f64; 3], teleport_id: i32, entity_id: i32) -> Self {
         Self {
+            entity_id,
             position: spawn,
             yaw: 0.0,
             pitch: 0.0,
@@ -549,6 +564,10 @@ impl PlayerSession {
             awaiting_teleport: Some((teleport_id, spawn)),
             loaded: false,
             position_packet_this_tick: false,
+            server_tick: 0,
+            digging: None,
+            delayed_dig: None,
+            dig_clock: None,
         }
     }
 
@@ -657,6 +676,7 @@ fn wrap_degrees(degrees: f32) -> f32 {
 fn serve_until_disconnect(
     configured: ConfiguredConnection,
     spawn: [f64; 3],
+    entity_id: i32,
     world: Option<&PreparedPlayWorld>,
 ) -> Result<(), String> {
     let (reader, mut writer) = configured.connection.split();
@@ -671,7 +691,7 @@ fn serve_until_disconnect(
         .name("borizon-play-reader".into())
         .spawn(move || read_play_packets(reader, incoming))
         .map_err(|error| format!("start PLAY network reader: {error}"))?;
-    let result = run_play_session(&mut writer, received, spawn, world);
+    let result = run_play_session(&mut writer, received, spawn, entity_id, world);
     closer.close();
     let _ = network_reader.join();
     result
@@ -722,6 +742,7 @@ fn run_play_session(
     writer: &mut horizon_protocol::connection::ConnWriter,
     received: Receiver<Result<(i32, Vec<u8>), String>>,
     spawn: [f64; 3],
+    entity_id: i32,
     world: Option<&PreparedPlayWorld>,
 ) -> Result<(), String> {
     const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
@@ -730,7 +751,7 @@ fn run_play_session(
     let mut last_keepalive = Instant::now();
     let mut next_keepalive_id = 1_i64;
     let mut pending_keepalive: Option<(i64, Instant)> = None;
-    let mut player = PlayerSession::new(spawn, 1);
+    let mut player = PlayerSession::new(spawn, 1, entity_id);
     let mut inbox = PendingPackets::default();
     let mut next_tick = Instant::now() + SERVER_TICK;
     loop {
@@ -770,6 +791,7 @@ fn run_play_session(
                     world,
                 )?;
             }
+            advance_player_mining(writer, &mut player, world)?;
             next_tick += SERVER_TICK;
         }
     }
@@ -785,6 +807,9 @@ fn process_play_packet(
 ) -> Result<(), String> {
     match packet {
         play::Serverbound::AcceptTeleportation(packet) => player.accept_teleport(&packet)?,
+        play::Serverbound::PlayerAction(packet) => {
+            process_player_action(writer, player, packet, world)?;
+        }
         play::Serverbound::KeepAlive(response) => match pending_keepalive.take() {
             Some((expected, _)) if response.id == expected => *last_keepalive = Instant::now(),
             Some((expected, _)) => {
@@ -839,6 +864,298 @@ fn process_play_packet(
             ));
         }
     }
+    Ok(())
+}
+
+fn process_player_action(
+    writer: &mut horizon_protocol::connection::ConnWriter,
+    player: &mut PlayerSession,
+    action: play::PlayerAction,
+    world: Option<&PreparedPlayWorld>,
+) -> Result<(), String> {
+    // Reference order: START, STOP and ABORT are sequence-ACKed before reach
+    // or loaded-chunk rejection. CHANGE_DESTROY_DIRECTION is not ACKed.
+    if matches!(action.action, 0 | 2 | 3) {
+        writer
+            .send(
+                &play::Clientbound::BlockChangedAck(play::BlockChangedAck {
+                    sequence: action.sequence,
+                })
+                .encode(),
+            )
+            .map_err(|error| format!("acknowledge block action: {error}"))?;
+    }
+    if action.action == 1 {
+        return Ok(());
+    }
+    if !matches!(action.action, 0 | 2 | 3) {
+        return Err(format!("unsupported PlayerAction {}", action.action));
+    }
+    if !player.loaded || player.awaiting_teleport.is_some() {
+        return Ok(());
+    }
+    let Some(world) = world else {
+        return Ok(());
+    };
+    let pos = BlockPos::new(action.pos[0], action.pos[1], action.pos[2]);
+    let eye = [
+        player.position[0],
+        player.position[1] + 1.62,
+        player.position[2],
+    ];
+    let in_reach = player_mining::within_block_range(eye, 5.5, action.pos);
+
+    if action.action == 0 {
+        if !in_reach {
+            return Ok(());
+        }
+        let resident = world
+            .resident
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !resident.level().is_loaded(pos)
+            || pos.y < resident.level().min_y()
+            || pos.y >= resident.level().max_y()
+        {
+            return Ok(());
+        }
+        let state = resident.level().block_state(pos);
+        let facts = world.resources.behaviours.facts(state);
+        let correct_tool = facts.flags & state_flags::REQUIRES_TOOL == 0;
+        let modifiers = DestroySpeedModifiers {
+            on_ground: player.on_ground,
+            ..DestroySpeedModifiers::default()
+        };
+        let per_tick = player_mining::destroy_progress(
+            facts.hardness,
+            correct_tool,
+            player_mining::destroy_speed(1.0, &modifiers),
+        );
+        let digging = DiggingState {
+            pos: action.pos,
+            started_at: player.server_tick,
+            per_tick,
+            progress: 0.0,
+        };
+        if per_tick >= 1.0 {
+            player.digging = None;
+            drop(resident);
+            destroy_player_block(writer, player.entity_id, world, digging)?;
+        } else {
+            player.dig_clock = Some((action.pos, player.server_tick));
+            player.digging = Some(digging);
+        }
+        return Ok(());
+    }
+
+    if action.action == 2 {
+        player.digging = None;
+        let resident = world
+            .resident
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let state = resident.level().block_state(pos);
+        send_block_update(writer, action.pos, state.0 as i32)?;
+        send_crack_progress(writer, player.entity_id, action.pos, -1)?;
+        return Ok(());
+    }
+
+    let active_dig = player.digging.take().filter(|dig| dig.pos == action.pos);
+    let started_at = player
+        .dig_clock
+        .filter(|(pos, _)| *pos == action.pos)
+        .map(|(_, started_at)| started_at);
+    if !in_reach {
+        return Ok(());
+    }
+    let Some(mut digging) = active_dig.or_else(|| {
+        started_at.map(|started_at| DiggingState {
+            pos: action.pos,
+            started_at,
+            per_tick: 0.0,
+            progress: 0.0,
+        })
+    }) else {
+        return Ok(());
+    };
+    let resident = world
+        .resident
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if !resident.level().is_loaded(pos)
+        || pos.y < resident.level().min_y()
+        || pos.y >= resident.level().max_y()
+    {
+        return Ok(());
+    }
+    let state = resident.level().block_state(pos);
+    let facts = world.resources.behaviours.facts(state);
+    if facts.flags & state_flags::AIR != 0 {
+        return Ok(());
+    }
+    let correct_tool = facts.flags & state_flags::REQUIRES_TOOL == 0;
+    digging.per_tick = player_mining::destroy_progress(
+        facts.hardness,
+        correct_tool,
+        player_mining::destroy_speed(
+            1.0,
+            &DestroySpeedModifiers {
+                on_ground: player.on_ground,
+                ..DestroySpeedModifiers::default()
+            },
+        ),
+    );
+    drop(resident);
+    digging.progress =
+        dig_progress_at_tick(digging.per_tick, player.server_tick, digging.started_at);
+    if stop_dig_breaks(digging.progress) {
+        destroy_player_block(writer, player.entity_id, world, digging)?;
+    } else if player.delayed_dig.is_none() {
+        player.delayed_dig = Some(digging);
+    }
+    Ok(())
+}
+
+/// `lan_actions/dig_stop.rs::stop_dig`: STOP breaks outright at 70%; below
+/// that it becomes a server-side delayed dig.
+fn stop_dig_breaks(progress: f32) -> bool {
+    progress >= 0.7
+}
+
+fn dig_progress_at_tick(per_tick: f32, current_tick: u64, started_at: u64) -> f32 {
+    per_tick * (current_tick - started_at + 1) as f32
+}
+
+fn send_block_update(
+    writer: &mut horizon_protocol::connection::ConnWriter,
+    pos: [i32; 3],
+    state: i32,
+) -> Result<(), String> {
+    writer
+        .send(&play::Clientbound::BlockUpdate(play::BlockUpdate { pos, state }).encode())
+        .map_err(|error| format!("send block update: {error}"))
+}
+
+fn send_crack_progress(
+    writer: &mut horizon_protocol::connection::ConnWriter,
+    id: i32,
+    pos: [i32; 3],
+    progress: i32,
+) -> Result<(), String> {
+    writer
+        .send(
+            &play::Clientbound::BlockDestruction(play::BlockDestruction {
+                id,
+                pos,
+                progress: progress as u8,
+            })
+            .encode(),
+        )
+        .map_err(|error| format!("send block destruction stage: {error}"))
+}
+
+fn destroy_player_block(
+    writer: &mut horizon_protocol::connection::ConnWriter,
+    entity_id: i32,
+    world: &PreparedPlayWorld,
+    digging: DiggingState,
+) -> Result<(), String> {
+    let pos = BlockPos::new(digging.pos[0], digging.pos[1], digging.pos[2]);
+    let mut resident = world
+        .resident
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if !resident.level().is_loaded(pos) {
+        return Ok(());
+    }
+    let state = resident.level().block_state(pos);
+    let correct_tool =
+        world.resources.behaviours.facts(state).flags & state_flags::REQUIRES_TOOL == 0;
+    let destroyed =
+        resident.destroy_block_by_player(&world.resources.behaviours, pos, false, correct_tool);
+    let state = resident.level().block_state(pos);
+    drop(resident);
+    if destroyed {
+        send_block_update(writer, digging.pos, state.0 as i32)?;
+        send_crack_progress(writer, entity_id, digging.pos, -1)?;
+    }
+    Ok(())
+}
+
+fn advance_player_mining(
+    writer: &mut horizon_protocol::connection::ConnWriter,
+    player: &mut PlayerSession,
+    world: Option<&PreparedPlayWorld>,
+) -> Result<(), String> {
+    let Some(world) = world else {
+        player.server_tick = player.server_tick.wrapping_add(1);
+        return Ok(());
+    };
+    let resident = world
+        .resident
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut delayed_completion = None;
+    if let Some(mut digging) = player.digging.take() {
+        let pos = BlockPos::new(digging.pos[0], digging.pos[1], digging.pos[2]);
+        if resident.level().is_loaded(pos)
+            && (resident.level().min_y()..resident.level().max_y()).contains(&pos.y)
+        {
+            let state = resident.level().block_state(pos);
+            let facts = world.resources.behaviours.facts(state);
+            if facts.flags & state_flags::AIR == 0 {
+                let correct_tool = facts.flags & state_flags::REQUIRES_TOOL == 0;
+                digging.per_tick = player_mining::destroy_progress(
+                    facts.hardness,
+                    correct_tool,
+                    player_mining::destroy_speed(
+                        1.0,
+                        &DestroySpeedModifiers {
+                            on_ground: player.on_ground,
+                            ..DestroySpeedModifiers::default()
+                        },
+                    ),
+                );
+                digging.progress = (digging.progress + digging.per_tick).min(1.0);
+                player.digging = Some(digging);
+            }
+        }
+    }
+    if let Some(mut digging) = player.delayed_dig.take() {
+        let pos = BlockPos::new(digging.pos[0], digging.pos[1], digging.pos[2]);
+        if resident.level().is_loaded(pos)
+            && (resident.level().min_y()..resident.level().max_y()).contains(&pos.y)
+        {
+            let state = resident.level().block_state(pos);
+            let facts = world.resources.behaviours.facts(state);
+            if facts.flags & state_flags::AIR == 0 {
+                let correct_tool = facts.flags & state_flags::REQUIRES_TOOL == 0;
+                digging.per_tick = player_mining::destroy_progress(
+                    facts.hardness,
+                    correct_tool,
+                    player_mining::destroy_speed(
+                        1.0,
+                        &DestroySpeedModifiers {
+                            on_ground: player.on_ground,
+                            ..DestroySpeedModifiers::default()
+                        },
+                    ),
+                );
+                digging.progress =
+                    dig_progress_at_tick(digging.per_tick, player.server_tick, digging.started_at);
+                if digging.progress >= 1.0 {
+                    delayed_completion = Some(digging);
+                } else {
+                    player.delayed_dig = Some(digging);
+                }
+            }
+        }
+    }
+    drop(resident);
+    if let Some(digging) = delayed_completion {
+        destroy_player_block(writer, player.entity_id, world, digging)?;
+    }
+    player.server_tick = player.server_tick.wrapping_add(1);
     Ok(())
 }
 
@@ -918,6 +1235,353 @@ mod tests {
     use crate::login::OfflineProfile;
     use horizon_protocol::connection::{Connection, Pipe};
 
+    fn receive_clientbound(client: &mut Connection) -> play::Clientbound {
+        let (id, payload) = client.recv().unwrap();
+        play::Clientbound::decode(id, &payload).unwrap()
+    }
+
+    #[test]
+    fn stop_dig_matches_reference_seventy_percent_threshold() {
+        assert!(!stop_dig_breaks(0.699_999));
+        assert!(stop_dig_breaks(0.7));
+        assert!(stop_dig_breaks(1.0));
+    }
+    #[test]
+    fn mining_progress_uses_server_ticks_not_client_tick_end_packets() {
+        let mut player = PlayerSession::new([0.5, 64.0, 0.5], 1, 9);
+        player.end_tick();
+        player.end_tick();
+        assert_eq!(player.server_tick, 0);
+        assert_eq!(dig_progress_at_tick(0.1, player.server_tick, 0), 0.1);
+        assert_eq!(dig_progress_at_tick(0.1, 3, 0), 0.4);
+    }
+    #[test]
+    fn block_action_ack_is_sent_for_start_stop_abort_but_not_direction_changes() {
+        for action in [0, 2, 3] {
+            let (server_pipe, client_pipe) = Pipe::pair();
+            let (_, mut writer) = Connection::local(server_pipe).split();
+            let mut client = Connection::local(client_pipe);
+            let mut player = PlayerSession::new([0.5, 64.0, 0.5], 1, 9);
+            process_player_action(
+                &mut writer,
+                &mut player,
+                play::PlayerAction {
+                    action,
+                    pos: [0, 64, 0],
+                    direction: 1,
+                    sequence: 120 + action,
+                },
+                None,
+            )
+            .unwrap();
+            let (id, payload) = client.recv().unwrap();
+            assert_eq!(
+                play::Clientbound::decode(id, &payload).unwrap(),
+                play::Clientbound::BlockChangedAck(play::BlockChangedAck {
+                    sequence: 120 + action,
+                })
+            );
+        }
+
+        let (server_pipe, client_pipe) = Pipe::pair();
+        let (_, mut writer) = Connection::local(server_pipe).split();
+        let mut client = Connection::local(client_pipe);
+        let mut player = PlayerSession::new([0.5, 64.0, 0.5], 1, 9);
+        process_player_action(
+            &mut writer,
+            &mut player,
+            play::PlayerAction {
+                action: 1,
+                pos: [0, 64, 0],
+                direction: 1,
+                sequence: 124,
+            },
+            None,
+        )
+        .unwrap();
+        drop(writer);
+        assert!(client.recv().is_err());
+    }
+
+    #[test]
+    fn official_server_resources_drive_survival_mining_through_player_action_packets() {
+        let Some(resources_path) = std::env::var_os("BORIZON_SERVER_RESOURCES") else {
+            eprintln!(
+                "skipped: set BORIZON_SERVER_RESOURCES to run the official 26.3 server-resource smoke test"
+            );
+            return;
+        };
+        let resources = Arc::new(
+            crate::resources::load(std::path::Path::new(&resources_path))
+                .expect("load official 26.3 server resources"),
+        );
+        let air = resources
+            .registry
+            .default_state("minecraft:air")
+            .expect("vanilla air state");
+        let stone = resources
+            .registry
+            .default_state("minecraft:stone")
+            .expect("vanilla stone state");
+        let target = BlockPos::new(0, 64, 0);
+        let spawn = [0.5, 65.0, 0.5];
+        let mut resident = ResidentDimension::new(
+            "minecraft:overworld",
+            ResidentLevel::new(resources.registry, -64, 384, 0).expect("create resident level"),
+            Ticks::new(0),
+        );
+        resident
+            .load_empty_chunk(ChunkPos::new(0, 0))
+            .expect("load empty resident chunk");
+        assert_eq!(
+            resident.level_mut().set_raw(target, stone),
+            Some(air),
+            "place vanilla stone into the loaded chunk fixture"
+        );
+        let world = PreparedPlayWorld {
+            resources,
+            dimension_type: 0,
+            spawn,
+            chunk_packets: Vec::new(),
+            resident: Mutex::new(resident),
+        };
+        let facts = world.resources.behaviours.facts(stone);
+        let correct_tool = facts.flags & state_flags::REQUIRES_TOOL == 0;
+        let per_tick = player_mining::destroy_progress(
+            facts.hardness,
+            correct_tool,
+            player_mining::destroy_speed(1.0, &DestroySpeedModifiers::default()),
+        );
+        assert!((0.0..1.0).contains(&per_tick));
+
+        let (server_pipe, client_pipe) = Pipe::pair();
+        let (_, mut writer) = Connection::local(server_pipe).split();
+        let mut client = Connection::local(client_pipe);
+        let mut player = PlayerSession::new(spawn, 1, 9);
+        player.loaded = true;
+        player.on_ground = true;
+        player.awaiting_teleport = None;
+        process_player_action(
+            &mut writer,
+            &mut player,
+            play::PlayerAction {
+                action: 0,
+                pos: [target.x, target.y, target.z],
+                direction: 1,
+                sequence: 41,
+            },
+            Some(&world),
+        )
+        .unwrap();
+        let (ack_id, ack_payload) = client.recv().unwrap();
+        assert_eq!(
+            play::Clientbound::decode(ack_id, &ack_payload).unwrap(),
+            play::Clientbound::BlockChangedAck(play::BlockChangedAck { sequence: 41 })
+        );
+        let tick_count = (0.8 / per_tick).ceil() as usize + 1;
+        for _ in 0..tick_count {
+            advance_player_mining(&mut writer, &mut player, Some(&world)).unwrap();
+        }
+        process_player_action(
+            &mut writer,
+            &mut player,
+            play::PlayerAction {
+                action: 3,
+                pos: [target.x, target.y, target.z],
+                direction: 1,
+                sequence: 42,
+            },
+            Some(&world),
+        )
+        .unwrap();
+        let (ack_id, ack_payload) = client.recv().unwrap();
+        assert_eq!(
+            play::Clientbound::decode(ack_id, &ack_payload).unwrap(),
+            play::Clientbound::BlockChangedAck(play::BlockChangedAck { sequence: 42 })
+        );
+        let (update_id, update_payload) = client.recv().unwrap();
+        assert!(matches!(
+            play::Clientbound::decode(update_id, &update_payload).unwrap(),
+            play::Clientbound::BlockUpdate(_)
+        ));
+        let (stage_id, stage_payload) = client.recv().unwrap();
+        assert!(matches!(
+            play::Clientbound::decode(stage_id, &stage_payload).unwrap(),
+            play::Clientbound::BlockDestruction(play::BlockDestruction { progress: 255, .. })
+        ));
+        let resident = world.resident.lock().unwrap();
+        let after = resident.level().block_state(target);
+        assert_eq!(after, air, "the PlayerAction flow must destroy the block");
+        assert_ne!(stone, after);
+        drop(resident);
+
+        let mut resident = world.resident.lock().unwrap();
+        assert_eq!(resident.level_mut().set_raw(target, stone), Some(air));
+        drop(resident);
+        process_player_action(
+            &mut writer,
+            &mut player,
+            play::PlayerAction {
+                action: 0,
+                pos: [target.x, target.y, target.z],
+                direction: 1,
+                sequence: 43,
+            },
+            Some(&world),
+        )
+        .unwrap();
+        assert!(matches!(
+            receive_clientbound(&mut client),
+            play::Clientbound::BlockChangedAck(_)
+        ));
+        advance_player_mining(&mut writer, &mut player, Some(&world)).unwrap();
+        process_player_action(
+            &mut writer,
+            &mut player,
+            play::PlayerAction {
+                action: 2,
+                pos: [target.x, target.y, target.z],
+                direction: 1,
+                sequence: 44,
+            },
+            Some(&world),
+        )
+        .unwrap();
+        let (abort_ack_id, abort_ack_payload) = client.recv().unwrap();
+        assert_eq!(
+            play::Clientbound::decode(abort_ack_id, &abort_ack_payload).unwrap(),
+            play::Clientbound::BlockChangedAck(play::BlockChangedAck { sequence: 44 })
+        );
+        assert!(matches!(
+            receive_clientbound(&mut client),
+            play::Clientbound::BlockUpdate(_)
+        ));
+        assert!(matches!(
+            receive_clientbound(&mut client),
+            play::Clientbound::BlockDestruction(play::BlockDestruction { progress: 255, .. })
+        ));
+        assert!(player.digging.is_none());
+        assert_eq!(
+            world.resident.lock().unwrap().level().block_state(target),
+            stone
+        );
+
+        process_player_action(
+            &mut writer,
+            &mut player,
+            play::PlayerAction {
+                action: 0,
+                pos: [target.x, target.y, target.z],
+                direction: 1,
+                sequence: 45,
+            },
+            Some(&world),
+        )
+        .unwrap();
+        let (start_ack_id, start_ack_payload) = client.recv().unwrap();
+        assert!(matches!(
+            play::Clientbound::decode(start_ack_id, &start_ack_payload).unwrap(),
+            play::Clientbound::BlockChangedAck(play::BlockChangedAck { sequence: 45 })
+        ));
+        advance_player_mining(&mut writer, &mut player, Some(&world)).unwrap();
+        let preserved_clock = player.dig_clock;
+        player.position = [100.5, 65.0, 100.5];
+        process_player_action(
+            &mut writer,
+            &mut player,
+            play::PlayerAction {
+                action: 3,
+                pos: [target.x, target.y, target.z],
+                direction: 1,
+                sequence: 46,
+            },
+            Some(&world),
+        )
+        .unwrap();
+        let (far_stop_ack_id, far_stop_ack_payload) = client.recv().unwrap();
+        assert!(matches!(
+            play::Clientbound::decode(far_stop_ack_id, &far_stop_ack_payload).unwrap(),
+            play::Clientbound::BlockChangedAck(play::BlockChangedAck { sequence: 46 })
+        ));
+        assert!(
+            player.digging.is_none(),
+            "out-of-reach STOP ends the active dig"
+        );
+        assert_eq!(
+            player.dig_clock, preserved_clock,
+            "START clock remains for the same block"
+        );
+
+        player.position = spawn;
+        process_player_action(
+            &mut writer,
+            &mut player,
+            play::PlayerAction {
+                action: 3,
+                pos: [target.x, target.y, target.z],
+                direction: 1,
+                sequence: 47,
+            },
+            Some(&world),
+        )
+        .unwrap();
+        let (stop_ack_id, stop_ack_payload) = client.recv().unwrap();
+        assert!(matches!(
+            play::Clientbound::decode(stop_ack_id, &stop_ack_payload).unwrap(),
+            play::Clientbound::BlockChangedAck(play::BlockChangedAck { sequence: 47 })
+        ));
+        assert!(
+            player.delayed_dig.is_some(),
+            "sub-70% STOP should be delayed"
+        );
+        for _ in 0..=(1.0 / per_tick).ceil() as usize {
+            if world.resident.lock().unwrap().level().block_state(target) == air {
+                break;
+            }
+            advance_player_mining(&mut writer, &mut player, Some(&world)).unwrap();
+        }
+        assert_eq!(
+            world.resident.lock().unwrap().level().block_state(target),
+            air
+        );
+        assert!(matches!(
+            receive_clientbound(&mut client),
+            play::Clientbound::BlockUpdate(_)
+        ));
+        assert!(matches!(
+            receive_clientbound(&mut client),
+            play::Clientbound::BlockDestruction(play::BlockDestruction { progress: 255, .. })
+        ));
+    }
+
+    #[test]
+    fn player_action_start_ack_precedes_loaded_and_world_validation() {
+        let (server_pipe, client_pipe) = Pipe::pair();
+        let (_, mut writer) = Connection::local(server_pipe).split();
+        let mut client = Connection::local(client_pipe);
+        let mut player = PlayerSession::new([0.5, 64.0, 0.5], 1, 9);
+        // Not loaded and still awaiting its spawn teleport: vanilla still ACKs
+        // the sequence before rejecting the action for gameplay.
+        process_player_action(
+            &mut writer,
+            &mut player,
+            play::PlayerAction {
+                action: 0,
+                pos: [1, 64, 1],
+                direction: 1,
+                sequence: 42,
+            },
+            None,
+        )
+        .unwrap();
+        let (id, payload) = client.recv().unwrap();
+        assert_eq!(
+            play::Clientbound::decode(id, &payload).unwrap(),
+            play::Clientbound::BlockChangedAck(play::BlockChangedAck { sequence: 42 })
+        );
+        assert!(player.digging.is_none());
+    }
+
     #[test]
     fn movement_resolver_stops_at_wall_and_marks_ground_contact() {
         let wall = VoxelShape::block().moved(Vec3::new(2.0, 1.0, 0.0));
@@ -945,7 +1609,7 @@ mod tests {
         let (server_pipe, client_pipe) = Pipe::pair();
         let (_, mut writer) = Connection::local(server_pipe).split();
         let mut client = Connection::local(client_pipe);
-        let mut player = PlayerSession::new([0.5, 64.0, 0.5], 1);
+        let mut player = PlayerSession::new([0.5, 64.0, 0.5], 1, 1);
         player.awaiting_teleport = None;
         player.loaded = true;
         player
@@ -988,7 +1652,7 @@ mod tests {
     #[test]
     fn movement_waits_for_loaded_client_and_accepted_teleport() {
         let spawn = [4.5, 64.0, -2.5];
-        let mut player = PlayerSession::new(spawn, 1);
+        let mut player = PlayerSession::new(spawn, 1, 1);
         player
             .update_movement(Some([7.5, 64.0, -2.5]), None, 1)
             .unwrap();
@@ -1015,7 +1679,7 @@ mod tests {
 
     #[test]
     fn movement_rejects_non_finite_values_and_duplicate_position_in_one_tick() {
-        let mut player = PlayerSession::new([0.5, 64.0, 0.5], 1);
+        let mut player = PlayerSession::new([0.5, 64.0, 0.5], 1, 1);
         player.awaiting_teleport = None;
         player.loaded = true;
         assert!(
@@ -1051,6 +1715,7 @@ mod tests {
                     client_information: None,
                 },
                 [0.5, 64.0, 0.5],
+                1,
                 None,
             )
         });
@@ -1142,6 +1807,7 @@ mod tests {
                     client_information: None,
                 },
                 [0.5, 64.0, 0.5],
+                1,
                 None,
             )
         });

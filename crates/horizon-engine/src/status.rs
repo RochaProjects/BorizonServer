@@ -62,6 +62,9 @@ fn listen_inner(
     play_server: Option<Arc<PlayServer>>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(address)?;
+    if let Some(server) = &play_server {
+        server.start_world_tick_loop()?;
+    }
     println!(
         "Horizon protocol listener bound to {}",
         listener.local_addr()?

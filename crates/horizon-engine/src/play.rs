@@ -3,8 +3,8 @@
 //! This is not yet the authoritative gameplay loop. Player movement uses resident
 //! contextual collisions, basic survival mining, and synchronous radius-one chunk
 //! streaming handle a limited gameplay path; gravity, entity/block-entity simulation,
-//! shared world ticks, other interactions, coherent post-mutation chunk packets,
-//! autosave/final shutdown, and complete metadata persistence remain pending.
+//! other interactions, coherent post-mutation chunk packets, graceful final shutdown,
+//! and complete metadata persistence remain pending.
 
 use crate::{login::ConfiguredConnection, play_chunk, resources::ServerResources};
 #[cfg(test)]
@@ -223,6 +223,62 @@ impl PlayServer {
                 ..PlayerRegistry::default()
             }),
         }
+    }
+
+    /// Start one server-owned world clock. Connection threads never advance
+    /// global time, so adding players cannot accelerate the world.
+    pub(crate) fn start_world_tick_loop(self: &Arc<Self>) -> std::io::Result<()> {
+        let server = Arc::clone(self);
+        thread::Builder::new()
+            .name("borizon-world-tick".into())
+            .spawn(move || {
+                // Main's autosave interval at the fixed 20 TPS used here:
+                // 300 seconds of ticks, with its 100-tick minimum.
+                const AUTOSAVE_TICKS: i64 = 20 * 300;
+                let mut ticks_until_autosave = AUTOSAVE_TICKS.max(100);
+                let mut next_tick = Instant::now() + SERVER_TICK;
+                loop {
+                    let now = Instant::now();
+                    if now < next_tick {
+                        thread::sleep(next_tick - now);
+                        continue;
+                    }
+                    while Instant::now() >= next_tick {
+                        ticks_until_autosave -= 1;
+                        let autosave = ticks_until_autosave <= 0;
+                        if autosave {
+                            ticks_until_autosave = AUTOSAVE_TICKS.max(100);
+                        }
+                        if let Err(error) = Self::tick_shared_world(&server.world, autosave) {
+                            eprintln!("Borizon world tick: {error}");
+                        }
+                        next_tick += SERVER_TICK;
+                    }
+                }
+            })?;
+        Ok(())
+    }
+
+    fn tick_shared_world(world: &PreparedPlayWorld, autosave: bool) -> Result<(), String> {
+        let mut runtime = world
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        runtime.advance_game_time();
+        let daylight = runtime.game_rules().bool("advance_time");
+        runtime
+            .advance_dimension_day_time("minecraft:overworld", daylight)
+            .ok_or_else(|| "PLAY Overworld disappeared from the shared world runtime".to_owned())?;
+        if autosave {
+            save_runtime_dirty_chunks(&mut runtime, &world.resources)?;
+            runtime
+                .save_world_data()
+                .map_err(|error| format!("autosave PLAY world data: {error}"))?;
+            runtime
+                .sync_regions()
+                .map_err(|error| format!("autosave sync PLAY Anvil regions: {error}"))?;
+        }
+        Ok(())
     }
 
     pub(crate) fn online_players(&self) -> usize {
@@ -2052,6 +2108,16 @@ mod tests {
             runtime: Mutex::new(runtime),
             player_chunks: Mutex::new(HashMap::new()),
         };
+        PlayServer::tick_shared_world(&world, false)
+            .expect("advance global and daylight clocks once through the server owner");
+        {
+            let runtime = world.runtime.lock().unwrap();
+            let dimension = runtime.dimension("minecraft:overworld").unwrap();
+            assert_eq!(runtime.game_time(), 1);
+            assert_eq!(dimension.day_time(), 1);
+        }
+        PlayServer::tick_shared_world(&world, true)
+            .expect("autosave chunks and SavedData through the server owner");
         let (movement_server_pipe, movement_client_pipe) = Pipe::pair();
         let (_, mut movement_writer) = Connection::local(movement_server_pipe).split();
         let mut movement_client = Connection::local(movement_client_pipe);

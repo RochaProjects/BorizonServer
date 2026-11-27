@@ -2,16 +2,15 @@
 //!
 //! This is not the dedicated server engine: callers still drive simulation ticks
 //! and choose chunk lifecycle/readiness. Each dimension owns the complete opaque
-//! NBT payloads for active and manually parked chunks; periodic candidate
-//! discovery, generation, tick scheduling and automatic persistence remain
-//! future engine responsibilities.
+//! NBT payloads for active and manually parked chunks; candidate discovery,
+//! generation, random ticking and automatic persistence remain engine responsibilities.
 //! The owner centralizes local SavedData, per-dimension borders/clocks and cached
 //! region files without carrying client or remote-world state.
 use crate::{
     chunk::ChunkData,
     compression::Compression,
     gamerules::GameRules,
-    level::{LevelAccess, ResidentDimension},
+    level::{Behaviours, LevelAccess, ResidentDimension},
     nbt::Limits,
     region::RegionFile,
     scoreboard::Scoreboard,
@@ -661,6 +660,14 @@ impl<'registry> LocalWorldRuntime<'registry> {
         let day_time = dimension.day_time().wrapping_add(i64::from(advance));
         dimension.set_day_time(day_time);
         Some(day_time)
+    }
+
+    /// Run scheduled vanilla block and fluid ticks in every registered dimension.
+    /// Chunk eligibility is enforced by each resident dimension's current ticket levels.
+    pub fn tick_scheduled(&mut self, behaviours: &Behaviours) {
+        for dimension in self.dimensions.values_mut() {
+            dimension.resident_mut().tick_scheduled(behaviours);
+        }
     }
 
     pub fn dimension(&self, key: &str) -> Option<&WorldDimension<'registry>> {

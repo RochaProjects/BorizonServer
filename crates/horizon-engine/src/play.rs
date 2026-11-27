@@ -3,8 +3,8 @@
 //! This is not yet the authoritative gameplay loop. Player movement uses resident
 //! contextual collisions, basic survival mining, and synchronous radius-one chunk
 //! streaming handle a limited gameplay path; gravity, entity/block-entity simulation,
-//! world ticks, other interactions, coherent post-mutation chunk packets, and
-//! persistence remain pending.
+//! shared world ticks, other interactions, coherent post-mutation chunk packets,
+//! autosave/final shutdown, and complete metadata persistence remain pending.
 
 use crate::{login::ConfiguredConnection, play_chunk, resources::ServerResources};
 #[cfg(test)]
@@ -20,6 +20,7 @@ use horizon_world::{
     level::{BlockId, LevelAccess, ResidentDimension, ResidentLevel, Ticks, data::state_flags},
     nbt::Limits,
     player_mining::{self, DestroySpeedModifiers},
+    ticket_levels::Sources as ChunkTicketSources,
     world_runtime::LocalWorldRuntime,
     worldgen::generator::{GeneratorWorker, OverworldGenerator, ProtoChunk},
 };
@@ -34,6 +35,7 @@ use std::{
 
 const CHUNK_RADIUS: i32 = 1;
 const CHUNK_COUNT: usize = 9;
+const MAX_LIFECYCLE_CANDIDATES: usize = 4096;
 const PLAY_TICK_BARRIER: Duration = Duration::from_millis(50);
 const SERVER_TICK: Duration = Duration::from_millis(50);
 const PACKETS_PER_TICK: usize = 400;
@@ -50,6 +52,7 @@ pub(crate) struct PreparedPlayWorld {
     chunk_packet_cache: Mutex<HashMap<ChunkPos, Vec<u8>>>,
     generator_worker: Option<Mutex<GeneratorWorker>>,
     runtime: Mutex<LocalWorldRuntime<'static>>,
+    player_chunks: Mutex<HashMap<i32, ChunkPos>>,
 }
 
 fn generated_chunk_data(
@@ -403,6 +406,7 @@ impl PreparedPlayWorld {
             chunk_packet_cache: Mutex::new(chunk_packet_cache),
             generator_worker: Some(Mutex::new(worker)),
             runtime: Mutex::new(runtime),
+            player_chunks: Mutex::new(HashMap::new()),
         })
     }
 
@@ -538,7 +542,104 @@ impl PreparedPlayWorld {
             "Horizon: entered initial PLAY for {} at ({:.1}, {:.1}, {:.1}); gameplay simulation is incomplete",
             configured.profile.name, self.spawn[0], self.spawn[1], self.spawn[2]
         );
-        serve_until_disconnect(configured, self.spawn, player_id, Some(self))
+        self.set_player_chunk(player_id, chunk_center(self.spawn))?;
+        let result = serve_until_disconnect(configured, self.spawn, player_id, Some(self));
+        let cleanup = self.finish_player_session(player_id);
+        match (result, cleanup) {
+            (Err(error), _) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    fn finish_player_session(&self, player_id: i32) -> Result<(), String> {
+        let mut first_error = self.remove_player_chunk(player_id).err();
+        let mut runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Err(error) = runtime.save_world_data() {
+            first_error
+                .get_or_insert_with(|| format!("save PLAY world data after session: {error}"));
+        }
+        if let Err(error) = runtime.sync_regions() {
+            first_error
+                .get_or_insert_with(|| format!("sync PLAY Anvil regions after session: {error}"));
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn set_player_chunk(&self, player_id: i32, center: ChunkPos) -> Result<(), String> {
+        let changed = {
+            let mut players = self
+                .player_chunks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if players.get(&player_id) == Some(&center) {
+                false
+            } else {
+                players.insert(player_id, center);
+                true
+            }
+        };
+        if changed {
+            self.reconcile_player_chunks()?;
+        }
+        Ok(())
+    }
+
+    fn remove_player_chunk(&self, player_id: i32) -> Result<(), String> {
+        let removed = self
+            .player_chunks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&player_id)
+            .is_some();
+        if removed {
+            self.reconcile_player_chunks()?;
+        }
+        Ok(())
+    }
+
+    fn reconcile_player_chunks(&self) -> Result<(), String> {
+        let mut players = self
+            .player_chunks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .map(|chunk| (chunk.x, chunk.z))
+            .collect::<Vec<_>>();
+        players.sort_unstable();
+
+        let mut runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let game_time = runtime.game_time();
+        let dimension = runtime
+            .dimension_mut("minecraft:overworld")
+            .expect("the Play Overworld is registered");
+        dimension
+            .resident_mut()
+            .update_chunk_tickets(Some(ChunkTicketSources {
+                players,
+                view_distance: CHUNK_RADIUS,
+                simulation_distance: CHUNK_RADIUS,
+                ..ChunkTicketSources::default()
+            }));
+        let plan = dimension
+            .lifecycle_candidates(MAX_LIFECYCLE_CANDIDATES)
+            .map_err(|error| format!("plan PLAY chunk lifecycle: {error}"))?;
+        dimension
+            .reconcile_ticketed_chunks(
+                plan.candidates,
+                Limits::saved(),
+                game_time,
+                |name| resolve_block_tick(&self.resources, name),
+                resolve_fluid_tick,
+            )
+            .map_err(|error| format!("reconcile PLAY chunk tickets: {error}"))?;
+        Ok(())
     }
 
     fn resolve_player_move(
@@ -1585,7 +1686,9 @@ fn update_player_movement(
             if (0..3).any(|axis| (resolved[axis] - requested[axis]).abs() > 1.0e-4) {
                 player.send_correction(writer, resolved)?;
             }
-            world.update_client_chunk_view(writer, player, chunk_center(resolved))?;
+            let center = chunk_center(resolved);
+            world.update_client_chunk_view(writer, player, center)?;
+            world.set_player_chunk(player.entity_id, center)?;
         }
         Err(_) => player.send_correction(writer, start)?,
     }
@@ -1947,6 +2050,7 @@ mod tests {
             chunk_packet_cache: Mutex::new(HashMap::new()),
             generator_worker: Some(Mutex::new(generator_worker)),
             runtime: Mutex::new(runtime),
+            player_chunks: Mutex::new(HashMap::new()),
         };
         let (movement_server_pipe, movement_client_pipe) = Pipe::pair();
         let (_, mut movement_writer) = Connection::local(movement_server_pipe).split();
@@ -2266,6 +2370,61 @@ mod tests {
             receive_clientbound(&mut client),
             play::Clientbound::BlockDestruction(play::BlockDestruction { progress: 255, .. })
         ));
+
+        // The fixture used several independent PlayerSession owners. Release
+        // their ticket sources before the lifecycle assertions below.
+        world
+            .remove_player_chunk(9)
+            .expect("release the first synthetic player's ticket");
+        world
+            .remove_player_chunk(10)
+            .expect("release the streamed synthetic player's ticket");
+        world
+            .set_player_chunk(9, ChunkPos::new(0, 0))
+            .expect("install the first vanilla player ticket");
+        let owned_chunk_count = {
+            let mut runtime = world.runtime.lock().unwrap();
+            save_runtime_dirty_chunks(&mut runtime, &world.resources)
+                .expect("persist all chunks before ticket-driven parking");
+            runtime
+                .dimension("minecraft:overworld")
+                .unwrap()
+                .resident()
+                .level()
+                .loaded_chunk_count()
+        };
+        world
+            .set_player_chunk(9, ChunkPos::new(40, 0))
+            .expect("reconcile after the player leaves the fixture chunks");
+        {
+            let runtime = world.runtime.lock().unwrap();
+            let dimension = runtime.dimension("minecraft:overworld").unwrap();
+            assert_eq!(dimension.resident().level().loaded_chunk_count(), 0);
+            assert_eq!(dimension.parked_chunk_count(), owned_chunk_count);
+        }
+        world
+            .set_player_chunk(9, ChunkPos::new(0, 0))
+            .expect("reactivate the saved fixture chunks when ticketed again");
+        {
+            let runtime = world.runtime.lock().unwrap();
+            let dimension = runtime.dimension("minecraft:overworld").unwrap();
+            assert_eq!(
+                dimension.resident().level().loaded_chunk_count(),
+                owned_chunk_count
+            );
+            assert_eq!(dimension.parked_chunk_count(), 0);
+            assert_eq!(dimension.resident().level().block_state(target), air);
+        }
+        world
+            .finish_player_session(9)
+            .expect("release tickets and checkpoint the world on logout");
+        {
+            let runtime = world.runtime.lock().unwrap();
+            let dimension = runtime.dimension("minecraft:overworld").unwrap();
+            assert_eq!(dimension.resident().level().loaded_chunk_count(), 0);
+            assert_eq!(dimension.parked_chunk_count(), owned_chunk_count);
+        }
+        assert!(world_root.join("level.dat").is_file());
         drop(world);
         std::fs::remove_dir_all(world_root).unwrap();
     }

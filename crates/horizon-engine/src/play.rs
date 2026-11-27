@@ -1,8 +1,9 @@
 //! Server-owned PLAY bootstrap with one resident Overworld shared by sessions.
 //!
 //! This is not yet the authoritative gameplay loop. Player movement uses resident
-//! contextual collisions and basic survival mining handles PlayerAction; gravity,
-//! entity/block-entity simulation, world ticks, other interactions, streaming and
+//! contextual collisions, basic survival mining, and synchronous radius-one chunk
+//! streaming handle a limited gameplay path; gravity, entity/block-entity simulation,
+//! world ticks, other interactions, coherent post-mutation chunk packets, and
 //! persistence remain pending.
 
 use crate::{login::ConfiguredConnection, play_chunk, resources::ServerResources};
@@ -17,10 +18,10 @@ use horizon_world::{
     fluid::FluidKind,
     level::{BlockId, LevelAccess, ResidentDimension, ResidentLevel, Ticks, data::state_flags},
     player_mining::{self, DestroySpeedModifiers},
-    worldgen::generator::{OverworldGenerator, ProtoChunk},
+    worldgen::generator::{GeneratorWorker, OverworldGenerator, ProtoChunk},
 };
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
     sync::{Arc, Mutex},
     thread,
@@ -42,12 +43,96 @@ pub(crate) struct PreparedPlayWorld {
     dimension_type: i32,
     spawn: [f64; 3],
     chunk_packets: Vec<Vec<u8>>,
+    chunk_packet_cache: Mutex<HashMap<ChunkPos, Vec<u8>>>,
+    generator_worker: Option<Mutex<GeneratorWorker>>,
     resident: Mutex<ResidentDimension<'static>>,
 }
 
+fn generated_chunk_data(
+    proto: &ProtoChunk,
+    resources: &ServerResources,
+) -> Result<horizon_world::chunk::ChunkData, String> {
+    proto
+        .to_chunk_data(
+            |id| {
+                u16::try_from(id.0)
+                    .ok()
+                    .filter(|id| usize::from(*id) < resources.behaviours.table.block_count())
+                    .map(|id| {
+                        resources
+                            .behaviours
+                            .table
+                            .info(BlockId(id))
+                            .name
+                            .to_string()
+                    })
+            },
+            |id| {
+                usize::try_from(id.0)
+                    .ok()
+                    .and_then(|index| FluidKind::ALL.get(index))
+                    .map(|fluid| fluid.name().to_owned())
+            },
+        )
+        .map_err(|error| format!("encode generated resident chunk: {error}"))
+}
+
+fn encode_center_chunk(
+    proto: &ProtoChunk,
+    light: horizon_protocol::chunk::LightData,
+    resources: &ServerResources,
+) -> Result<(Vec<u8>, horizon_world::chunk::ChunkData), String> {
+    let position = proto.position();
+    let chunk =
+        play_chunk::encode_generated_chunk(proto, resources.registry, &resources.behaviours)?;
+    let packet = play::Clientbound::LevelChunkWithLight(play::LevelChunkWithLight {
+        x: position.x,
+        z: position.z,
+        chunk,
+        light,
+    })
+    .encode();
+    Ok((packet, generated_chunk_data(proto, resources)?))
+}
+
+fn generate_center_chunk(
+    worker: &mut GeneratorWorker,
+    center: ChunkPos,
+    resources: &ServerResources,
+) -> Result<(Vec<u8>, horizon_world::chunk::ChunkData), String> {
+    let mut chunks = Vec::with_capacity(CHUNK_COUNT);
+    for z in center.z - CHUNK_RADIUS..=center.z + CHUNK_RADIUS {
+        for x in center.x - CHUNK_RADIUS..=center.x + CHUNK_RADIUS {
+            chunks.push(
+                worker
+                    .generate_proto(ChunkPos::new(x, z))
+                    .map_err(|error| format!("generate chunk ({x},{z}): {error}"))?,
+            );
+        }
+    }
+    let mut region: [ProtoChunk; CHUNK_COUNT] = chunks
+        .try_into()
+        .map_err(|_| "worldgen did not produce a 3×3 chunk region")?;
+    worker
+        .decorate(&mut region)
+        .map_err(|error| format!("decorate chunk ({},{}): {error}", center.x, center.z))?;
+    if !region[4].is_decorated() || region[4].position() != center {
+        return Err(format!(
+            "worldgen did not finalize the requested center chunk ({},{})",
+            center.x, center.z
+        ));
+    }
+    let lights = resources.light_occlusion.light_overworld_region(
+        &region,
+        resources.registry,
+        &resources.behaviours,
+    )?;
+    encode_center_chunk(&region[4], lights[4].clone(), resources)
+}
+
 /// Shared world admission state for the PLAY listener. The resident dimension
-/// is shared; authoritative player simulation and cross-player updates remain
-/// incomplete.
+/// and generated chunk packet cache are shared; authoritative simulation and
+/// cross-player updates remain incomplete.
 pub(crate) struct PlayServer {
     world: Arc<PreparedPlayWorld>,
     players: Mutex<PlayerRegistry>,
@@ -161,6 +246,8 @@ impl PreparedPlayWorld {
         if !region[4].is_decorated() {
             return Err("worldgen did not bring the spawn chunk to Features status".into());
         }
+        let spawn = find_spawn(&region, &resources)?;
+        let spawn_center = chunk_center(spawn);
 
         let mut resident = ResidentDimension::new(
             "minecraft:overworld",
@@ -168,83 +255,51 @@ impl PreparedPlayWorld {
                 .map_err(|error| format!("create resident Overworld: {error}"))?,
             Ticks::new(seed as i32),
         );
-        for proto in &region {
-            let chunk_data = proto
-                .to_chunk_data(
-                    |id| {
-                        u16::try_from(id.0)
-                            .ok()
-                            .filter(|id| {
-                                usize::from(*id) < resources.behaviours.table.block_count()
-                            })
-                            .map(|id| {
-                                resources
-                                    .behaviours
-                                    .table
-                                    .info(BlockId(id))
-                                    .name
-                                    .to_string()
-                            })
-                    },
-                    |id| {
-                        usize::try_from(id.0)
-                            .ok()
-                            .and_then(|index| FluidKind::ALL.get(index))
-                            .map(|fluid| fluid.name().to_owned())
-                    },
-                )
-                .map_err(|error| format!("encode generated resident chunk: {error}"))?;
-            resident
-                .load_generated_chunk_data(
-                    &chunk_data,
-                    0,
-                    |name| {
-                        resources
-                            .behaviours
-                            .table
-                            .block_by_name(name)
-                            .map(|id| TickTypeId(u32::from(id.0)))
-                    },
-                    |name| {
-                        FluidKind::ALL
-                            .into_iter()
-                            .find(|fluid| fluid.name() == name)
-                            .map(|fluid| TickTypeId(fluid.index() as u32))
-                    },
-                )
-                .map_err(|error| format!("load generated resident chunk: {error}"))?;
-        }
-
-        let spawn = find_spawn(&region, &resources)?;
-        let lights = resources.light_occlusion.light_overworld_region(
-            &region,
-            resources.registry,
-            &resources.behaviours,
-        )?;
         let mut chunk_packets = Vec::with_capacity(CHUNK_COUNT);
-        for (index, proto) in region.iter().enumerate() {
-            let x = index % 3;
-            let z = index / 3;
-            let chunk = play_chunk::encode_generated_chunk(
-                proto,
-                resources.registry,
-                &resources.behaviours,
-            )?;
-            chunk_packets.push(
-                play::Clientbound::LevelChunkWithLight(play::LevelChunkWithLight {
-                    x: x as i32 - CHUNK_RADIUS,
-                    z: z as i32 - CHUNK_RADIUS,
-                    chunk,
-                    light: lights[index].clone(),
-                })
-                .encode(),
-            );
+        let mut chunk_packet_cache = HashMap::with_capacity(CHUNK_COUNT);
+        for z in spawn_center.z - CHUNK_RADIUS..=spawn_center.z + CHUNK_RADIUS {
+            for x in spawn_center.x - CHUNK_RADIUS..=spawn_center.x + CHUNK_RADIUS {
+                let position = ChunkPos::new(x, z);
+                let (packet, chunk_data) = if position == region[4].position() {
+                    let lights = resources.light_occlusion.light_overworld_region(
+                        &region,
+                        resources.registry,
+                        &resources.behaviours,
+                    )?;
+                    encode_center_chunk(&region[4], lights[4].clone(), &resources)?
+                } else {
+                    generate_center_chunk(&mut worker, position, &resources)?
+                };
+                resident
+                    .load_generated_chunk_data(
+                        &chunk_data,
+                        0,
+                        |name| {
+                            resources
+                                .behaviours
+                                .table
+                                .block_by_name(name)
+                                .map(|id| TickTypeId(u32::from(id.0)))
+                        },
+                        |name| {
+                            FluidKind::ALL
+                                .into_iter()
+                                .find(|fluid| fluid.name() == name)
+                                .map(|fluid| TickTypeId(fluid.index() as u32))
+                        },
+                    )
+                    .map_err(|error| format!("load generated resident chunk: {error}"))?;
+                chunk_packet_cache.insert(position, packet.clone());
+                chunk_packets.push(packet);
+            }
         }
         Ok(Self {
             resources,
             dimension_type,
             spawn,
             chunk_packets,
+            chunk_packet_cache: Mutex::new(chunk_packet_cache),
+            generator_worker: Some(Mutex::new(worker)),
             resident: Mutex::new(resident),
         })
     }
@@ -290,8 +345,8 @@ impl PreparedPlayWorld {
                     "minecraft:the_end".into(),
                 ],
                 max_players: 20,
-                chunk_radius: 2,
-                simulation_distance: 2,
+                chunk_radius: CHUNK_RADIUS,
+                simulation_distance: CHUNK_RADIUS,
                 reduced_debug_info: false,
                 show_death_screen: true,
                 limited_crafting: false,
@@ -327,8 +382,12 @@ impl PreparedPlayWorld {
                 yaw: 0.0,
                 pitch: 0.0,
             }),
-            play::Clientbound::SetChunkCacheRadius(play::Distance { distance: 2 }),
-            play::Clientbound::SetSimulationDistance(play::Distance { distance: 2 }),
+            play::Clientbound::SetChunkCacheRadius(play::Distance {
+                distance: CHUNK_RADIUS,
+            }),
+            play::Clientbound::SetSimulationDistance(play::Distance {
+                distance: CHUNK_RADIUS,
+            }),
             play::Clientbound::SetChunkCacheCenter(play::SetChunkCacheCenter {
                 x: spawn_chunk[0],
                 z: spawn_chunk[1],
@@ -398,6 +457,166 @@ impl PreparedPlayWorld {
             fall_distance,
             on_ground,
         )
+    }
+
+    fn prepare_player_view(&self, player: &PlayerSession, center: ChunkPos) -> Result<(), String> {
+        for z in center.z - CHUNK_RADIUS..=center.z + CHUNK_RADIUS {
+            for x in center.x - CHUNK_RADIUS..=center.x + CHUNK_RADIUS {
+                let position = ChunkPos::new(x, z);
+                if !player.sent_chunks.contains(&position) {
+                    self.prepare_chunk(position)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_chunk(&self, position: ChunkPos) -> Result<(), String> {
+        if self
+            .chunk_packet_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(&position)
+        {
+            return Ok(());
+        }
+        let Some(worker) = &self.generator_worker else {
+            return Err(format!(
+                "cannot stream missing chunk ({},{}): no server generator worker",
+                position.x, position.z
+            ));
+        };
+        let mut worker = worker.lock().unwrap_or_else(|error| error.into_inner());
+        if self
+            .chunk_packet_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(&position)
+        {
+            return Ok(());
+        }
+        let (packet, chunk_data) = generate_center_chunk(&mut worker, position, &self.resources)?;
+        let mut resident = self
+            .resident
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let probe = BlockPos::new(position.x * 16, -64, position.z * 16);
+        if resident.level().is_loaded(probe) {
+            return Err(format!(
+                "resident chunk ({},{}) has no packet snapshot; refusing to send regenerated data",
+                position.x, position.z
+            ));
+        }
+        resident
+            .load_generated_chunk_data(
+                &chunk_data,
+                0,
+                |name| {
+                    self.resources
+                        .behaviours
+                        .table
+                        .block_by_name(name)
+                        .map(|id| TickTypeId(u32::from(id.0)))
+                },
+                |name| {
+                    FluidKind::ALL
+                        .into_iter()
+                        .find(|fluid| fluid.name() == name)
+                        .map(|fluid| TickTypeId(fluid.index() as u32))
+                },
+            )
+            .map_err(|error| {
+                format!(
+                    "load streamed chunk ({},{}): {error}",
+                    position.x, position.z
+                )
+            })?;
+        drop(resident);
+        self.chunk_packet_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(position, packet);
+        Ok(())
+    }
+
+    fn update_client_chunk_view(
+        &self,
+        writer: &mut horizon_protocol::connection::ConnWriter,
+        player: &mut PlayerSession,
+        center: ChunkPos,
+    ) -> Result<(), String> {
+        if center == player.chunk_center {
+            return Ok(());
+        }
+        writer
+            .send(
+                &play::Clientbound::SetChunkCacheCenter(play::SetChunkCacheCenter {
+                    x: center.x,
+                    z: center.z,
+                })
+                .encode(),
+            )
+            .map_err(|error| format!("update client chunk cache center: {error}"))?;
+
+        let desired = chunks_in_view(center);
+        let mut forgotten = player
+            .sent_chunks
+            .difference(&desired)
+            .copied()
+            .collect::<Vec<_>>();
+        forgotten.sort_by_key(|chunk| (chunk.z, chunk.x));
+        for chunk in forgotten {
+            writer
+                .send(
+                    &play::Clientbound::ForgetLevelChunk(play::ForgetLevelChunk {
+                        pos: [chunk.x, chunk.z],
+                    })
+                    .encode(),
+                )
+                .map_err(|error| {
+                    format!("forget client chunk ({},{}): {error}", chunk.x, chunk.z)
+                })?;
+        }
+
+        let mut added = desired
+            .difference(&player.sent_chunks)
+            .copied()
+            .collect::<Vec<_>>();
+        added.sort_by_key(|chunk| (chunk.z, chunk.x));
+        if !added.is_empty() {
+            writer
+                .send(
+                    &play::Clientbound::ChunkBatchStart(horizon_protocol::packets::Empty).encode(),
+                )
+                .map_err(|error| format!("start streamed chunk batch: {error}"))?;
+            let cache = self
+                .chunk_packet_cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for chunk in &added {
+                let packet = cache.get(chunk).ok_or_else(|| {
+                    format!(
+                        "streamed chunk ({},{}) has no encoded packet",
+                        chunk.x, chunk.z
+                    )
+                })?;
+                writer.send(packet).map_err(|error| {
+                    format!("send streamed chunk ({},{}): {error}", chunk.x, chunk.z)
+                })?;
+            }
+            drop(cache);
+            writer
+                .send(
+                    &play::Clientbound::ChunkBatchFinished(play::ChunkBatchFinished {
+                        size: added.len() as i32,
+                    })
+                    .encode(),
+                )
+                .map_err(|error| format!("finish streamed chunk batch: {error}"))?;
+        }
+        player.sent_chunks = desired;
+        player.chunk_center = center;
+        Ok(())
     }
 }
 
@@ -494,10 +713,29 @@ fn find_spawn(
         .ok_or_else(|| "spawn 3×3 has no exposed full-collision ground or water surface".into())
 }
 
+fn chunk_center(position: [f64; 3]) -> ChunkPos {
+    ChunkPos::new(
+        (position[0].floor() as i32).div_euclid(16),
+        (position[2].floor() as i32).div_euclid(16),
+    )
+}
+
+fn chunks_in_view(center: ChunkPos) -> HashSet<ChunkPos> {
+    let mut chunks = HashSet::with_capacity(CHUNK_COUNT);
+    for z in center.z - CHUNK_RADIUS..=center.z + CHUNK_RADIUS {
+        for x in center.x - CHUNK_RADIUS..=center.x + CHUNK_RADIUS {
+            chunks.insert(ChunkPos::new(x, z));
+        }
+    }
+    chunks
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct PlayerSession {
     entity_id: i32,
     position: [f64; 3],
+    chunk_center: ChunkPos,
+    sent_chunks: HashSet<ChunkPos>,
     yaw: f32,
     pitch: f32,
     on_ground: bool,
@@ -522,9 +760,12 @@ struct DiggingState {
 
 impl PlayerSession {
     fn new(spawn: [f64; 3], teleport_id: i32, entity_id: i32) -> Self {
+        let chunk_center = chunk_center(spawn);
         Self {
             entity_id,
             position: spawn,
+            chunk_center,
+            sent_chunks: chunks_in_view(chunk_center),
             yaw: 0.0,
             pitch: 0.0,
             on_ground: false,
@@ -1149,6 +1390,11 @@ fn update_player_movement(
     if exceeds_base_movement_limit(start, requested) {
         return player.send_correction(writer, start);
     }
+    let requested_center = chunk_center(requested);
+    if let Err(error) = world.prepare_player_view(player, requested_center) {
+        eprintln!("Horizon: refusing movement because chunk streaming failed: {error}");
+        return player.send_correction(writer, start);
+    }
     match world.resolve_player_move(
         player.entity_id,
         start,
@@ -1167,9 +1413,8 @@ fn update_player_movement(
             if (0..3).any(|axis| (resolved[axis] - requested[axis]).abs() > 1.0e-4) {
                 player.send_correction(writer, resolved)?;
             }
+            world.update_client_chunk_view(writer, player, chunk_center(resolved))?;
         }
-        // Until chunk streaming exists, reaching an unloaded chunk is handled
-        // like a refused move: keep the session alive and return the player.
         Err(_) => player.send_correction(writer, start)?,
     }
     Ok(())
@@ -1311,7 +1556,7 @@ mod tests {
             Ticks::new(0),
         );
         for z in -1..=1 {
-            for x in -1..=1 {
+            for x in -1..=2 {
                 resident
                     .load_empty_chunk(ChunkPos::new(x, z))
                     .expect("load movement fixture chunk");
@@ -1324,11 +1569,16 @@ mod tests {
         );
         let wall = BlockPos::new(1, 65, 0);
         assert_eq!(resident.level_mut().set_raw(wall, stone), Some(air));
-        let world = PreparedPlayWorld {
+        let generator_worker = OverworldGenerator::new(resources.worldgen.clone(), 0)
+            .expect("create official Overworld generator")
+            .worker();
+        let mut world = PreparedPlayWorld {
             resources,
             dimension_type: 0,
             spawn,
             chunk_packets: Vec::new(),
+            chunk_packet_cache: Mutex::new(HashMap::new()),
+            generator_worker: Some(Mutex::new(generator_worker)),
             resident: Mutex::new(resident),
         };
         let (movement_server_pipe, movement_client_pipe) = Pipe::pair();
@@ -1360,10 +1610,65 @@ mod tests {
         ));
         assert!(
             world
-                .resolve_player_move(9, [31.5, 65.0, 0.5], [32.5, 65.0, 0.5], 0.0, false)
+                .resolve_player_move(9, [47.5, 65.0, 0.5], [48.5, 65.0, 0.5], 0.0, false)
                 .is_err(),
-            "movement into an unloaded chunk must be refused until streaming exists"
+            "the collision resolver must still fail closed before the streaming owner loads a chunk"
         );
+
+        let mut streamer = PlayerSession::new([31.5, 65.0, 0.5], 2, 10);
+        streamer.loaded = true;
+        streamer.awaiting_teleport = None;
+        update_player_movement(
+            &mut movement_writer,
+            &mut streamer,
+            Some([32.5, 65.0, 0.5]),
+            None,
+            0,
+            Some(&world),
+        )
+        .expect("stream chunks before accepting movement into the next view");
+        assert_eq!(streamer.position, [32.5, 65.0, 0.5]);
+        let mut streamed_chunks = Vec::new();
+        let mut finished = false;
+        while !finished {
+            let (id, payload) = movement_client.recv().unwrap();
+            match play::Clientbound::decode(id, &payload).unwrap() {
+                play::Clientbound::LevelChunkWithLight(chunk) => {
+                    streamed_chunks.push((chunk.x, chunk.z));
+                }
+                play::Clientbound::ChunkBatchFinished(batch) => {
+                    assert_eq!(batch.size, 3);
+                    finished = true;
+                }
+                play::Clientbound::SetChunkCacheCenter(center) => {
+                    assert_eq!((center.x, center.z), (2, 0));
+                }
+                play::Clientbound::ForgetLevelChunk(_) | play::Clientbound::ChunkBatchStart(_) => {}
+                packet => panic!("unexpected packet during chunk view shift: {packet:?}"),
+            }
+        }
+        assert_eq!(streamed_chunks, vec![(3, -1), (3, 0), (3, 1)]);
+
+        let mut blocked_streamer = PlayerSession::new([47.5, 65.0, 0.5], 3, 11);
+        blocked_streamer.loaded = true;
+        blocked_streamer.awaiting_teleport = None;
+        drop(world.generator_worker.take());
+        update_player_movement(
+            &mut movement_writer,
+            &mut blocked_streamer,
+            Some([48.5, 65.0, 0.5]),
+            None,
+            0,
+            Some(&world),
+        )
+        .expect("a streaming failure must reject movement without closing the session");
+        assert_eq!(blocked_streamer.position, [47.5, 65.0, 0.5]);
+        let (id, payload) = movement_client.recv().unwrap();
+        assert!(matches!(
+            play::Clientbound::decode(id, &payload).unwrap(),
+            play::Clientbound::PlayerPosition(play::PlayerPosition { position, .. })
+                if position == [47.5, 65.0, 0.5]
+        ));
 
         let water = world
             .resources

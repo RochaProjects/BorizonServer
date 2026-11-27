@@ -2,6 +2,7 @@ mod light;
 pub mod login;
 mod play;
 mod play_chunk;
+mod play_collision;
 pub mod registry_sync;
 mod resources;
 mod status;

@@ -1,18 +1,20 @@
 //! Server-owned PLAY bootstrap with one resident Overworld shared by sessions.
 //!
-//! This is not yet the authoritative gameplay loop. Player movement is checked
-//! against resident static block collisions; gravity, entities, world ticks,
-//! block interaction, chunk streaming and persistence remain pending.
+//! This is not yet the authoritative gameplay loop. Player movement uses resident
+//! contextual collisions and basic survival mining handles PlayerAction; gravity,
+//! entity/block-entity simulation, world ticks, other interactions, streaming and
+//! persistence remain pending.
 
 use crate::{login::ConfiguredConnection, play_chunk, resources::ServerResources};
+#[cfg(test)]
+use horizon_core::geometry::{Aabb, Vec3, VoxelShape, try_resolve_step_movement};
 use horizon_core::{
-    geometry::{Aabb, Vec3, VoxelShape, try_resolve_step_movement},
     position::{BlockPos, ChunkPos},
     ticks::TickTypeId,
 };
 use horizon_protocol::packets::{configuration::KeepAlive, play};
 use horizon_world::{
-    fluid::{FluidKind, FluidState},
+    fluid::FluidKind,
     level::{BlockId, LevelAccess, ResidentDimension, ResidentLevel, Ticks, data::state_flags},
     player_mining::{self, DestroySpeedModifiers},
     worldgen::generator::{OverworldGenerator, ProtoChunk},
@@ -377,65 +379,29 @@ impl PreparedPlayWorld {
 
     fn resolve_player_move(
         &self,
+        entity_id: i32,
         from: [f64; 3],
         requested: [f64; 3],
+        fall_distance: f64,
         on_ground: bool,
     ) -> Result<([f64; 3], bool), String> {
         let resident = self
             .resident
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let level = resident.level();
-        resolve_movement_with_shapes(from, requested, on_ground, |bounds| {
-            let min = bounds.min_position();
-            let max = bounds.max_position();
-            let floor = |v: f64| v.floor().clamp(-30_000_000.0, 30_000_000.0) as i32;
-            let (min_x, min_y, min_z) = (floor(min.x), floor(min.y), floor(min.z));
-            let (max_x, max_y, max_z) = (floor(max.x), floor(max.y), floor(max.z));
-            // Bound broad-phase work even when a client reports a huge jump.
-            let volume = i64::from(max_x - min_x + 1)
-                .saturating_mul(i64::from(max_y - min_y + 1))
-                .saturating_mul(i64::from(max_z - min_z + 1));
-            if volume > 16_384 {
-                return Err("movement collision query is too large".to_owned());
-            }
-            let mut collisions = Vec::new();
-            for y in min_y..=max_y {
-                for z in min_z..=max_z {
-                    for x in min_x..=max_x {
-                        let block = BlockPos::new(x, y, z);
-                        if !level.is_loaded(block) {
-                            return Err("movement reached a chunk that is not loaded".into());
-                        }
-                        let state = level.block_state(block);
-                        if let Some(shape) = self.resources.behaviours.collision_shape(state) {
-                            if !shape.is_empty() {
-                                collisions.push(shape.moved(Vec3::new(
-                                    f64::from(x),
-                                    f64::from(y),
-                                    f64::from(z),
-                                )));
-                            }
-                        } else {
-                            let facts = self.resources.behaviours.facts(state);
-                            if facts.fluid == FluidState::EMPTY
-                                && facts.flags & state_flags::FULL_COLLISION != 0
-                            {
-                                collisions.push(VoxelShape::block().moved(Vec3::new(
-                                    f64::from(x),
-                                    f64::from(y),
-                                    f64::from(z),
-                                )));
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(collisions)
-        })
+        crate::play_collision::resolve_player_move(
+            resident.level(),
+            &self.resources,
+            entity_id,
+            from,
+            requested,
+            fall_distance,
+            on_ground,
+        )
     }
 }
 
+#[cfg(test)]
 fn player_box(position: [f64; 3], half_width: f64, height: f64) -> Aabb {
     Aabb::new(
         Vec3::new(
@@ -451,6 +417,7 @@ fn player_box(position: [f64; 3], half_width: f64, height: f64) -> Aabb {
     )
 }
 
+#[cfg(test)]
 fn resolve_movement_with_shapes<E>(
     from: [f64; 3],
     requested: [f64; 3],
@@ -534,6 +501,7 @@ struct PlayerSession {
     yaw: f32,
     pitch: f32,
     on_ground: bool,
+    fall_distance: f64,
     last_teleport_id: i32,
     awaiting_teleport: Option<(i32, [f64; 3])>,
     loaded: bool,
@@ -560,6 +528,7 @@ impl PlayerSession {
             yaw: 0.0,
             pitch: 0.0,
             on_ground: false,
+            fall_distance: 0.0,
             last_teleport_id: teleport_id,
             awaiting_teleport: Some((teleport_id, spawn)),
             loaded: false,
@@ -1180,10 +1149,21 @@ fn update_player_movement(
     if exceeds_base_movement_limit(start, requested) {
         return player.send_correction(writer, start);
     }
-    match world.resolve_player_move(start, requested, flags & 1 != 0) {
+    match world.resolve_player_move(
+        player.entity_id,
+        start,
+        requested,
+        player.fall_distance,
+        flags & 1 != 0,
+    ) {
         Ok((resolved, grounded)) => {
             player.position = resolved;
             player.on_ground = grounded || flags & 1 != 0;
+            if grounded {
+                player.fall_distance = 0.0;
+            } else if resolved[1] < start[1] {
+                player.fall_distance += start[1] - resolved[1];
+            }
             if (0..3).any(|axis| (resolved[axis] - requested[axis]).abs() > 1.0e-4) {
                 player.send_correction(writer, resolved)?;
             }
@@ -1304,7 +1284,7 @@ mod tests {
     }
 
     #[test]
-    fn official_server_resources_drive_survival_mining_through_player_action_packets() {
+    fn official_server_resources_drive_play_mining_and_contextual_movement() {
         let Some(resources_path) = std::env::var_os("BORIZON_SERVER_RESOURCES") else {
             eprintln!(
                 "skipped: set BORIZON_SERVER_RESOURCES to run the official 26.3 server-resource smoke test"
@@ -1330,14 +1310,20 @@ mod tests {
             ResidentLevel::new(resources.registry, -64, 384, 0).expect("create resident level"),
             Ticks::new(0),
         );
-        resident
-            .load_empty_chunk(ChunkPos::new(0, 0))
-            .expect("load empty resident chunk");
+        for z in -1..=1 {
+            for x in -1..=1 {
+                resident
+                    .load_empty_chunk(ChunkPos::new(x, z))
+                    .expect("load movement fixture chunk");
+            }
+        }
         assert_eq!(
             resident.level_mut().set_raw(target, stone),
             Some(air),
             "place vanilla stone into the loaded chunk fixture"
         );
+        let wall = BlockPos::new(1, 65, 0);
+        assert_eq!(resident.level_mut().set_raw(wall, stone), Some(air));
         let world = PreparedPlayWorld {
             resources,
             dimension_type: 0,
@@ -1345,6 +1331,77 @@ mod tests {
             chunk_packets: Vec::new(),
             resident: Mutex::new(resident),
         };
+        let (movement_server_pipe, movement_client_pipe) = Pipe::pair();
+        let (_, mut movement_writer) = Connection::local(movement_server_pipe).split();
+        let mut movement_client = Connection::local(movement_client_pipe);
+        let mut mover = PlayerSession::new(spawn, 1, 9);
+        mover.loaded = true;
+        mover.awaiting_teleport = None;
+        update_player_movement(
+            &mut movement_writer,
+            &mut mover,
+            Some([2.5, 65.0, 0.5]),
+            None,
+            0,
+            Some(&world),
+        )
+        .expect("process real PLAY movement packet against official stone shape");
+        assert!(
+            (0.69..=0.71).contains(&mover.position[0]),
+            "player body must stop at the face of the stone wall: {:?}",
+            mover.position
+        );
+        assert!(mover.awaiting_teleport.is_some());
+        let (correction_id, correction_payload) = movement_client.recv().unwrap();
+        assert!(matches!(
+            play::Clientbound::decode(correction_id, &correction_payload).unwrap(),
+            play::Clientbound::PlayerPosition(play::PlayerPosition { position, .. })
+                if (0.69..=0.71).contains(&position[0])
+        ));
+        assert!(
+            world
+                .resolve_player_move(9, [31.5, 65.0, 0.5], [32.5, 65.0, 0.5], 0.0, false)
+                .is_err(),
+            "movement into an unloaded chunk must be refused until streaming exists"
+        );
+
+        let water = world
+            .resources
+            .registry
+            .default_state("minecraft:water")
+            .expect("vanilla water state");
+        let powder_snow = world
+            .resources
+            .registry
+            .default_state("minecraft:powder_snow")
+            .expect("vanilla powder-snow state");
+        {
+            let mut resident = world.resident.lock().unwrap();
+            assert_eq!(
+                resident.level_mut().set_raw(BlockPos::new(0, 65, 2), water),
+                Some(air)
+            );
+            assert_eq!(
+                resident
+                    .level_mut()
+                    .set_raw(BlockPos::new(0, 65, 3), powder_snow),
+                Some(air)
+            );
+        }
+        let (through_water, _) = world
+            .resolve_player_move(9, [0.5, 65.0, 2.5], [2.5, 65.0, 2.5], 0.0, false)
+            .expect("resolve player-context water movement");
+        assert!(
+            through_water[0] > 2.49,
+            "water must not block a player: {through_water:?}"
+        );
+        let (through_powder_snow, _) = world
+            .resolve_player_move(9, [0.5, 65.0, 3.5], [2.5, 65.0, 3.5], 0.0, false)
+            .expect("resolve player-context powder-snow movement");
+        assert!(
+            through_powder_snow[0] > 2.49,
+            "an empty-handed player without leather boots must not stand on powder snow: {through_powder_snow:?}"
+        );
         let facts = world.resources.behaviours.facts(stone);
         let correct_tool = facts.flags & state_flags::REQUIRES_TOOL == 0;
         let per_tick = player_mining::destroy_progress(

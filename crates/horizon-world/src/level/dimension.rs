@@ -130,6 +130,11 @@ impl<'registry> ResidentDimension<'registry> {
         }
     }
 
+    /// Run queued vanilla block events after scheduled and random ticks.
+    pub fn run_block_events(&mut self, behaviours: &Behaviours) {
+        behaviours.run_block_events(&mut self.level, &mut self.ticks);
+    }
+
     /// Apply player-driven destruction using this dimension's paired resident
     /// level and tick owners. This mirrors the existing `Behaviours` contract
     /// while keeping the borrow boundary server-owned and atomic.

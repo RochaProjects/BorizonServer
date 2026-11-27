@@ -684,6 +684,13 @@ impl<'registry> LocalWorldRuntime<'registry> {
         }
     }
 
+    /// Run queued block events in every dimension after scheduled and random ticks.
+    pub fn run_block_events(&mut self, behaviours: &Behaviours) {
+        for dimension in self.dimensions.values_mut() {
+            dimension.resident_mut().run_block_events(behaviours);
+        }
+    }
+
     pub fn dimension(&self, key: &str) -> Option<&WorldDimension<'registry>> {
         self.dimensions.get(key)
     }

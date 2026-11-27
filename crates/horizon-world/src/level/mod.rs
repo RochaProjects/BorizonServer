@@ -632,6 +632,7 @@ pub struct ResidentLevel<'registry> {
     random: LegacyRandom,
     game_time: i64,
     day_time: i64,
+    game_rules: crate::gamerules::GameRules,
     ticking_levels: Levels,
 }
 
@@ -674,6 +675,7 @@ impl<'registry> ResidentLevel<'registry> {
             random: LegacyRandom::new(seed),
             game_time: 0,
             day_time: 0,
+            game_rules: crate::gamerules::GameRules::default(),
             ticking_levels: Levels::default(),
         })
     }
@@ -927,9 +929,35 @@ impl<'registry> ResidentLevel<'registry> {
         chunks
     }
 
+    /// Find the lowest section at or above `from` with any state accepted by
+    /// the behavior table's random-tick predicate. Distinct palette states are
+    /// checked instead of unpacking all 4096 positions in every section.
+    pub fn next_random_ticking_section(
+        &self,
+        chunk: ChunkPos,
+        from: i32,
+        mut candidate: impl FnMut(BlockStateId) -> bool,
+    ) -> Option<i32> {
+        self.columns
+            .get(&chunk)?
+            .sections
+            .iter()
+            .filter_map(|(&section_y, section)| {
+                let min_y = section_y.checked_mul(16)?;
+                (min_y >= from && min_y < self.max_y && section.any_state(&mut candidate))
+                    .then_some(min_y)
+            })
+            .min()
+    }
+
     pub fn set_times(&mut self, game_time: i64, day_time: i64) {
         self.game_time = game_time;
         self.day_time = day_time;
+    }
+
+    /// Set the loaded world rules used by vanilla block behavior and tick phases.
+    pub fn set_game_rule_catalog(&mut self, rules: crate::gamerules::GameRules) {
+        self.game_rules = rules;
     }
 
     pub(crate) fn set_chunk_ticking_levels(&mut self, levels: Levels) {
@@ -938,6 +966,10 @@ impl<'registry> ResidentLevel<'registry> {
 }
 
 impl LevelAccess for ResidentLevel<'_> {
+    fn game_rule_catalog(&self) -> &crate::gamerules::GameRules {
+        &self.game_rules
+    }
+
     fn block_state(&self, pos: BlockPos) -> BlockStateId {
         if !(self.min_y..self.max_y).contains(&pos.y) || !self.columns.contains_key(&pos.chunk()) {
             return self.air;

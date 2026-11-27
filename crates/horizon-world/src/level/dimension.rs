@@ -4,7 +4,7 @@
 //! entities, lighting, region-file ownership and durability policy remain with the
 //! caller. It makes it harder for the resident block store and scheduled tick owner
 //! to disagree about which chunks are loaded.
-use super::{Behaviours, ResidentLevel, Ticks};
+use super::{Behaviours, LevelAccess, ResidentLevel, Ticks};
 use crate::{
     chunk::ChunkData,
     compression::Compression,
@@ -106,6 +106,28 @@ impl<'registry> ResidentDimension<'registry> {
     /// later phases for the owning engine.
     pub fn tick_scheduled(&mut self, behaviours: &Behaviours) {
         behaviours.tick_scheduled(&mut self.level, &mut self.ticks);
+    }
+
+    /// Run random ticks in loaded chunks selected by the dimension's random
+    /// simulation ticket level. Section discovery uses the resident palettes.
+    pub fn tick_random_chunks(&mut self, behaviours: &Behaviours) {
+        let chunks = self
+            .level
+            .loaded_chunks()
+            .into_iter()
+            .filter(|chunk| {
+                self.chunk_tickets.levels().random_ticking(chunk.x, chunk.z)
+                    && self.level.is_ticking_chunk(*chunk)
+            })
+            .collect::<Vec<_>>();
+        for chunk in chunks {
+            let (level, ticks) = (&mut self.level, &mut self.ticks);
+            behaviours.tick_chunk_random(level, ticks, chunk, |level, from| {
+                level.next_random_ticking_section(chunk, from, |state| {
+                    behaviours.random_tick_candidate(state)
+                })
+            });
+        }
     }
 
     /// Apply player-driven destruction using this dimension's paired resident

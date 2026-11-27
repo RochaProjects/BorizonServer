@@ -270,6 +270,7 @@ impl PlayServer {
             .advance_dimension_day_time("minecraft:overworld", daylight)
             .ok_or_else(|| "PLAY Overworld disappeared from the shared world runtime".to_owned())?;
         runtime.tick_scheduled(&world.resources.behaviours);
+        runtime.tick_random_chunks(&world.resources.behaviours);
         if autosave {
             save_runtime_dirty_chunks(&mut runtime, &world.resources)?;
             runtime

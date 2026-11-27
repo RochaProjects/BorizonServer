@@ -665,8 +665,22 @@ impl<'registry> LocalWorldRuntime<'registry> {
     /// Run scheduled vanilla block and fluid ticks in every registered dimension.
     /// Chunk eligibility is enforced by each resident dimension's current ticket levels.
     pub fn tick_scheduled(&mut self, behaviours: &Behaviours) {
+        let rules = self.game_rules.clone();
         for dimension in self.dimensions.values_mut() {
-            dimension.resident_mut().tick_scheduled(behaviours);
+            let resident = dimension.resident_mut();
+            resident.level_mut().set_game_rule_catalog(rules.clone());
+            resident.tick_scheduled(behaviours);
+        }
+    }
+
+    /// Run random block/fluid ticks for resident chunks allowed by each
+    /// dimension's simulation ticket levels, using the current saved rules.
+    pub fn tick_random_chunks(&mut self, behaviours: &Behaviours) {
+        let rules = self.game_rules.clone();
+        for dimension in self.dimensions.values_mut() {
+            let resident = dimension.resident_mut();
+            resident.level_mut().set_game_rule_catalog(rules.clone());
+            resident.tick_random_chunks(behaviours);
         }
     }
 

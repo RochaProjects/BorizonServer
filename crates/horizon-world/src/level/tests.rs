@@ -1717,6 +1717,10 @@ fn resident_level_rejects_invalid_bounds_and_sections_transactionally() {
 fn resident_level_is_a_consumer_for_vanilla_block_behaviours() {
     let Some(f) = fixture() else { return };
     let mut level = ResidentLevel::new(&f.registry, -64, 384, 42).unwrap();
+    let mut rules = crate::gamerules::GameRules::default();
+    assert!(rules.set_string("random_tick_speed", "0"));
+    level.set_game_rule_catalog(rules);
+    assert_eq!(level.game_rules().random_tick_speed, 0);
     let pos = BlockPos::new(0, 80, 0);
     assert!(level.load_empty_chunk(pos.chunk()));
     let mut ticks = Ticks::new(0);
@@ -1726,6 +1730,14 @@ fn resident_level_is_a_consumer_for_vanilla_block_behaviours() {
             .set_block(&mut level, &mut ticks, pos, stone, flags::UPDATE_ALL)
     );
     assert_eq!(level.block_state(pos), stone);
+    assert_eq!(
+        level.next_random_ticking_section(pos.chunk(), -64, |state| state == stone),
+        Some(80)
+    );
+    assert_eq!(
+        level.next_random_ticking_section(pos.chunk(), 81, |state| state == stone),
+        None
+    );
     assert!(f.behaviours.set_block(
         &mut level,
         &mut ticks,

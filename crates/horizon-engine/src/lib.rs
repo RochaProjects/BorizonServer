@@ -588,9 +588,8 @@ mod tests {
     }
 
     #[test]
-    fn default_execution_is_refused_until_gameplay_is_connected() {
-        let error = run(std::iter::empty()).unwrap_err();
-        assert!(error.contains("runtime has not been extracted"));
+    fn default_execution_selects_the_dedicated_server_command() {
+        assert!(matches!(parse_args(std::iter::empty()), Ok(Command::Run)));
     }
 
     #[test]

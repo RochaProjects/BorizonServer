@@ -68,32 +68,34 @@ fn listen_inner(
     online: Option<Arc<login::OnlineAuthenticator>>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(address)?;
-    if let Some(server) = &play_server {
-        server.start_world_tick_loop()?;
-    }
+    let _world_tick_loop = play_server
+        .as_ref()
+        .map(|server| server.start_world_tick_loop())
+        .transpose()?;
     println!(
         "Horizon protocol listener bound to {}",
         listener.local_addr()?
     );
-    for connection in listener.incoming() {
-        match connection {
-            Ok(stream) => {
-                let registries = registries.clone();
-                let play_server = play_server.clone();
-                let motd = motd.clone();
-                let online = online.clone();
-                thread::Builder::new()
-                    .name("horizon-protocol-client".into())
-                    .spawn(move || {
-                        if let Err(error) = handle(stream, registries, play_server, motd, online) {
-                            eprintln!("Horizon protocol connection: {error}");
-                        }
-                    })?;
-            }
-            Err(error) => eprintln!("Horizon status accept: {error}"),
-        }
+    loop {
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            // The tick-loop guard stops, joins, and flushes the world as this
+            // listener returns instead of leaving a detached simulation thread.
+            Err(error) => return Err(error),
+        };
+        let registries = registries.clone();
+        let play_server = play_server.clone();
+        let motd = motd.clone();
+        let online = online.clone();
+        thread::Builder::new()
+            .name("horizon-protocol-client".into())
+            .spawn(move || {
+                if let Err(error) = handle(stream, registries, play_server, motd, online) {
+                    eprintln!("Horizon protocol connection: {error}");
+                }
+            })?;
     }
-    Ok(())
 }
 
 fn handle(

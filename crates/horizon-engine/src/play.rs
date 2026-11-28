@@ -1277,6 +1277,33 @@ impl Default for PlayerRegistry {
     }
 }
 
+/// Owns the shared world clock thread. Dropping or stopping the listener must
+/// stop and join this thread before its world resources can be released.
+pub(crate) struct WorldTickLoop {
+    stop: SyncSender<()>,
+    worker: Option<thread::JoinHandle<Result<(), String>>>,
+}
+
+impl WorldTickLoop {
+    fn join_worker(&mut self) -> Result<(), String> {
+        let _ = self.stop.send(());
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        worker
+            .join()
+            .map_err(|_| "PLAY world tick owner panicked".to_owned())?
+    }
+}
+
+impl Drop for WorldTickLoop {
+    fn drop(&mut self) {
+        if let Err(error) = self.join_worker() {
+            eprintln!("Borizon final world save: {error}");
+        }
+    }
+}
+
 impl PlayServer {
     pub(crate) fn new(world: Arc<PreparedPlayWorld>) -> Self {
         let max_players = world.max_players;
@@ -1292,11 +1319,12 @@ impl PlayServer {
 
     /// Start one server-owned world clock. Connection threads never advance
     /// global time, so adding players cannot accelerate the world.
-    pub(crate) fn start_world_tick_loop(self: &Arc<Self>) -> std::io::Result<()> {
+    pub(crate) fn start_world_tick_loop(self: &Arc<Self>) -> std::io::Result<WorldTickLoop> {
         let server = Arc::clone(self);
-        thread::Builder::new()
+        let (stop, stop_rx) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
             .name("borizon-world-tick".into())
-            .spawn(move || {
+            .spawn(move || -> Result<(), String> {
                 // Main's autosave interval at the fixed 20 TPS used here:
                 // 300 seconds of ticks, with its 100-tick minimum.
                 const AUTOSAVE_TICKS: i64 = 20 * 300;
@@ -1305,8 +1333,10 @@ impl PlayServer {
                 loop {
                     let now = Instant::now();
                     if now < next_tick {
-                        thread::sleep(next_tick - now);
-                        continue;
+                        match stop_rx.recv_timeout(next_tick - now) {
+                            Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                            Err(RecvTimeoutError::Timeout) => {}
+                        }
                     }
                     while Instant::now() >= next_tick {
                         ticks_until_autosave -= 1;
@@ -1318,9 +1348,34 @@ impl PlayServer {
                             eprintln!("Borizon world tick: {error}");
                         }
                         next_tick += SERVER_TICK;
+                        match stop_rx.try_recv() {
+                            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
+                                return Self::save_final_world(&server.world);
+                            }
+                            Err(mpsc::TryRecvError::Empty) => {}
+                        }
                     }
                 }
+                Self::save_final_world(&server.world)
             })?;
+        Ok(WorldTickLoop {
+            stop,
+            worker: Some(worker),
+        })
+    }
+
+    fn save_final_world(world: &PreparedPlayWorld) -> Result<(), String> {
+        let mut runtime = world
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        save_runtime_dirty_chunks(&mut runtime, &world.resources)?;
+        runtime
+            .save_world_data()
+            .map_err(|error| format!("save final PLAY world data: {error}"))?;
+        runtime
+            .sync_regions()
+            .map_err(|error| format!("sync final PLAY Anvil regions: {error}"))?;
         Ok(())
     }
 
@@ -5475,6 +5530,21 @@ mod tests {
             assert_eq!(dimension.parked_chunk_count(), owned_chunk_count);
         }
         assert!(world_root.join("level.dat").is_file());
+        let world = Arc::new(world);
+        let play_server = Arc::new(PlayServer::new(Arc::clone(&world)));
+        let tick_loop = play_server
+            .start_world_tick_loop()
+            .expect("start the listener-owned world tick thread");
+        thread::sleep(Duration::from_millis(125));
+        drop(tick_loop);
+        let stopped_time = world.runtime.lock().unwrap().game_time();
+        thread::sleep(Duration::from_millis(125));
+        assert_eq!(
+            world.runtime.lock().unwrap().game_time(),
+            stopped_time,
+            "dropping the listener's tick-loop guard must join and stop world time"
+        );
+        drop(play_server);
         drop(world);
         std::fs::remove_dir_all(world_root).unwrap();
     }

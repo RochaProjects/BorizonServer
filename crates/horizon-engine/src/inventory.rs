@@ -4,7 +4,11 @@
 //! armor, main inventory, hotbar, and offhand. This owner intentionally lives
 //! in the dedicated engine; it has no renderer or client-game dependency.
 
-use horizon_protocol::{item::Stack, packets::play};
+use horizon_protocol::{
+    item::{SavedNbtContext, Stack},
+    packets::play,
+};
+use horizon_world::nbt::Tag;
 
 pub(crate) const PLAYER_MENU_SLOTS: usize = 46;
 
@@ -26,6 +30,49 @@ impl Default for PlayerInventory {
 }
 
 impl PlayerInventory {
+    /// Restore vanilla `Inventory` slots from a DataFixed player compound.
+    pub(crate) fn load_saved(&mut self, player: &Tag, nbt: &SavedNbtContext) -> Result<(), String> {
+        self.slots.fill(None);
+        let Some(Tag::List(items)) = player.get("Inventory") else {
+            return Ok(());
+        };
+        for item in items {
+            let saved_slot = match item.get("Slot") {
+                Some(Tag::Byte(slot)) => i16::from(*slot),
+                Some(Tag::Int(slot)) => i16::try_from(*slot).unwrap_or(i16::MIN),
+                _ => continue,
+            };
+            let Some(slot) = menu_slot(saved_slot) else {
+                continue;
+            };
+            let stack = nbt
+                .read(item)
+                .map_err(|error| format!("decode player inventory slot {saved_slot}: {error}"))?;
+            self.slots[slot] = (stack.count > 0).then_some(stack);
+        }
+        Ok(())
+    }
+
+    /// Encode the server-owned inventory using vanilla's player NBT slot
+    /// numbers and current `ItemStack.CODEC` shape.
+    pub(crate) fn save_nbt(&self, nbt: &SavedNbtContext) -> Result<Tag, String> {
+        let mut items = Vec::new();
+        // Vanilla's PlayerInventory saves main storage, armor, then offhand.
+        for saved_slot in 0_i16..36 {
+            let slot = if saved_slot < 9 {
+                36 + usize::try_from(saved_slot).expect("hotbar slot is nonnegative")
+            } else {
+                usize::try_from(saved_slot).expect("inventory slot is nonnegative")
+            };
+            save_slot(&self.slots, &mut items, slot, saved_slot, nbt)?;
+        }
+        for (saved_slot, menu_slot) in [(100, 8), (101, 7), (102, 6), (103, 5)] {
+            save_slot(&self.slots, &mut items, menu_slot, saved_slot, nbt)?;
+        }
+        save_slot(&self.slots, &mut items, 45, -106, nbt)?;
+        Ok(Tag::List(items))
+    }
+
     /// Builds the authoritative `InventoryMenu` snapshot sent when entering
     /// PLAY and when rejecting a client prediction that the server cannot
     /// apply yet. The monotonically changing state id follows the menu's
@@ -199,6 +246,43 @@ impl PlayerInventory {
     pub(crate) fn state_id(&self) -> i32 {
         self.state_id
     }
+}
+
+fn menu_slot(saved_slot: i16) -> Option<usize> {
+    match saved_slot {
+        0..=8 => Some(36 + usize::try_from(saved_slot).ok()?),
+        9..=35 => Some(usize::try_from(saved_slot).ok()?),
+        100 => Some(8),
+        101 => Some(7),
+        102 => Some(6),
+        103 => Some(5),
+        -106 => Some(45),
+        _ => None,
+    }
+}
+
+fn save_slot(
+    slots: &[Option<Stack>],
+    items: &mut Vec<Tag>,
+    menu_slot: usize,
+    saved_slot: i16,
+    nbt: &SavedNbtContext,
+) -> Result<(), String> {
+    let Some(stack) = slots.get(menu_slot) else {
+        return Err(format!("invalid player inventory menu slot {menu_slot}"));
+    };
+    let Some(stack) = stack else {
+        return Ok(());
+    };
+    let mut item = nbt
+        .write(stack)
+        .map_err(|error| format!("encode player inventory slot {saved_slot}: {error}"))?;
+    let Tag::Compound(fields) = &mut item else {
+        return Err("item stack encoder returned a non-compound NBT value".into());
+    };
+    fields.insert("Slot".into(), Tag::Byte(saved_slot as i8));
+    items.push(item);
+    Ok(())
 }
 
 #[cfg(test)]

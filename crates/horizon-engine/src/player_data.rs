@@ -1,5 +1,7 @@
 //! Vanilla player position storage (`players/data/<uuid>.dat`).
 
+use crate::inventory::PlayerInventory;
+use horizon_protocol::item::SavedNbtContext;
 use horizon_world::{
     datafix::files::{read_dat, write_dat},
     nbt::Tag,
@@ -9,11 +11,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct SavedPlayer {
     pub(crate) position: [f64; 3],
     pub(crate) yaw: f32,
     pub(crate) pitch: f32,
+    pub(crate) selected_slot: i16,
+    pub(crate) inventory: PlayerInventory,
 }
 
 fn path(world: &Path, uuid: u128) -> PathBuf {
@@ -23,7 +27,11 @@ fn path(world: &Path, uuid: u128) -> PathBuf {
     ))
 }
 
-pub(crate) fn load(world: &Path, uuid: u128) -> Result<Option<SavedPlayer>, String> {
+pub(crate) fn load(
+    world: &Path,
+    uuid: u128,
+    item_nbt: &SavedNbtContext,
+) -> Result<Option<SavedPlayer>, String> {
     let file = path(world, uuid);
     let backup = file.with_extension("dat_old");
     let root = match read_dat(&file) {
@@ -44,9 +52,15 @@ pub(crate) fn load(world: &Path, uuid: u128) -> Result<Option<SavedPlayer>, Stri
             }
         },
     };
-    let Some(root) = root else {
+    let Some(mut root) = root else {
         return Ok(None);
     };
+    // Match PlayerDataStorage.load: convert the complete player payload using
+    // the vanilla DataFixer before reading fields or handing it to a session.
+    // In particular this upgrades legacy item stacks in Inventory to the
+    // 26.3 item-component format instead of merely stamping a newer version
+    // onto old NBT when the player next disconnects.
+    horizon_world::datafix::update_player(&mut root);
     if let Some(Tag::String(dimension)) = root.get("Dimension")
         && dimension.to_string_lossy() != "minecraft:overworld"
     {
@@ -76,10 +90,17 @@ pub(crate) fn load(world: &Path, uuid: u128) -> Result<Option<SavedPlayer>, Stri
     if !yaw.is_finite() || !pitch.is_finite() {
         return Ok(None);
     }
+    let mut inventory = PlayerInventory::default();
+    inventory.load_saved(&root, item_nbt)?;
     Ok(Some(SavedPlayer {
         position,
         yaw,
         pitch,
+        selected_slot: match root.get("SelectedItemSlot") {
+            Some(Tag::Int(slot)) if (0..=8).contains(slot) => *slot as i16,
+            _ => 0,
+        },
+        inventory,
     }))
 }
 
@@ -89,6 +110,9 @@ pub(crate) fn save(
     position: [f64; 3],
     yaw: f32,
     pitch: f32,
+    selected_slot: i16,
+    inventory: &PlayerInventory,
+    item_nbt: &SavedNbtContext,
 ) -> Result<(), String> {
     if position.iter().any(|value| !value.is_finite()) || !yaw.is_finite() || !pitch.is_finite() {
         return Err("refusing to save non-finite player coordinates or rotation".into());
@@ -111,9 +135,13 @@ pub(crate) fn save(
         },
     };
     let mut root = existing.unwrap_or_else(|| Tag::Compound(Default::default()));
+    // PlayerDataStorage applies this before mutating/saving player state. Keep
+    // older player files structurally upgraded before writing DataVersion 26.3.
+    horizon_world::datafix::update_player(&mut root);
     let Tag::Compound(fields) = &mut root else {
         return Err(format!("player data {} is not a compound", file.display()));
     };
+    fields.insert("Inventory".into(), inventory.save_nbt(item_nbt)?);
     fields.insert(
         "UUID".into(),
         Tag::IntArray(
@@ -142,6 +170,10 @@ pub(crate) fn save(
     fields.insert(
         "Dimension".into(),
         Tag::String("minecraft:overworld".into()),
+    );
+    fields.insert(
+        "SelectedItemSlot".into(),
+        Tag::Int(i32::from(selected_slot.clamp(0, 8))),
     );
     let temporary = file.with_extension("dat.tmp");
     write_dat(&temporary, &root).map_err(|error| {

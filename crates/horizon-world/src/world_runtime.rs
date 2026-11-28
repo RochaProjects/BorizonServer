@@ -735,6 +735,15 @@ impl<'registry> LocalWorldRuntime<'registry> {
         }
     }
 
+    /// Tick block entities that are owned by the server world runtime in each
+    /// registered dimension. This currently advances vanilla moving pistons;
+    /// other block entity types need their own server-owned state and tickers.
+    pub fn tick_block_entities(&mut self, behaviours: &Behaviours) {
+        for dimension in self.dimensions.values_mut() {
+            dimension.resident_mut().tick_block_entities(behaviours);
+        }
+    }
+
     /// Drain authoritative block-state mutations from all dimensions in
     /// deterministic dimension order. Server transports publish this after
     /// each world tick so every connected client observes the same state.

@@ -9,6 +9,44 @@ use crate::{
 use horizon_world::nbt::Tag;
 use std::sync::Arc;
 
+/// Reader/writer for vanilla `ItemStack.CODEC` values in 26.3 player/world
+/// NBT. Registry names are captured once so callers can persist many stacks
+/// without depending on any client-side item model.
+pub struct SavedNbtContext {
+    registries: Arc<std::collections::HashMap<String, crate::registry::Ids>>,
+}
+
+impl SavedNbtContext {
+    pub fn new(builtin: &crate::registry::Builtin, dynamic: &crate::registry::Dynamic) -> Self {
+        let mut registries = builtin.registries.clone();
+        for (name, entries) in &dynamic.registries {
+            registries.insert(
+                name.clone(),
+                crate::registry::Ids::from_names(
+                    entries.iter().map(|(name, _)| name.clone()).collect(),
+                ),
+            );
+        }
+        Self {
+            registries: Arc::new(registries),
+        }
+    }
+
+    /// Decode a saved item stack using the server's 26.3 registry IDs.
+    pub fn read(&self, saved: &Tag) -> Result<Stack> {
+        let _registries = ids::legacy_registries(Arc::clone(&self.registries));
+        v1_20_3::from_saved_nbt(saved)
+    }
+
+    /// Encode an item stack in vanilla's current saved NBT shape. The existing
+    /// pinned legacy codec and DataFixer are used as a bridge; a normalized
+    /// round-trip must reproduce the entire stack or serialization fails.
+    pub fn write(&self, stack: &Stack) -> Result<Tag> {
+        let _registries = ids::legacy_registries(Arc::clone(&self.registries));
+        v1_20_3::to_saved_nbt(stack)
+    }
+}
+
 mod hash;
 mod skip;
 mod trim;

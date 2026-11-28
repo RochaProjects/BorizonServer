@@ -169,6 +169,16 @@ impl<'registry> ResidentDimension<'registry> {
         behaviours.run_block_events(&mut self.level, &mut self.ticks);
     }
 
+    /// Advance moving piston block entities for one server tick.
+    ///
+    /// Vanilla runs handled block events before this phase, so a piston that
+    /// starts moving from an event receives its first movement tick in the
+    /// same level tick. Other block entity tickers are owned by higher-level
+    /// game systems and are not represented by this dimension yet.
+    pub fn tick_block_entities(&mut self, behaviours: &Behaviours) {
+        behaviours.tick_block_entities(&mut self.level, &mut self.ticks);
+    }
+
     /// Apply player-driven destruction using this dimension's paired resident
     /// level and tick owners. This mirrors the existing `Behaviours` contract
     /// while keeping the borrow boundary server-owned and atomic.

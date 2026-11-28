@@ -61,6 +61,16 @@ pub struct RegistryBundle {
 }
 
 impl RegistryBundle {
+    /// Registry names and IDs as assigned by the vanilla configuration order.
+    /// The item NBT codec needs these names even outside a live connection.
+    pub fn dynamic_registries(&self) -> horizon_protocol::registry::Dynamic {
+        let mut dynamic = horizon_protocol::registry::Dynamic::default();
+        for registry in &self.registries {
+            dynamic.add(registry.clone());
+        }
+        dynamic
+    }
+
     #[cfg(test)]
     pub(crate) fn from_test_parts(registries: Vec<RegistryData>, tags: Vec<RegistryTags>) -> Self {
         Self { registries, tags }

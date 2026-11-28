@@ -1337,6 +1337,7 @@ impl PlayServer {
         runtime.tick_scheduled(&world.resources.behaviours);
         runtime.tick_random_chunks(&world.resources.behaviours);
         runtime.run_block_events(&world.resources.behaviours);
+        runtime.tick_block_entities(&world.resources.behaviours);
         let resident = runtime
             .dimension("minecraft:overworld")
             .expect("the PLAY Overworld is registered")
@@ -1640,10 +1641,18 @@ impl PreparedPlayWorld {
         mut configured: ConfiguredConnection,
         player_id: i32,
     ) -> Result<(), String> {
-        let saved_player = crate::player_data::load(&self.world_root, configured.profile.uuid)?;
-        let player_position = saved_player.map_or(self.spawn, |saved| saved.position);
-        let player_yaw = saved_player.map_or(0.0, |saved| saved.yaw);
-        let player_pitch = saved_player.map_or(0.0, |saved| saved.pitch);
+        let saved_player = crate::player_data::load(
+            &self.world_root,
+            configured.profile.uuid,
+            &self.resources.saved_item_nbt,
+        )?;
+        let player_position = saved_player
+            .as_ref()
+            .map_or(self.spawn, |saved| saved.position);
+        let player_yaw = saved_player.as_ref().map_or(0.0, |saved| saved.yaw);
+        let player_pitch = saved_player.as_ref().map_or(0.0, |saved| saved.pitch);
+        let selected_slot = saved_player.as_ref().map_or(0, |saved| saved.selected_slot);
+        let inventory = saved_player.map_or_else(PlayerInventory::default, |saved| saved.inventory);
         let view_distance = configured
             .client_information
             .as_ref()
@@ -1825,6 +1834,8 @@ impl PreparedPlayWorld {
             player_id,
             player_name,
             player_uuid,
+            selected_slot,
+            inventory,
             Some(self),
             view_distance,
             player_chunk,
@@ -1892,6 +1903,9 @@ impl PreparedPlayWorld {
             player.position,
             player.yaw,
             player.pitch,
+            player.selected_slot,
+            &player.inventory,
+            &self.resources.saved_item_nbt,
         )
     }
 
@@ -3002,6 +3016,8 @@ fn serve_until_disconnect(
         entity_id,
         player_name,
         uuid,
+        0,
+        PlayerInventory::default(),
         world,
         view_distance,
         spawn_center,
@@ -3016,6 +3032,8 @@ fn serve_until_disconnect_with_player_data(
     entity_id: i32,
     player_name: String,
     player_uuid: u128,
+    selected_slot: i16,
+    inventory: PlayerInventory,
     world: Option<&PreparedPlayWorld>,
     view_distance: i32,
     spawn_center: ChunkPos,
@@ -3024,6 +3042,8 @@ fn serve_until_disconnect_with_player_data(
     player.name = player_name;
     player.yaw = yaw;
     player.pitch = pitch;
+    player.selected_slot = selected_slot.clamp(0, 8);
+    player.inventory = inventory;
     player.game_mode = world.map_or(0, |world| world.game_mode);
     player.view_distance = view_distance;
     player.chunk_center = spawn_center;

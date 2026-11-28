@@ -438,6 +438,88 @@ fn from_tag(saved: &Tag, known: Option<(i32, i32)>) -> Result<Stack> {
     Ok(stack)
 }
 
+pub(super) fn from_saved_nbt(saved: &Tag) -> Result<Stack> {
+    fn check(value: &Tag) -> Result<()> {
+        match value {
+            Tag::Compound(fields) => {
+                if let Some(Tag::Compound(components)) = value.get("components") {
+                    for name in components.keys() {
+                        let name = name.to_string_lossy();
+                        let component = name.strip_prefix('!').unwrap_or(&name);
+                        if component_id(component).is_none() {
+                            return Err(Error::new(format!(
+                                "saved item has an unsupported data component: {component}"
+                            )));
+                        }
+                    }
+                }
+                for child in fields.values() {
+                    check(child)?;
+                }
+            }
+            Tag::List(values) => {
+                for child in values {
+                    check(child)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    check(saved)?;
+    from_tag(saved, None)
+}
+
+pub(super) fn to_saved_nbt(stack: &Stack) -> Result<Tag> {
+    if !(1..=127).contains(&stack.count) {
+        return Err(Error::new(format!(
+            "item stack count {} cannot be represented in vanilla playerdata",
+            stack.count
+        )));
+    }
+    let legacy = legacy_tag(stack)?;
+    let mut saved = Tag::compound([
+        (
+            "id",
+            d::string(&registry_name("minecraft:item", stack.item)?),
+        ),
+        ("Count", Tag::Byte(stack.count as i8)),
+    ]);
+    if !matches!(&legacy, Tag::Compound(fields) if fields.is_empty()) {
+        d::set(&mut saved, "tag", legacy);
+    }
+    // ItemStackComponentizationFix is the vanilla 1.20.5 bridge from the
+    // legacy `tag` shape to current `components` NBT. The DataFixer supplies
+    // every intervening vanilla item fix.
+    const DATA_VERSION_1_20_4: i32 = 3_837;
+    datafix::update(
+        Ty::ItemStack,
+        &mut saved,
+        DATA_VERSION_1_20_4,
+        datafix::CURRENT,
+    );
+
+    fn canonical(mut stack: Stack) -> Stack {
+        stack.added.sort_by_key(|(kind, _)| *kind);
+        stack.removed.sort_unstable();
+        for (_, value) in &mut stack.added {
+            if let Component::Stacks(nested) = value {
+                for stack in nested {
+                    *stack = canonical(stack.clone());
+                }
+            }
+        }
+        stack
+    }
+    let round_trip = from_saved_nbt(&saved)?;
+    if canonical(stack.clone()) != canonical(round_trip) {
+        return Err(Error::new(
+            "item stack contains components that the saved-NBT bridge cannot preserve exactly",
+        ));
+    }
+    Ok(saved)
+}
+
 fn dye(value: Option<&Tag>) -> i32 {
     text(value)
         .and_then(|s| DYES.iter().position(|v| *v == s))

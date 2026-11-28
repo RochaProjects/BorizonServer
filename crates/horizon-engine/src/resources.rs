@@ -25,6 +25,7 @@ pub(crate) struct ServerResources {
     pub(crate) synchronized_registries: RegistryBundle,
     pub(crate) builtin_registries: Builtin,
     pub(crate) item_ids: Ids,
+    pub(crate) saved_item_nbt: horizon_protocol::item::SavedNbtContext,
     pub(crate) loot: LootData,
     pub(crate) light_occlusion: crate::light::LightOcclusion,
 }
@@ -77,6 +78,10 @@ pub(crate) fn load(root: &Path) -> Result<ServerResources, String> {
         .filter(|ids| !ids.names.is_empty())
         .cloned()
         .ok_or("registries.json has no built-in minecraft:item IDs")?;
+    let saved_item_nbt = horizon_protocol::item::SavedNbtContext::new(
+        &builtin_registries,
+        &synchronized_registries.dynamic_registries(),
+    );
     let loot = LootData::load(root, &PackOverlay::NONE)
         .map_err(|error| format!("load vanilla item defaults and loot data: {error}"))?;
     if !loot.has_table("minecraft:blocks/stone") {
@@ -93,6 +98,7 @@ pub(crate) fn load(root: &Path) -> Result<ServerResources, String> {
         synchronized_registries,
         builtin_registries,
         item_ids,
+        saved_item_nbt,
         loot,
         light_occlusion,
     })

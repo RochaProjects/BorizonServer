@@ -25,6 +25,7 @@ pub(crate) struct ServerResources {
     pub(crate) synchronized_registries: RegistryBundle,
     pub(crate) builtin_registries: Builtin,
     pub(crate) item_ids: Ids,
+    pub(crate) player_max_health: f32,
     pub(crate) saved_item_nbt: horizon_protocol::item::SavedNbtContext,
     pub(crate) loot: LootData,
     pub(crate) light_occlusion: crate::light::LightOcclusion,
@@ -82,6 +83,27 @@ pub(crate) fn load(root: &Path) -> Result<ServerResources, String> {
         &builtin_registries,
         &synchronized_registries.dynamic_registries(),
     );
+    let attribute_data: serde_json::Value =
+        horizon_world::json_file::read(&root.join("attributes.json"))
+            .map_err(|error| format!("load entity attributes: {error}"))?;
+    let attribute_catalog = horizon_world::attributes::entity::Catalog::from_json(&attribute_data)
+        .map_err(|error| format!("decode entity attributes: {error}"))?;
+    let mut player_attributes = Arc::new(attribute_catalog)
+        .create("minecraft:player")
+        .ok_or("attributes.json has no minecraft:player defaults")?;
+    let max_health_id = player_attributes
+        .catalog()
+        .id("minecraft:max_health")
+        .ok_or("attributes.json has no minecraft:max_health")?;
+    let player_max_health = player_attributes
+        .value(max_health_id)
+        .map_err(|error| format!("read player max health attribute: {error:?}"))?
+        as f32;
+    if !player_max_health.is_finite() || player_max_health <= 0.0 {
+        return Err(format!(
+            "invalid player max health value {player_max_health}"
+        ));
+    }
     let loot = LootData::load(root, &PackOverlay::NONE)
         .map_err(|error| format!("load vanilla item defaults and loot data: {error}"))?;
     if !loot.has_table("minecraft:blocks/stone") {
@@ -98,6 +120,7 @@ pub(crate) fn load(root: &Path) -> Result<ServerResources, String> {
         synchronized_registries,
         builtin_registries,
         item_ids,
+        player_max_health,
         saved_item_nbt,
         loot,
         light_occlusion,

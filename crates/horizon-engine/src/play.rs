@@ -1712,7 +1712,11 @@ impl PreparedPlayWorld {
         let player_yaw = saved_player.as_ref().map_or(0.0, |saved| saved.yaw);
         let player_pitch = saved_player.as_ref().map_or(0.0, |saved| saved.pitch);
         let selected_slot = saved_player.as_ref().map_or(0, |saved| saved.selected_slot);
-        let health = saved_player.as_ref().map_or(20.0, |saved| saved.health);
+        let health = saved_player
+            .as_ref()
+            .map_or(self.resources.player_max_health, |saved| {
+                saved.health.clamp(0.0, self.resources.player_max_health)
+            });
         let food = saved_player
             .as_ref()
             .map_or_else(horizon_world::food::FoodData::default, |saved| saved.food);
@@ -2959,6 +2963,7 @@ struct PlayerSession {
     inventory: PlayerInventory,
     health: f32,
     food: horizon_world::food::FoodData,
+    last_health_sync: Option<(f32, i32, f32)>,
     experience_progress: f32,
     experience_level: i32,
     experience_total: i32,
@@ -3010,6 +3015,7 @@ impl PlayerSession {
             inventory: PlayerInventory::default(),
             health: 20.0,
             food: horizon_world::food::FoodData::default(),
+            last_health_sync: None,
             experience_progress: 0.0,
             experience_level: 0,
             experience_total: 0,
@@ -3191,6 +3197,7 @@ fn serve_until_disconnect_with_player_data(
     player.inventory = inventory;
     player.health = health;
     player.food = food;
+    player.last_health_sync = Some((health, food.food, food.saturation));
     player.experience_progress = experience_progress;
     player.experience_level = experience_level;
     player.experience_total = experience_total;
@@ -3323,6 +3330,7 @@ fn run_play_session(
                 )?;
             }
             advance_player_mining(writer, player, world)?;
+            advance_player_survival(writer, player, world)?;
             if let Some(world) = world {
                 world.stream_chunks(writer, player)?;
                 sync_item_entities(writer, player, world)?;
@@ -3330,6 +3338,53 @@ fn run_play_session(
             next_tick += SERVER_TICK;
         }
     }
+}
+
+fn advance_player_survival(
+    writer: &mut horizon_protocol::connection::ConnWriter,
+    player: &mut PlayerSession,
+    world: Option<&PreparedPlayWorld>,
+) -> Result<(), String> {
+    let Some(world) = world else {
+        return Ok(());
+    };
+    let natural_regeneration = world
+        .runtime
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .game_rules()
+        .bool("natural_health_regeneration");
+    let difficulty = match world.difficulty {
+        0 => horizon_world::food::Difficulty::Peaceful,
+        1 => horizon_world::food::Difficulty::Easy,
+        2 => horizon_world::food::Difficulty::Normal,
+        _ => horizon_world::food::Difficulty::Hard,
+    };
+    crate::survival::tick_food(
+        &mut player.health,
+        &mut player.food,
+        difficulty,
+        natural_regeneration,
+        matches!(player.game_mode, 1 | 3),
+        player.server_tick,
+        world.resources.player_max_health,
+    );
+
+    let state = (player.health, player.food.food, player.food.saturation);
+    if player.last_health_sync != Some(state) {
+        writer
+            .send(
+                &play::Clientbound::SetHealth(play::SetHealth {
+                    health: state.0,
+                    food: state.1,
+                    saturation: state.2,
+                })
+                .encode(),
+            )
+            .map_err(|error| format!("sync player health and food: {error}"))?;
+        player.last_health_sync = Some(state);
+    }
+    Ok(())
 }
 
 fn process_play_packet(
@@ -4497,6 +4552,15 @@ fn update_player_movement(
         flags & 1 != 0,
     ) {
         Ok((resolved, grounded)) => {
+            crate::survival::accepted_movement(
+                &mut player.food,
+                start,
+                resolved,
+                grounded || flags & 1 != 0,
+                player.sprinting,
+                player.input_flags & 0x20 != 0,
+                matches!(player.game_mode, 1 | 3),
+            );
             player.position = resolved;
             player.on_ground = grounded || flags & 1 != 0;
             if grounded {

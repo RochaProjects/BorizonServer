@@ -9,6 +9,7 @@ use std::convert::Infallible;
 
 struct FoodTick<'a> {
     health: &'a mut f32,
+    max_health: f32,
     difficulty: Difficulty,
     natural_regeneration: bool,
     invulnerable: bool,
@@ -35,11 +36,11 @@ impl FoodWorld for FoodTick<'_> {
     }
 
     fn is_hurt(&mut self, _: &mut FoodData) -> Result<bool, Self::Error> {
-        Ok(*self.health < 20.0)
+        Ok(*self.health < self.max_health)
     }
 
     fn heal(&mut self, _: &mut FoodData, amount: f32) -> Result<(), Self::Error> {
-        *self.health = (*self.health + amount).min(20.0);
+        *self.health = (*self.health + amount).min(self.max_health);
         Ok(())
     }
 
@@ -68,9 +69,26 @@ pub(crate) fn tick_food(
     difficulty: Difficulty,
     natural_regeneration: bool,
     invulnerable: bool,
+    server_tick: u64,
+    max_health: f32,
 ) {
+    // ServerPlayer.tickRegeneration runs before the ordinary FoodData tick.
+    if difficulty == Difficulty::Peaceful && natural_regeneration && server_tick.is_multiple_of(20)
+    {
+        if *health < max_health {
+            *health = (*health + 1.0).min(max_health);
+        }
+        if food.saturation < 20.0 {
+            food.saturation += 1.0;
+        }
+    }
+    if server_tick.is_multiple_of(10) && food.needs_food() {
+        food.food = food.food.wrapping_add(1);
+    }
+
     let mut world = FoodTick {
         health,
+        max_health,
         difficulty,
         natural_regeneration,
         invulnerable,

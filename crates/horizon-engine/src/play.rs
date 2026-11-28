@@ -2937,7 +2937,7 @@ fn centers_distance_key(centers: &[ChunkPos], position: ChunkPos) -> i128 {
         .unwrap_or(i128::MAX)
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 struct PlayerSession {
     entity_id: i32,
     name: String,
@@ -2962,6 +2962,8 @@ struct PlayerSession {
     selected_slot: i16,
     inventory: PlayerInventory,
     health: f32,
+    health_state: Option<crate::survival::PlayerHealth>,
+    death_announced: bool,
     food: horizon_world::food::FoodData,
     last_health_sync: Option<(f32, i32, f32)>,
     experience_progress: f32,
@@ -3014,6 +3016,8 @@ impl PlayerSession {
             selected_slot: 0,
             inventory: PlayerInventory::default(),
             health: 20.0,
+            health_state: None,
+            death_announced: false,
             food: horizon_world::food::FoodData::default(),
             last_health_sync: None,
             experience_progress: 0.0,
@@ -3196,6 +3200,18 @@ fn serve_until_disconnect_with_player_data(
     player.selected_slot = selected_slot.clamp(0, 8);
     player.inventory = inventory;
     player.health = health;
+    if let Some(world) = world {
+        player.health_state = Some(crate::survival::PlayerHealth::new(
+            world.resources.player_attributes.clone(),
+            world.resources.player_float_ids,
+            health,
+        )?);
+        player.health = player
+            .health_state
+            .as_ref()
+            .expect("health state was initialized")
+            .health();
+    }
     player.food = food;
     player.last_health_sync = Some((health, food.food, food.saturation));
     player.experience_progress = experience_progress;
@@ -3360,15 +3376,101 @@ fn advance_player_survival(
         2 => horizon_world::food::Difficulty::Normal,
         _ => horizon_world::food::Difficulty::Hard,
     };
-    crate::survival::tick_food(
-        &mut player.health,
-        &mut player.food,
-        difficulty,
-        natural_regeneration,
-        matches!(player.game_mode, 1 | 3),
-        player.server_tick,
-        world.resources.player_max_health,
-    );
+    if let Some(health) = player.health_state.as_mut() {
+        crate::survival::tick_food(
+            health,
+            &world.resources.damage_sources,
+            &mut player.food,
+            difficulty,
+            natural_regeneration,
+            matches!(player.game_mode, 1 | 3),
+            player.server_tick,
+        )?;
+        player.health = health.health();
+    }
+
+    if player
+        .health_state
+        .as_ref()
+        .is_some_and(crate::survival::PlayerHealth::is_dead)
+        && !player.death_announced
+    {
+        let keep_inventory = world
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .game_rules()
+            .bool("keep_inventory");
+        if !keep_inventory && player.game_mode != 3 {
+            let drops = player.inventory.take_death_drops();
+            let mut random = world
+                .loot_random
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for stack in drops {
+                let velocity = player_drop_motion(&mut random, player.yaw, player.pitch);
+                world.item_entities.spawn(
+                    stack,
+                    [
+                        player.position[0],
+                        player.position[1] + 0.2,
+                        player.position[2],
+                    ],
+                    velocity,
+                )?;
+            }
+            player.experience_progress = 0.0;
+            player.experience_level = 0;
+            player.experience_total = 0;
+            writer
+                .send(
+                    &play::Clientbound::ContainerSetContent(player.inventory.content_packet())
+                        .encode(),
+                )
+                .map_err(|error| format!("sync inventory after death drops: {error}"))?;
+            writer
+                .send(
+                    &play::Clientbound::SetExperience(play::SetExperience {
+                        progress: player.experience_progress,
+                        level: player.experience_level,
+                        total: player.experience_total,
+                    })
+                    .encode(),
+                )
+                .map_err(|error| format!("sync experience after death: {error}"))?;
+        }
+        use horizon_world::nbt::{JavaString, Tag};
+        let death_message_key = player
+            .health_state
+            .as_ref()
+            .expect("dead state has a health owner")
+            .death_message()
+            .to_owned();
+        let message = Tag::Compound(
+            [
+                (
+                    JavaString::from("translate"),
+                    Tag::String(JavaString::from(death_message_key.as_str())),
+                ),
+                (
+                    JavaString::from("with"),
+                    Tag::List(vec![Tag::String(JavaString::from(player.name.as_str()))]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        writer
+            .send(
+                &play::Clientbound::PlayerCombatKill(play::PlayerCombatKill {
+                    id: player.entity_id,
+                    message,
+                })
+                .encode(),
+            )
+            .map_err(|error| format!("send player death notification: {error}"))?;
+        player.death_announced = true;
+    }
 
     let state = (player.health, player.food.food, player.food.saturation);
     if player.last_health_sync != Some(state) {
@@ -3411,6 +3513,9 @@ fn process_play_packet(
             None => return Err("client answered an unsolicited PLAY keepalive".into()),
         },
         play::Serverbound::PlayerLoaded(_) => player.loaded = true,
+        play::Serverbound::ClientCommand(packet) if packet.action == 0 => {
+            respawn_player(writer, player, world)?;
+        }
         play::Serverbound::ClientTickEnd(_) => player.end_tick(),
         play::Serverbound::PlayerInput(packet) => player.input_flags = packet.flags,
         play::Serverbound::SetCarriedItem(packet) => {
@@ -4520,6 +4625,177 @@ fn advance_player_mining(
     }
     player.server_tick = player.server_tick.wrapping_add(1);
     send_pending_block_updates(writer, player, world)?;
+    Ok(())
+}
+
+fn respawn_player(
+    writer: &mut horizon_protocol::connection::ConnWriter,
+    player: &mut PlayerSession,
+    world: Option<&PreparedPlayWorld>,
+) -> Result<(), String> {
+    let Some(world) = world else {
+        return Ok(());
+    };
+    if !player
+        .health_state
+        .as_ref()
+        .is_some_and(crate::survival::PlayerHealth::is_dead)
+    {
+        return Ok(());
+    }
+
+    let spawn = world.spawn;
+    let center = chunk_center(spawn);
+    world.set_player_chunk(player.entity_id, center)?;
+    let initial_chunks = world.prepare_player_chunks(center)?;
+    if world.hardcore {
+        player.game_mode = 3;
+    }
+    player.health = world.resources.player_max_health;
+    player
+        .health_state
+        .as_mut()
+        .expect("PLAY health state is initialized")
+        .respawn(player.health)?;
+    player.food = horizon_world::food::FoodData::default();
+    player.death_announced = false;
+    player.position = spawn;
+    player.chunk_center = center;
+    player.yaw = 0.0;
+    player.pitch = 0.0;
+    player.on_ground = false;
+    player.fall_distance = 0.0;
+    player.loaded = false;
+    player.sprinting = false;
+    player.digging = None;
+    player.delayed_dig = None;
+    player.dig_clock = None;
+    player.sent_chunks = chunks_in_view(center);
+    player.chunk_queue.clear();
+    requeue_chunks(player, center);
+    player
+        .chunk_queue
+        .retain(|chunk| !player.sent_chunks.contains(chunk));
+    player.unacknowledged_batches = 1;
+    player.max_unacknowledged_batches = 1;
+    player.batch_quota = 0.0;
+
+    let dimension = "minecraft:overworld".to_owned();
+    writer
+        .send(
+            &play::Clientbound::Respawn(play::Respawn {
+                spawn: play::SpawnInfo {
+                    dimension_type: world.dimension_type,
+                    dimension: dimension.clone(),
+                    seed: 0,
+                    game_type: player.game_mode,
+                    previous_game_type: None,
+                    debug: false,
+                    flat: false,
+                    last_death: None,
+                    portal_cooldown: 0,
+                    sea_level: 63,
+                },
+                keep: 0,
+            })
+            .encode(),
+        )
+        .map_err(|error| format!("send player respawn: {error}"))?;
+    writer
+        .send(
+            &play::Clientbound::PlayerAbilities(play::PlayerAbilities {
+                flags: if player.game_mode == 3 { 0b0111 } else { 0 },
+                flying_speed: 0.05,
+                walking_speed: 0.1,
+            })
+            .encode(),
+        )
+        .map_err(|error| format!("sync respawned player abilities: {error}"))?;
+    writer
+        .send(
+            &play::Clientbound::ChangeDifficulty(play::ChangeDifficulty {
+                difficulty: world.difficulty,
+                locked: false,
+            })
+            .encode(),
+        )
+        .map_err(|error| format!("sync difficulty after respawn: {error}"))?;
+    writer
+        .send(
+            &play::Clientbound::SetDefaultSpawnPosition(play::SetDefaultSpawnPosition {
+                pos: play::GlobalPos {
+                    dimension,
+                    pos: [
+                        spawn[0].floor() as i32,
+                        spawn[1].floor() as i32,
+                        spawn[2].floor() as i32,
+                    ],
+                },
+                yaw: 0.0,
+                pitch: 0.0,
+            })
+            .encode(),
+        )
+        .map_err(|error| format!("sync spawn position after respawn: {error}"))?;
+    writer
+        .send(
+            &play::Clientbound::GameEvent(play::GameEvent {
+                event: 13,
+                param: 0.0,
+            })
+            .encode(),
+        )
+        .map_err(|error| format!("start respawn terrain loading: {error}"))?;
+    writer
+        .send(
+            &play::Clientbound::SetChunkCacheCenter(play::SetChunkCacheCenter {
+                x: center.x,
+                z: center.z,
+            })
+            .encode(),
+        )
+        .map_err(|error| format!("set respawn chunk center: {error}"))?;
+    writer
+        .send(&play::Clientbound::ChunkBatchStart(horizon_protocol::packets::Empty).encode())
+        .map_err(|error| format!("start respawn chunk batch: {error}"))?;
+    for chunk in &initial_chunks {
+        writer
+            .send(chunk)
+            .map_err(|error| format!("send respawn chunk: {error}"))?;
+    }
+    writer
+        .send(
+            &play::Clientbound::ChunkBatchFinished(play::ChunkBatchFinished {
+                size: initial_chunks.len() as i32,
+            })
+            .encode(),
+        )
+        .map_err(|error| format!("finish respawn chunk batch: {error}"))?;
+    writer
+        .send(
+            &play::Clientbound::SetHealth(play::SetHealth {
+                health: player.health,
+                food: player.food.food,
+                saturation: player.food.saturation,
+            })
+            .encode(),
+        )
+        .map_err(|error| format!("sync respawned player health: {error}"))?;
+    player.last_health_sync = Some((player.health, player.food.food, player.food.saturation));
+    writer
+        .send(
+            &play::Clientbound::SetExperience(play::SetExperience {
+                progress: player.experience_progress,
+                level: player.experience_level,
+                total: player.experience_total,
+            })
+            .encode(),
+        )
+        .map_err(|error| format!("sync respawned player experience: {error}"))?;
+    writer
+        .send(&play::Clientbound::ContainerSetContent(player.inventory.content_packet()).encode())
+        .map_err(|error| format!("sync respawned player inventory: {error}"))?;
+    player.send_correction(writer, spawn)?;
     Ok(())
 }
 

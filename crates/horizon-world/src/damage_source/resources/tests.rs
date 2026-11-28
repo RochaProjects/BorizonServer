@@ -51,6 +51,24 @@ fn file(id: &str, value: Value) -> (String, Vec<Vec<u8>>) {
 }
 
 #[test]
+fn vanilla_server_damage_resources_can_seed_the_catalog_without_an_exported_snapshot() {
+    let f = Fixture::new();
+    fs::remove_file(f.0.join("damage-catalog.json")).unwrap();
+    for name in ["fall", "stalagmite", "starve"] {
+        f.write(
+            &format!("data/minecraft/damage_type/{name}.json"),
+            definition(name),
+        );
+    }
+
+    let catalog = Catalog::load(&f.0, &PackOverlay::NONE).unwrap();
+    let fall = catalog.id("minecraft:fall").unwrap();
+    assert_eq!(catalog.definition(fall).unwrap().message_id, "fall");
+    assert!(catalog.in_tag(fall, "minecraft:bypasses_armor"));
+    assert!(catalog.id("minecraft:starve").is_some());
+}
+
+#[test]
 fn root_namespaces_and_ordered_world_overrides_preserve_vanilla_indices() {
     let f = Fixture::new();
     let base = Catalog::load(&f.0, &PackOverlay::NONE).unwrap();

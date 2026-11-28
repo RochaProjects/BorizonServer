@@ -170,6 +170,15 @@ impl PlayerInventory {
         true
     }
 
+    /// Take every stored stack when vanilla death drops are enabled. The
+    /// carried stack is included because closing the dead player's container
+    /// returns/drops that cursor stack as part of the same lifecycle.
+    pub(crate) fn take_death_drops(&mut self) -> Vec<Stack> {
+        let mut drops = self.carried.take().into_iter().collect::<Vec<_>>();
+        drops.extend(self.slots.iter_mut().filter_map(Option::take));
+        drops
+    }
+
     /// Insert as much of a server-authored stack as the vanilla player
     /// inventory can hold. Returns the amount accepted; the caller retains
     /// any remainder in its item entity.

@@ -26,6 +26,9 @@ pub(crate) struct ServerResources {
     pub(crate) builtin_registries: Builtin,
     pub(crate) item_ids: Ids,
     pub(crate) player_max_health: f32,
+    pub(crate) player_attributes: Arc<horizon_world::attributes::entity::Catalog>,
+    pub(crate) player_float_ids: horizon_world::player_health::PlayerFloatIds,
+    pub(crate) damage_sources: horizon_world::damage_source::Catalog,
     pub(crate) saved_item_nbt: horizon_protocol::item::SavedNbtContext,
     pub(crate) loot: LootData,
     pub(crate) light_occlusion: crate::light::LightOcclusion,
@@ -88,14 +91,15 @@ pub(crate) fn load(root: &Path) -> Result<ServerResources, String> {
             .map_err(|error| format!("load entity attributes: {error}"))?;
     let attribute_catalog = horizon_world::attributes::entity::Catalog::from_json(&attribute_data)
         .map_err(|error| format!("decode entity attributes: {error}"))?;
-    let mut player_attributes = Arc::new(attribute_catalog)
+    let player_attributes = Arc::new(attribute_catalog);
+    let mut player_defaults = player_attributes
         .create("minecraft:player")
         .ok_or("attributes.json has no minecraft:player defaults")?;
-    let max_health_id = player_attributes
+    let max_health_id = player_defaults
         .catalog()
         .id("minecraft:max_health")
         .ok_or("attributes.json has no minecraft:max_health")?;
-    let player_max_health = player_attributes
+    let player_max_health = player_defaults
         .value(max_health_id)
         .map_err(|error| format!("read player max health attribute: {error:?}"))?
         as f32;
@@ -103,6 +107,32 @@ pub(crate) fn load(root: &Path) -> Result<ServerResources, String> {
         return Err(format!(
             "invalid player max health value {player_max_health}"
         ));
+    }
+    let player_float_data: serde_json::Value =
+        horizon_world::json_file::read(&root.join("player-float-ids.json"))
+            .map_err(|error| format!("load player health data IDs: {error}"))?;
+    let player_float_id = |name: &str| -> Result<u8, String> {
+        let value = player_float_data[name]
+            .as_u64()
+            .ok_or_else(|| format!("player-float-ids.json has no valid {name} ID"))?;
+        u8::try_from(value).map_err(|error| format!("invalid player {name} data ID: {error}"))
+    };
+    let player_float_ids = horizon_world::player_health::PlayerFloatIds {
+        health: player_float_id("health")?,
+        absorption: player_float_id("absorption")?,
+    };
+    if player_float_ids.health == player_float_ids.absorption
+        || player_float_ids.health == u8::MAX
+        || player_float_ids.absorption == u8::MAX
+    {
+        return Err("player health float IDs are aliased or reserved".into());
+    }
+    let damage_sources = horizon_world::damage_source::Catalog::load(root, &PackOverlay::NONE)
+        .map_err(|error| format!("load vanilla damage types and tags: {error}"))?;
+    for name in ["minecraft:fall", "minecraft:starve"] {
+        if damage_sources.id(name).is_none() {
+            return Err(format!("damage resources have no required type {name}"));
+        }
     }
     let loot = LootData::load(root, &PackOverlay::NONE)
         .map_err(|error| format!("load vanilla item defaults and loot data: {error}"))?;
@@ -121,6 +151,9 @@ pub(crate) fn load(root: &Path) -> Result<ServerResources, String> {
         builtin_registries,
         item_ids,
         player_max_health,
+        player_attributes,
+        player_float_ids,
+        damage_sources,
         saved_item_nbt,
         loot,
         light_occlusion,

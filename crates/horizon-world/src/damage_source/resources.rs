@@ -177,9 +177,37 @@ impl Catalog {
     /// The exported vanilla definitions plus ordinary resource-root and
     /// enabled world-pack files. No definition is published on codec failure.
     pub fn load(root: &Path, overlay: &PackOverlay<'_>) -> io::Result<Self> {
-        let catalog = serde_json::from_slice(&fs::read(root.join("damage-catalog.json"))?)?;
+        let path = root.join("damage-catalog.json");
+        let mut catalog = if path.is_file() {
+            let catalog = serde_json::from_slice(&fs::read(path)?)?;
+            Self::from_json(&catalog, &serde_json::json!({}))?
+        } else {
+            // The dedicated engine's resource exporter may provide vanilla
+            // damage types directly from the official server runtime jar.
+            // Their registry IDs are resolved by name later, so the local
+            // catalog only needs a stable ordering for this resource snapshot.
+            let mut definitions = Vec::new();
+            let mut ids = BTreeMap::new();
+            for (id, bytes) in resource_files(root, "damage_type")? {
+                let definition = Definition::from_json(&id, &bytes)
+                    .map_err(|error| invalid(format!("damage type {id}: {error}")))?;
+                ids.insert(id, DamageTypeId(definitions.len()));
+                definitions.push(definition);
+            }
+            if definitions.is_empty() {
+                return Err(invalid(
+                    "missing damage-catalog.json and vanilla damage_type resources",
+                ));
+            }
+            Self {
+                definitions,
+                ids,
+                tags: BTreeMap::new(),
+            }
+        };
         // Resolve tags only after custom definitions have joined the registry.
-        Self::from_json(&catalog, &serde_json::json!({}))?.with_packs(root, overlay)
+        catalog = catalog.with_packs(root, overlay)?;
+        Ok(catalog)
     }
 
     /// Names in a resolved tag, independently of local or network indices.

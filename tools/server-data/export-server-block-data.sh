@@ -40,6 +40,8 @@ java -cp "$build_dir/classes:$classpath" \
   dev.horizonlab.parity.VanillaGameplayFactsExporter "$work_dir/gameplay-facts.json"
 java -cp "$build_dir/classes:$classpath" \
   dev.horizonlab.parity.VanillaLightOcclusionExporter "$work_dir/light-occlusion.json"
+java -cp "$build_dir/classes:$classpath" \
+  dev.horizonlab.parity.VanillaServerPlayerResourcesExporter "$resources_dir"
 
 python3 - "$work_dir/facts.json" "$work_dir/block_flags.json" <<'PY'
 import json

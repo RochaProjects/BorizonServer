@@ -21,6 +21,7 @@ DATA_KINDS = (
     "tags/enchantment",
     "tags/instrument",
     "tags/entity_type",
+    "damage_type",
     "tags/damage_type",
     "tags/worldgen/biome",
 )

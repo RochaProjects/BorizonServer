@@ -3,19 +3,24 @@
 
 ### Estado atual da migração — 2026-11-28
 
-- Branch: `BorizonV26.3`; último commit enviado: `cb128ffa` (`Persist player position in dedicated PLAY`). `main` continua somente como referência.
-- Alterações locais ainda sem commit: a fase autoritativa compartilhada chama o ticker existente de pistões móveis após block events; o playerdata passa pelo `datafix::update_player` da referência antes da leitura e antes de salvar; e restaura/salva posição, rotação, `SelectedItemSlot` (0–8) e slots de inventário suportados pelo codec NBT atual. Stacks que não fazem round-trip exato são recusados para evitar perda silenciosa; a cobertura de componentes 26.3 é incompleta. `cargo fmt --all -- --check`, `cargo check --locked -p horizon-engine` e `git diff --check` passaram; não foram executados testes nem sessão de cliente nesta etapa.
-- Já integrado: conexão Java 26.3 e teste manual anterior de gameplay survival básico; movement/mining, drops/coleta/colocação iniciais, inventário básico, relógio comum, ticks programados/aleatórios/block events, tickets de jogador, save inicial e pipeline de chunks `TERRAIN`/`FEATURES`/`LIGHT`. O teste manual comprova uma fatia, não paridade vanilla.
-- Nesta última atualização: budgets de jobs comparados à política da referência; reconciliação de block entities em escritas de worldgen e finalização parcial de ID/default NBT para block entities geradas. `cargo fmt --check`, `cargo check --locked -p horizon-world`, `cargo check --locked -p horizon-engine` e `git diff --check` passaram. Não houve build de release nem teste de jogo após esse commit.
-- Já integrado antes desta rodada: conexão Java 26.3 e uma fatia manual de survival (movimento com colisão limitada, mineração, drops/coleta/colocação), inventário básico, relógio global, ticks agendados/aleatórios/block events, ticketing, autosave parcial, pipeline TERRAIN/FEATURES/LIGHT e posição/rotação por UUID. Isso comprova caminhos específicos, não equivalência vanilla.
-- Próximo corte: ampliar e validar o round-trip NBT de itens para cobrir os componentes vanilla 26.3 sem perda; a primeira ponte já salva/restaura os slots de inventário suportados e recusa stacks cujo round-trip não seja exato. Persistem saúde/fome/XP/efeitos e outros dados do jogador. Em paralelo, seguir a referência de streaming para explicar a expansão observada de 3×3 e fechar o lifecycle de chunk/save/shutdown. O ticker ligado cobre apenas pistões móveis; não equivale aos tickers gerais de baús, fornalhas, entidades ou mundo. Não declarar gameplay vanilla completo.
+- Branch `BorizonV26.3`; ponta remota integrada: `d9a7b4fd7` (`Match vanilla creative mining reach`). `main` continua somente como referência de leitura.
+- Já integrados: persistência parcial de posição/rotação e inventário; DataFixer em playerdata; ticks programados, aleatórios, block events e pistões móveis; fases de mineração survival com ferramenta e sincronização de estágio; alcance vanilla padrão para survival/creative. O inventário usa uma ponte NBT que rejeita stacks não preserváveis exatamente; suporte a todos os componentes 26.3 ainda falta.
+- `cargo fmt --all -- --check`, `cargo check --locked -p horizon-engine` e `git diff --check` passaram para as alterações locais de inventário/pistões antes da integração remota. Os commits remotos registram 48 testes da engine e checagem do grafo server-only; os cenários que requerem recursos oficiais não foram executados sem `BORIZON_SERVER_RESOURCES`.
+- Estado continua incremental: não há paridade vanilla comprovada. Próximos cortes incluem cobertura completa dos dados do jogador e componentes de itens; diagnosticar a expansão efetiva para além de 3×3; melhorar movimento/mineração com atributos, efeitos, água e ray trace; e completar sincronização de entidades, ticking, dimensões e lifecycle de save/shutdown.
+
+### PlayerAction: mineração e alcance — 2026-11-28
+
+- [x] `PlayerAction` agora atualiza estágios de mineração para viewers próximos, limpa em ABORT/quebra e usa o relógio do START no cálculo de STOP. STOP considera a ferramenta atualmente equipada e usa a regra de quebra do loot; START recusa spectator.
+- [x] O alcance usa os valores padrão de interação vanilla (4,5 survival/5 creative mais o buffer do callsite). Eye height e atributos de alcance continuam simplificados.
+- [x] Os commits remotos registram 48 testes, `cargo check`, `cargo fmt` e auditoria do grafo server-only. Os testes que exigem recursos oficiais foram compilados, mas não executaram seu corpo sem o pacote de recursos.
+- [ ] Ainda faltam modificadores completos de mineração (atributos, efeitos, água), Adventure/claims, durabilidade de ferramentas e ray trace vanilla; validar com recursos oficiais e sessão real.
 
 ### Tick de pistões móveis — 2026-11-28
 
-- [x] A referência da `main` executa `run_block_events` e depois `tick_moving_pistons` no ciclo de mundo (`game/block_ticks.rs`). `Behaviours::tick_block_entities` em `horizon-world` já implementava o avanço dos pistões móveis residentes, mas o `WorldDimension`/`LocalWorldRuntime` e o loop PLAY não o chamavam.
-- [x] `ResidentDimension` agora expõe essa fase; `LocalWorldRuntime` aplica-a em cada dimensão registrada; `PlayServer::tick_shared_world` executa-a depois dos block events. A passagem atualiza os pistões presentes em chunks com block ticking habilitado.
-- [x] Verificação: `cargo fmt --all -- --check`, `cargo check --locked -p horizon-engine` e `git diff --check` passaram. Nenhum teste foi executado e não houve runtime/client nesta etapa.
-- [ ] A API existente avança apenas moving pistons; os demais block entities vanilla ainda não têm owners/tickers server-side neste runtime. A física de empurrar entidades e o sync de estado de block entity continuam pendentes.
+- [x] A referência da `main` executa `run_block_events` e depois `tick_moving_pistons` no ciclo de mundo (`game/block_ticks.rs`). `Behaviours::tick_block_entities` em `horizon-world` já implementava o avanço dos pistões móveis residentes, mas o loop PLAY não o chamava.
+- [x] `ResidentDimension` expõe essa fase; `LocalWorldRuntime` aplica-a em cada dimensão registrada; `PlayServer::tick_shared_world` executa-a depois dos block events.
+- [x] `cargo fmt --all -- --check`, `cargo check --locked -p horizon-engine` e `git diff --check` passaram. Nenhum teste ou runtime foi executado nesta rodada.
+- [ ] A API existente avança apenas moving pistons; os demais block entities vanilla ainda não têm owners/tickers server-side neste runtime. Física de empurrar entidades e sync de estado de block entity continuam pendentes.
 
 ### Persistência inicial do inventário e slot selecionado — 2026-11-28
 
@@ -23,13 +28,13 @@
 - [x] Hotbar, armazenamento, armadura e mão secundária são lidos e salvos nos slots vanilla do playerdata com o codec de stacks disponível.
 - [x] A serialização faz round-trip e rejeita stacks que não possam ser preservados exatamente; componentes desconhecidos/não suportados falham explicitamente, sem salvar silenciosamente dados perdidos.
 - [x] `cargo fmt --all -- --check`, `cargo check --locked -p horizon-engine` e `git diff --check` passaram. Não houve testes nem teste de runtime nesta etapa.
-- [ ] Auditar e implementar suporte ao conjunto completo de componentes de item vanilla 26.3; validar a persistência em sessão real e cobrir saúde/fome/XP/efeitos e demais campos de playerdata.
+- [ ] Auditar e implementar suporte ao conjunto completo de componentes de item vanilla 26.3; validar persistência em sessão real e cobrir saúde/fome/XP/efeitos e demais campos de playerdata.
 
 ### DataFixer no playerdata — 2026-11-28
 
-- [x] A leitura agora aplica `horizon_world::datafix::update_player` ao composto completo antes de acessar `Pos`, dimensão e rotação, seguindo a fronteira de `PlayerDataStorage.load` da referência.
-- [x] O salvamento aplica o mesmo DataFixer aos dados existentes antes de definir `DataVersion=CURRENT`; o inventário é codificado separadamente pela ponte de stacks atual, que recusa conversões não exatas.
-- [x] `cargo fmt --all -- --check`, `cargo check --locked -p horizon-engine` e `git diff --check` passaram. Nenhum teste ou runtime foi executado.
+- [x] A leitura aplica `horizon_world::datafix::update_player` ao composto completo antes de acessar campos, seguindo a fronteira de `PlayerDataStorage.load` da referência.
+- [x] O salvamento aplica o mesmo DataFixer antes de definir `DataVersion=CURRENT`; o inventário é codificado separadamente pela ponte de stacks, que recusa conversões não exatas.
+- [x] `cargo fmt --all -- --check`, `cargo check --locked -p horizon-engine` e `git diff --check` passaram. Nenhum teste ou runtime foi executado nesta rodada.
 
 ### Persistência de posição do jogador — 2026-11-27
 
@@ -238,8 +243,9 @@ O Borizon ainda não tem equivalente integrado para `WorldRequest`/carregamento 
 - [x] Comparação somente leitura: `origin/main:crates/horizon-client/src/game/levels.rs::tick_server` conduz partes compartilhadas uma vez antes dos níveis; `dedicated.rs::run_dedicated_inner` chama o tick único do servidor; `autosave.rs::next_autosave_interval`/`autosave_interval` usa 300 segundos de ticks (mínimo 100), e `core_tests.rs` fixa os valores de referência (20 TPS → 6000 ticks).
 - [x] Em Borizon, `status::listen_inner` inicia uma thread de world tick ao montar o `PlayServer`; o loop não depende de jogadores conectados e conexões não podem multiplicar o avanço do relógio. O relógio comum e `advance_time` do Overworld usam métodos de `LocalWorldRuntime` existentes.
 - [x] Autosave escalonado inicial salva todos os chunks dirty, SavedData e sync das regiões pelo owner. `cargo check -p horizon-engine --locked` passou; a regressão `official_server_resources_drive_play_mining_and_contextual_movement` passou com recursos vanilla oficiais após verificar game time = 1, day time = 1 e executar autosave pelo owner. A suíte completa de 36 testes também passou antes de acrescentar essas asserções; o teste modificado foi reexecutado isoladamente e passou.
-- [ ] Limitações ainda concretas: tick de mundo está restrito aos dois relógios e não processa `tickChildren`/chunks, fluidos, entidades, clima, funções, tarefas de plugins ou watchdog; a taxa é fixa em 20 TPS e não há `/tick sprint`/tick-rate management; autosave é síncrono e não há save final por encerramento do processo. O loop de thread não tem sinal de stop até integrar shutdown real.
-- [ ] Pendências: integrar os demais ticks server-safe por `LocalWorldRuntime` e criar lifecycle de stop no listener que aguarde sessões, persista estado e encerre o owner; não alegar paridade até validar gameplay vanilla amplo.
+- [x] `WorldTickLoop` agora pertence ao escopo do listener: no retorno da função do listener, o guard acorda e faz join da thread; o owner salva chunks dirty, SavedData e regiões antes de terminar. O teste oficial `official_server_resources_drive_play_mining_and_contextual_movement` verifica que, após descartar o guard, `game_time` para de avançar.
+- [ ] Limitações: scheduled/random ticks e block events já têm owners server-side, mas ainda faltam interleaving vanilla de efeitos/spills, ticking geral de entidades, clima, funções, watchdog e lifecycle completo de block entities; a taxa é fixa em 20 TPS e não há `/tick sprint`/tick-rate management. Autosave é síncrono. Não há comando/sinal externo para pedir parada: o flush final só ocorre se `listen_inner` retornar por erro; threads de conexões ainda são detached e não são fechadas/aguardadas, portanto isso ainda não é shutdown seguro com sessões ativas. Ctrl-C do processo não executa esse caminho.
+- [ ] Próximo passo: implementar um gatilho explícito de shutdown, parar novas conexões, encerrar e aguardar sessões PLAY, então executar flush e join do owner; continuar a ordem vanilla de scheduled ticks e eventos/efeitos. Não alegar paridade até validar gameplay vanilla amplo.
 
 ### Persistência inicial de chunks no PLAY — 2026-11-26
 

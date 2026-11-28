@@ -1006,6 +1006,11 @@ enum PublishedLevelEvent {
         volume: f32,
         pitch: f32,
     },
+    Crack {
+        entity_id: i32,
+        pos: [i32; 3],
+        progress: i32,
+    },
 }
 
 #[derive(Default)]
@@ -1277,6 +1282,33 @@ impl Default for PlayerRegistry {
     }
 }
 
+/// Owns the shared world clock thread. Dropping or stopping the listener must
+/// stop and join this thread before its world resources can be released.
+pub(crate) struct WorldTickLoop {
+    stop: SyncSender<()>,
+    worker: Option<thread::JoinHandle<Result<(), String>>>,
+}
+
+impl WorldTickLoop {
+    fn join_worker(&mut self) -> Result<(), String> {
+        let _ = self.stop.send(());
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        worker
+            .join()
+            .map_err(|_| "PLAY world tick owner panicked".to_owned())?
+    }
+}
+
+impl Drop for WorldTickLoop {
+    fn drop(&mut self) {
+        if let Err(error) = self.join_worker() {
+            eprintln!("Borizon final world save: {error}");
+        }
+    }
+}
+
 impl PlayServer {
     pub(crate) fn new(world: Arc<PreparedPlayWorld>) -> Self {
         let max_players = world.max_players;
@@ -1292,11 +1324,12 @@ impl PlayServer {
 
     /// Start one server-owned world clock. Connection threads never advance
     /// global time, so adding players cannot accelerate the world.
-    pub(crate) fn start_world_tick_loop(self: &Arc<Self>) -> std::io::Result<()> {
+    pub(crate) fn start_world_tick_loop(self: &Arc<Self>) -> std::io::Result<WorldTickLoop> {
         let server = Arc::clone(self);
-        thread::Builder::new()
+        let (stop, stop_rx) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
             .name("borizon-world-tick".into())
-            .spawn(move || {
+            .spawn(move || -> Result<(), String> {
                 // Main's autosave interval at the fixed 20 TPS used here:
                 // 300 seconds of ticks, with its 100-tick minimum.
                 const AUTOSAVE_TICKS: i64 = 20 * 300;
@@ -1305,8 +1338,10 @@ impl PlayServer {
                 loop {
                     let now = Instant::now();
                     if now < next_tick {
-                        thread::sleep(next_tick - now);
-                        continue;
+                        match stop_rx.recv_timeout(next_tick - now) {
+                            Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                            Err(RecvTimeoutError::Timeout) => {}
+                        }
                     }
                     while Instant::now() >= next_tick {
                         ticks_until_autosave -= 1;
@@ -1318,9 +1353,34 @@ impl PlayServer {
                             eprintln!("Borizon world tick: {error}");
                         }
                         next_tick += SERVER_TICK;
+                        match stop_rx.try_recv() {
+                            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
+                                return Self::save_final_world(&server.world);
+                            }
+                            Err(mpsc::TryRecvError::Empty) => {}
+                        }
                     }
                 }
+                Self::save_final_world(&server.world)
             })?;
+        Ok(WorldTickLoop {
+            stop,
+            worker: Some(worker),
+        })
+    }
+
+    fn save_final_world(world: &PreparedPlayWorld) -> Result<(), String> {
+        let mut runtime = world
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        save_runtime_dirty_chunks(&mut runtime, &world.resources)?;
+        runtime
+            .save_world_data()
+            .map_err(|error| format!("save final PLAY world data: {error}"))?;
+        runtime
+            .sync_regions()
+            .map_err(|error| format!("sync final PLAY Anvil regions: {error}"))?;
         Ok(())
     }
 
@@ -2502,6 +2562,25 @@ impl PreparedPlayWorld {
         Ok(())
     }
 
+    fn publish_crack_progress(
+        &self,
+        entity_id: i32,
+        pos: [i32; 3],
+        progress: i32,
+    ) -> Result<(), String> {
+        self.level_events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .append(
+                "minecraft:overworld".into(),
+                PublishedLevelEvent::Crack {
+                    entity_id,
+                    pos,
+                    progress,
+                },
+            )
+    }
+
     fn level_events_since(&self, cursor: u64) -> Result<(Vec<WorldLevelEvent>, u64), String> {
         self.level_events
             .lock()
@@ -2850,6 +2929,7 @@ struct DiggingState {
     started_at: u64,
     per_tick: f32,
     progress: f32,
+    last_stage: i32,
 }
 
 impl PlayerSession {
@@ -3521,6 +3601,12 @@ fn player_destroy_progress(
     )
 }
 
+fn block_action_reach(game_mode: i32) -> f64 {
+    // Mirrors Player.isWithinBlockInteractionRange(pos, 1.0) in origin/main:
+    // default range is 4.5 in survival and 5.0 in creative.
+    (if game_mode == 1 { 5.0 } else { 4.5 }) + 1.0
+}
+
 fn process_player_action(
     writer: &mut horizon_protocol::connection::ConnWriter,
     player: &mut PlayerSession,
@@ -3557,11 +3643,22 @@ fn process_player_action(
         player.position[1] + 1.62,
         player.position[2],
     ];
-    let in_reach = player_mining::within_block_range(eye, 5.5, action.pos);
+    let in_reach =
+        player_mining::within_block_range(eye, block_action_reach(player.game_mode), action.pos);
 
     if action.action == 0 {
+        // main's `Player.blockActionRestricted` always rejects spectators;
+        // otherwise this dedicated handler would fall through to survival.
+        if player.game_mode == 3 {
+            return Ok(());
+        }
         if !in_reach {
             return Ok(());
+        }
+        if let Some(previous_dig) = player.digging.take() {
+            if previous_dig.last_stage >= 0 {
+                world.publish_crack_progress(player.entity_id, previous_dig.pos, -1)?;
+            }
         }
         let runtime = world
             .runtime
@@ -3590,17 +3687,19 @@ fn process_player_action(
                     started_at: player.server_tick,
                     per_tick: 1.0,
                     progress: 1.0,
+                    last_stage: -1,
                 },
             )?;
             return Ok(());
         }
         let facts = world.resources.behaviours.facts(state);
         let per_tick = player_destroy_progress(player, world, state, facts.hardness, facts.flags);
-        let digging = DiggingState {
+        let mut digging = DiggingState {
             pos: action.pos,
             started_at: player.server_tick,
             per_tick,
             progress: 0.0,
+            last_stage: -1,
         };
         if per_tick >= 1.0 {
             player.digging = None;
@@ -3608,6 +3707,8 @@ fn process_player_action(
             destroy_player_block(writer, player, world, digging)?;
         } else {
             player.dig_clock = Some((action.pos, player.server_tick));
+            drop(runtime);
+            publish_mining_stage(player, world, &mut digging, per_tick)?;
             player.digging = Some(digging);
         }
         return Ok(());
@@ -3615,6 +3716,7 @@ fn process_player_action(
 
     if action.action == 2 {
         player.digging = None;
+        world.publish_crack_progress(player.entity_id, action.pos, -1)?;
         let runtime = world
             .runtime
             .lock()
@@ -3624,6 +3726,7 @@ fn process_player_action(
             .expect("the Play Overworld is registered")
             .resident();
         let state = resident.level().block_state(pos);
+        drop(runtime);
         send_block_update(writer, action.pos, state.0 as i32)?;
         send_crack_progress(writer, player.entity_id, action.pos, -1)?;
         return Ok(());
@@ -3643,6 +3746,7 @@ fn process_player_action(
             started_at,
             per_tick: 0.0,
             progress: 0.0,
+            last_stage: -1,
         })
     }) else {
         return Ok(());
@@ -3666,18 +3770,11 @@ fn process_player_action(
     if facts.flags & state_flags::AIR != 0 {
         return Ok(());
     }
-    let correct_tool = facts.flags & state_flags::REQUIRES_TOOL == 0;
-    digging.per_tick = player_mining::destroy_progress(
-        facts.hardness,
-        correct_tool,
-        player_mining::destroy_speed(
-            1.0,
-            &DestroySpeedModifiers {
-                on_ground: player.on_ground,
-                ..DestroySpeedModifiers::default()
-            },
-        ),
-    );
+    // Match main's `guest_stop_digging`: resolve destroy progress from the
+    // player's current held item and the real block/tool rules, not a
+    // hand-speed approximation. STOP is allowed to arrive after the held
+    // item changed while the client was mining.
+    digging.per_tick = player_destroy_progress(player, world, state, facts.hardness, facts.flags);
     drop(runtime);
     digging.progress =
         dig_progress_at_tick(digging.per_tick, player.server_tick, digging.started_at);
@@ -3697,6 +3794,20 @@ fn stop_dig_breaks(progress: f32) -> bool {
 
 fn dig_progress_at_tick(per_tick: f32, current_tick: u64, started_at: u64) -> f32 {
     per_tick * (current_tick - started_at + 1) as f32
+}
+
+fn publish_mining_stage(
+    player: &mut PlayerSession,
+    world: &PreparedPlayWorld,
+    digging: &mut DiggingState,
+    progress: f32,
+) -> Result<(), String> {
+    let stage = (progress * 10.0) as i32;
+    if stage != digging.last_stage {
+        world.publish_crack_progress(player.entity_id, digging.pos, stage)?;
+        digging.last_stage = stage;
+    }
+    Ok(())
 }
 
 fn send_block_update(
@@ -3783,6 +3894,9 @@ fn destroy_player_block(
     if destroyed {
         world.publish_block_changes(changes)?;
         world.publish_level_events(events)?;
+        if digging.last_stage >= 0 {
+            world.publish_crack_progress(player.entity_id, digging.pos, -1)?;
+        }
         if player.game_mode != 1 && correct_tool && block_drops {
             spawn_block_loot(player, world, &old_state, pos)?;
         }
@@ -3910,6 +4024,28 @@ fn send_pending_level_events(
             })
             .sum::<f64>();
         match event.event {
+            PublishedLevelEvent::Crack {
+                entity_id,
+                pos,
+                progress,
+            } => {
+                let distance_squared = (0..3)
+                    .map(|axis| (player.position[axis] - f64::from(pos[axis])).powi(2))
+                    .sum::<f64>();
+                if entity_id == player.entity_id || distance_squared >= 32.0 * 32.0 {
+                    continue;
+                }
+                writer
+                    .send(
+                        &play::Clientbound::BlockDestruction(play::BlockDestruction {
+                            id: entity_id,
+                            pos,
+                            progress: progress as u8,
+                        })
+                        .encode(),
+                    )
+                    .map_err(|error| format!("send PLAY mining progress: {error}"))?;
+            }
             PublishedLevelEvent::Level { pos, id, data } => {
                 if distance_squared > 64.0 * 64.0 {
                     continue;
@@ -4105,7 +4241,9 @@ fn send_item_entity_stack(
 
 fn event_pos(event: &PublishedLevelEvent) -> [i32; 3] {
     match event {
-        PublishedLevelEvent::Level { pos, .. } | PublishedLevelEvent::Sound { pos, .. } => *pos,
+        PublishedLevelEvent::Level { pos, .. }
+        | PublishedLevelEvent::Sound { pos, .. }
+        | PublishedLevelEvent::Crack { pos, .. } => *pos,
     }
 }
 
@@ -4137,7 +4275,10 @@ fn advance_player_mining(
             if facts.flags & state_flags::AIR == 0 {
                 digging.per_tick =
                     player_destroy_progress(player, world, state, facts.hardness, facts.flags);
-                digging.progress = (digging.progress + digging.per_tick).min(1.0);
+                digging.progress =
+                    dig_progress_at_tick(digging.per_tick, player.server_tick, digging.started_at);
+                let progress = digging.progress;
+                publish_mining_stage(player, world, &mut digging, progress)?;
                 player.digging = Some(digging);
             }
         }
@@ -4154,6 +4295,8 @@ fn advance_player_mining(
                     player_destroy_progress(player, world, state, facts.hardness, facts.flags);
                 digging.progress =
                     dig_progress_at_tick(digging.per_tick, player.server_tick, digging.started_at);
+                let progress = digging.progress;
+                publish_mining_stage(player, world, &mut digging, progress)?;
                 if digging.progress >= 1.0 {
                     delayed_completion = Some(digging);
                 } else {
@@ -4375,6 +4518,21 @@ mod tests {
         assert!(!stop_dig_breaks(0.699_999));
         assert!(stop_dig_breaks(0.7));
         assert!(stop_dig_breaks(1.0));
+    }
+    #[test]
+    fn creative_block_interaction_reach_matches_reference_default() {
+        let eye = [0.5, 1.62, 0.5];
+        let edge_block = [6, 1, 0];
+        assert!(!player_mining::within_block_range(
+            eye,
+            block_action_reach(0),
+            edge_block
+        ));
+        assert!(player_mining::within_block_range(
+            eye,
+            block_action_reach(1),
+            edge_block
+        ));
     }
     #[test]
     fn mining_progress_uses_server_ticks_not_client_tick_end_packets() {
@@ -5047,6 +5205,125 @@ mod tests {
         );
         assert!((0.0..1.0).contains(&per_tick));
 
+        // The main's STOP path asks the player for destroy progress again,
+        // using the currently held tool. A pickaxe switched to after START
+        // must therefore count for STOP's 70% decision even when the elapsed
+        // bare-hand progress is still below that threshold.
+        let (tool_server_pipe, tool_client_pipe) = Pipe::pair();
+        let (_, mut tool_writer) = Connection::local(tool_server_pipe).split();
+        let mut tool_client = Connection::local(tool_client_pipe);
+        let preexisting_item_ids = world
+            .item_entities
+            .all()
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<HashSet<_>>();
+        let mut tool_player = PlayerSession::new(spawn, 5, 13);
+        tool_player.loaded = true;
+        tool_player.awaiting_teleport = None;
+        tool_player.on_ground = true;
+        tool_player.world_update_cursor = world.latest_block_update();
+        tool_player.level_event_cursor = world.latest_level_event_sequence();
+        let (viewer_server_pipe, viewer_client_pipe) = Pipe::pair();
+        let (_, mut viewer_writer) = Connection::local(viewer_server_pipe).split();
+        let mut viewer_client = Connection::local(viewer_client_pipe);
+        let mut nearby_viewer = PlayerSession::new(spawn, 6, 14);
+        nearby_viewer.loaded = true;
+        nearby_viewer.awaiting_teleport = None;
+        nearby_viewer.sent_chunks.insert(ChunkPos::new(0, 0));
+        nearby_viewer.level_event_cursor = world.latest_level_event_sequence();
+        process_player_action(
+            &mut tool_writer,
+            &mut tool_player,
+            play::PlayerAction {
+                action: 0,
+                pos: [target.x, target.y, target.z],
+                direction: 1,
+                sequence: 40,
+            },
+            Some(&world),
+        )
+        .unwrap();
+        assert!(matches!(
+            receive_clientbound(&mut tool_client),
+            play::Clientbound::BlockChangedAck(_)
+        ));
+        send_pending_level_events(&mut viewer_writer, &mut nearby_viewer, &world).unwrap();
+        assert!(matches!(
+            receive_clientbound(&mut viewer_client),
+            play::Clientbound::BlockDestruction(play::BlockDestruction {
+                id: 13,
+                pos,
+                progress: 0,
+            }) if pos == [target.x, target.y, target.z]
+        ));
+        let elapsed_ticks = (0.2 / per_tick).ceil() as usize;
+        let first_stage_ticks = (0.11 / per_tick).ceil() as usize;
+        for _ in 0..first_stage_ticks {
+            advance_player_mining(&mut tool_writer, &mut tool_player, Some(&world)).unwrap();
+        }
+        send_pending_level_events(&mut viewer_writer, &mut nearby_viewer, &world).unwrap();
+        assert!(matches!(
+            receive_clientbound(&mut viewer_client),
+            play::Clientbound::BlockDestruction(play::BlockDestruction {
+                id: 13,
+                pos,
+                progress: 1,
+            }) if pos == [target.x, target.y, target.z]
+        ));
+        for _ in first_stage_ticks..elapsed_ticks {
+            advance_player_mining(&mut tool_writer, &mut tool_player, Some(&world)).unwrap();
+        }
+        let pickaxe = world
+            .resources
+            .item_ids
+            .id("minecraft:diamond_pickaxe")
+            .expect("vanilla diamond pickaxe item ID");
+        assert!(
+            tool_player
+                .inventory
+                .set_creative_slot(36, Some(horizon_protocol::item::Stack::new(pickaxe, 1)))
+        );
+        let held_progress =
+            player_destroy_progress(&tool_player, &world, stone, facts.hardness, facts.flags);
+        let elapsed = (tool_player.server_tick + 1) as f32;
+        assert!(
+            per_tick * elapsed < 0.7,
+            "bare-hand progress must remain below STOP threshold"
+        );
+        assert!(
+            held_progress * elapsed >= 0.7,
+            "the real pickaxe must cross STOP threshold"
+        );
+        process_player_action(
+            &mut tool_writer,
+            &mut tool_player,
+            play::PlayerAction {
+                action: 3,
+                pos: [target.x, target.y, target.z],
+                direction: 1,
+                sequence: 41,
+            },
+            Some(&world),
+        )
+        .unwrap();
+        assert!(matches!(
+            receive_clientbound(&mut tool_client),
+            play::Clientbound::BlockChangedAck(_)
+        ));
+        assert_eq!(
+            world_block_state(&world, target),
+            air,
+            "STOP must use the held diamond pickaxe"
+        );
+        for item in world.item_entities.all() {
+            if !preexisting_item_ids.contains(&item.id) {
+                world.item_entities.remove(item.id);
+            }
+        }
+        assert_eq!(set_world_block_state(&world, target, stone), Some(air));
+        world.runtime.lock().unwrap().take_block_changes(); // reset test-only mining mutation
+
         let (server_pipe, client_pipe) = Pipe::pair();
         let (_, mut writer) = Connection::local(server_pipe).split();
         let mut client = Connection::local(client_pipe);
@@ -5273,6 +5550,7 @@ mod tests {
                 started_at: 0,
                 per_tick: 1.0,
                 progress: 1.0,
+                last_stage: -1,
             },
         )
         .expect("destroy dirt through the server loot path");
@@ -5495,6 +5773,21 @@ mod tests {
             assert_eq!(dimension.parked_chunk_count(), owned_chunk_count);
         }
         assert!(world_root.join("level.dat").is_file());
+        let world = Arc::new(world);
+        let play_server = Arc::new(PlayServer::new(Arc::clone(&world)));
+        let tick_loop = play_server
+            .start_world_tick_loop()
+            .expect("start the listener-owned world tick thread");
+        thread::sleep(Duration::from_millis(125));
+        drop(tick_loop);
+        let stopped_time = world.runtime.lock().unwrap().game_time();
+        thread::sleep(Duration::from_millis(125));
+        assert_eq!(
+            world.runtime.lock().unwrap().game_time(),
+            stopped_time,
+            "dropping the listener's tick-loop guard must join and stop world time"
+        );
+        drop(play_server);
         drop(world);
         std::fs::remove_dir_all(world_root).unwrap();
     }

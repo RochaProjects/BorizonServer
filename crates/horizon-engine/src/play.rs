@@ -1712,6 +1712,19 @@ impl PreparedPlayWorld {
         let player_yaw = saved_player.as_ref().map_or(0.0, |saved| saved.yaw);
         let player_pitch = saved_player.as_ref().map_or(0.0, |saved| saved.pitch);
         let selected_slot = saved_player.as_ref().map_or(0, |saved| saved.selected_slot);
+        let health = saved_player.as_ref().map_or(20.0, |saved| saved.health);
+        let food = saved_player
+            .as_ref()
+            .map_or_else(horizon_world::food::FoodData::default, |saved| saved.food);
+        let experience_progress = saved_player
+            .as_ref()
+            .map_or(0.0, |saved| saved.experience_progress);
+        let experience_level = saved_player
+            .as_ref()
+            .map_or(0, |saved| saved.experience_level);
+        let experience_total = saved_player
+            .as_ref()
+            .map_or(0, |saved| saved.experience_total);
         let inventory = saved_player.map_or_else(PlayerInventory::default, |saved| saved.inventory);
         let view_distance = configured
             .client_information
@@ -1868,6 +1881,28 @@ impl PreparedPlayWorld {
         configured
             .connection
             .send(
+                &play::Clientbound::SetHealth(play::SetHealth {
+                    health,
+                    food: food.food,
+                    saturation: food.saturation,
+                })
+                .encode(),
+            )
+            .map_err(|error| format!("send initial player health and food: {error}"))?;
+        configured
+            .connection
+            .send(
+                &play::Clientbound::SetExperience(play::SetExperience {
+                    progress: experience_progress,
+                    level: experience_level,
+                    total: experience_total,
+                })
+                .encode(),
+            )
+            .map_err(|error| format!("send initial player experience: {error}"))?;
+        configured
+            .connection
+            .send(
                 &play::Clientbound::PlayerPosition(play::PlayerPosition {
                     teleport: 1,
                     position: player_position,
@@ -1896,6 +1931,11 @@ impl PreparedPlayWorld {
             player_uuid,
             selected_slot,
             inventory,
+            health,
+            food,
+            experience_progress,
+            experience_level,
+            experience_total,
             Some(self),
             view_distance,
             player_chunk,
@@ -1966,6 +2006,11 @@ impl PreparedPlayWorld {
             player.selected_slot,
             &player.inventory,
             &self.resources.saved_item_nbt,
+            player.health,
+            player.food,
+            player.experience_progress,
+            player.experience_level,
+            player.experience_total,
         )
     }
 
@@ -2912,6 +2957,11 @@ struct PlayerSession {
     game_mode: i32,
     selected_slot: i16,
     inventory: PlayerInventory,
+    health: f32,
+    food: horizon_world::food::FoodData,
+    experience_progress: f32,
+    experience_level: i32,
+    experience_total: i32,
     input_flags: u8,
     sprinting: bool,
     server_tick: u64,
@@ -2958,6 +3008,11 @@ impl PlayerSession {
             game_mode: 0,
             selected_slot: 0,
             inventory: PlayerInventory::default(),
+            health: 20.0,
+            food: horizon_world::food::FoodData::default(),
+            experience_progress: 0.0,
+            experience_level: 0,
+            experience_total: 0,
             input_flags: 0,
             sprinting: false,
             server_tick: 0,
@@ -3098,6 +3153,11 @@ fn serve_until_disconnect(
         uuid,
         0,
         PlayerInventory::default(),
+        20.0,
+        horizon_world::food::FoodData::default(),
+        0.0,
+        0,
+        0,
         world,
         view_distance,
         spawn_center,
@@ -3114,6 +3174,11 @@ fn serve_until_disconnect_with_player_data(
     player_uuid: u128,
     selected_slot: i16,
     inventory: PlayerInventory,
+    health: f32,
+    food: horizon_world::food::FoodData,
+    experience_progress: f32,
+    experience_level: i32,
+    experience_total: i32,
     world: Option<&PreparedPlayWorld>,
     view_distance: i32,
     spawn_center: ChunkPos,
@@ -3124,6 +3189,11 @@ fn serve_until_disconnect_with_player_data(
     player.pitch = pitch;
     player.selected_slot = selected_slot.clamp(0, 8);
     player.inventory = inventory;
+    player.health = health;
+    player.food = food;
+    player.experience_progress = experience_progress;
+    player.experience_level = experience_level;
+    player.experience_total = experience_total;
     player.game_mode = world.map_or(0, |world| world.game_mode);
     player.view_distance = view_distance;
     player.chunk_center = spawn_center;
@@ -3628,6 +3698,67 @@ fn process_player_action(
     if action.action == 1 {
         return Ok(());
     }
+    // ServerPlayer.drop(boolean): action 4 drops the whole selected stack,
+    // action 5 drops one item. Item entities are shared and replicated by the
+    // ordinary PLAY item-entity sync path.
+    if matches!(action.action, 4 | 5) {
+        if !player.loaded || player.awaiting_teleport.is_some() || player.game_mode == 3 {
+            return Ok(());
+        }
+        let Some(world) = world else {
+            return Ok(());
+        };
+        if let Some(stack) =
+            player
+                .inventory
+                .take_held_drop(player.selected_slot, action.action == 4, false)
+        {
+            let velocity = {
+                let mut random = world
+                    .loot_random
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                player_drop_motion(&mut random, player.yaw, player.pitch)
+            };
+            world.item_entities.spawn_with_pickup_delay(
+                stack,
+                [
+                    player.position[0],
+                    player.position[1] + 1.62 - f64::from(0.3f32),
+                    player.position[2],
+                ],
+                velocity,
+                40,
+            )?;
+            writer
+                .send(
+                    &play::Clientbound::ContainerSetContent(player.inventory.content_packet())
+                        .encode(),
+                )
+                .map_err(|error| format!("sync inventory after dropping item: {error}"))?;
+        }
+        return Ok(());
+    }
+    // ServerGamePacketListenerImpl handles this action after ending any item
+    // use. Item-use state is not implemented yet, but the inventory swap itself
+    // is authoritative and must not disconnect an otherwise valid client.
+    if action.action == 7 {
+        if player.game_mode != 3 && player.inventory.swap_offhand(player.selected_slot) {
+            writer
+                .send(
+                    &play::Clientbound::ContainerSetContent(player.inventory.content_packet())
+                        .encode(),
+                )
+                .map_err(|error| format!("sync inventory after offhand swap: {error}"))?;
+        }
+        return Ok(());
+    }
+    // RELEASE_USE_ITEM has no active effect to release until bow/food/potion
+    // use-state handling is ported. It is a valid protocol action, not a
+    // malformed PlayerAction.
+    if action.action == 6 {
+        return Ok(());
+    }
     if !matches!(action.action, 0 | 2 | 3) {
         return Err(format!("unsupported PlayerAction {}", action.action));
     }
@@ -3784,6 +3915,29 @@ fn process_player_action(
         player.delayed_dig = Some(digging);
     }
     Ok(())
+}
+
+fn player_drop_motion(random: &mut LegacyRandom, yaw: f32, pitch: f32) -> [f64; 3] {
+    use horizon_core::{geometry::trig, jmath};
+
+    let tau = std::f32::consts::TAU;
+    let (pitch, yaw) = (
+        f64::from(pitch * trig::DEG_TO_RAD),
+        f64::from(yaw * trig::DEG_TO_RAD),
+    );
+    let (sin_pitch, cos_pitch, sin_yaw, cos_yaw) = (
+        f64::from(trig::sin(pitch)),
+        f64::from(trig::cos(pitch)),
+        f64::from(trig::sin(yaw)),
+        f64::from(trig::cos(yaw)),
+    );
+    let direction = f64::from(random.next_float() * tau);
+    let power = f64::from(0.02 * random.next_float());
+    [
+        -sin_yaw * cos_pitch * 0.3 + jmath::cos(direction) * power,
+        -sin_pitch * 0.3 + 0.1 + f64::from((random.next_float() - random.next_float()) * 0.1),
+        cos_yaw * cos_pitch * 0.3 + jmath::sin(direction) * power,
+    ]
 }
 
 /// `lan_actions/dig_stop.rs::stop_dig`: STOP breaks outright at 70%; below

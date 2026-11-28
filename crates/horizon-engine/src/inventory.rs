@@ -131,6 +131,45 @@ impl PlayerInventory {
         true
     }
 
+    /// Remove one item, or the complete selected stack, for vanilla's drop key.
+    /// Spectators cannot drop items; creative players can, matching the server
+    /// player's `drop(boolean)` path.
+    pub(crate) fn take_held_drop(
+        &mut self,
+        selected: i16,
+        all: bool,
+        spectator: bool,
+    ) -> Option<Stack> {
+        if spectator {
+            return None;
+        }
+        let slot = 36 + usize::try_from(selected).ok()?;
+        let stack = self.slots.get_mut(slot)?.as_mut()?;
+        if stack.count <= 0 {
+            return None;
+        }
+        let count = if all { stack.count } else { 1 };
+        let mut dropped = stack.clone();
+        dropped.count = count;
+        stack.count -= count;
+        if stack.count == 0 {
+            self.slots[slot] = None;
+        }
+        Some(dropped)
+    }
+
+    /// Swap the selected hotbar stack with the offhand slot.
+    pub(crate) fn swap_offhand(&mut self, selected: i16) -> bool {
+        let Ok(selected) = usize::try_from(selected) else {
+            return false;
+        };
+        if selected >= 9 {
+            return false;
+        }
+        self.slots.swap(36 + selected, 45);
+        true
+    }
+
     /// Insert as much of a server-authored stack as the vanilla player
     /// inventory can hold. Returns the amount accepted; the caller retains
     /// any remainder in its item entity.

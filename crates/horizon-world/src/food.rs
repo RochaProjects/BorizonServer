@@ -9,7 +9,7 @@ pub enum Difficulty {
 impl Difficulty {
     pub const NAMES: [&str; 4] = ["peaceful", "easy", "normal", "hard"];
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FoodData {
     pub food: i32,
     pub saturation: f32,

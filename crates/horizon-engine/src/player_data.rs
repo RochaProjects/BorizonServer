@@ -4,6 +4,7 @@ use crate::inventory::PlayerInventory;
 use horizon_protocol::item::SavedNbtContext;
 use horizon_world::{
     datafix::files::{read_dat, write_dat},
+    food::FoodData,
     nbt::Tag,
 };
 use std::{
@@ -18,6 +19,11 @@ pub(crate) struct SavedPlayer {
     pub(crate) pitch: f32,
     pub(crate) selected_slot: i16,
     pub(crate) inventory: PlayerInventory,
+    pub(crate) health: f32,
+    pub(crate) food: FoodData,
+    pub(crate) experience_progress: f32,
+    pub(crate) experience_level: i32,
+    pub(crate) experience_total: i32,
 }
 
 fn path(world: &Path, uuid: u128) -> PathBuf {
@@ -92,6 +98,22 @@ pub(crate) fn load(
     }
     let mut inventory = PlayerInventory::default();
     inventory.load_saved(&root, item_nbt)?;
+    let (health, food) = match &root {
+        Tag::Compound(fields) => {
+            let mut food = FoodData::default();
+            food.read_nbt(fields);
+            let health = match root.get("Health") {
+                Some(Tag::Float(value)) => f32::from_bits(*value),
+                _ => 20.0,
+            };
+            (if health.is_finite() { health } else { 20.0 }, food)
+        }
+        _ => (20.0, FoodData::default()),
+    };
+    let experience_progress = match root.get("XpP") {
+        Some(Tag::Float(value)) => f32::from_bits(*value),
+        _ => 0.0,
+    };
     Ok(Some(SavedPlayer {
         position,
         yaw,
@@ -101,7 +123,23 @@ pub(crate) fn load(
             _ => 0,
         },
         inventory,
+        health,
+        food,
+        experience_progress: if experience_progress.is_finite() {
+            experience_progress
+        } else {
+            0.0
+        },
+        experience_level: nbt_int(&root, "XpLevel"),
+        experience_total: nbt_int(&root, "XpTotal"),
     }))
+}
+
+fn nbt_int(root: &Tag, name: &str) -> i32 {
+    match root.get(name) {
+        Some(Tag::Int(value)) => *value,
+        _ => 0,
+    }
 }
 
 pub(crate) fn save(
@@ -113,9 +151,19 @@ pub(crate) fn save(
     selected_slot: i16,
     inventory: &PlayerInventory,
     item_nbt: &SavedNbtContext,
+    health: f32,
+    food: FoodData,
+    experience_progress: f32,
+    experience_level: i32,
+    experience_total: i32,
 ) -> Result<(), String> {
-    if position.iter().any(|value| !value.is_finite()) || !yaw.is_finite() || !pitch.is_finite() {
-        return Err("refusing to save non-finite player coordinates or rotation".into());
+    if position.iter().any(|value| !value.is_finite())
+        || !yaw.is_finite()
+        || !pitch.is_finite()
+        || !health.is_finite()
+        || !experience_progress.is_finite()
+    {
+        return Err("refusing to save non-finite player state".into());
     }
     let file = path(world, uuid);
     let backup = file.with_extension("dat_old");
@@ -142,6 +190,11 @@ pub(crate) fn save(
         return Err(format!("player data {} is not a compound", file.display()));
     };
     fields.insert("Inventory".into(), inventory.save_nbt(item_nbt)?);
+    fields.insert("Health".into(), Tag::Float(health.to_bits()));
+    food.write_nbt(fields);
+    fields.insert("XpP".into(), Tag::Float(experience_progress.to_bits()));
+    fields.insert("XpLevel".into(), Tag::Int(experience_level));
+    fields.insert("XpTotal".into(), Tag::Int(experience_total));
     fields.insert(
         "UUID".into(),
         Tag::IntArray(

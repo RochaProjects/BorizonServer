@@ -4,9 +4,9 @@
 ### Estado atual da migração — 2026-11-28
 
 - Branch `BorizonV26.3`; ponta remota integrada: `d9a7b4fd7` (`Match vanilla creative mining reach`). `main` continua somente como referência de leitura.
-- Já integrados: persistência parcial de posição/rotação e inventário; DataFixer em playerdata; ticks programados, aleatórios, block events e pistões móveis; fases de mineração survival com ferramenta e sincronização de estágio; alcance vanilla padrão para survival/creative. O inventário usa uma ponte NBT que rejeita stacks não preserváveis exatamente; suporte a todos os componentes 26.3 ainda falta.
+- Já integrados: persistência parcial de posição/rotação, inventário, saúde, FoodData e XP; envio dessas estatísticas no início do PLAY; DataFixer em playerdata; ticks programados, aleatórios, block events e pistões móveis; fases de mineração survival com ferramenta e sincronização de estágio; alcance vanilla padrão para survival/creative; soltar itens (um/todos) e trocar mão secundária. Saúde/fome/XP ainda não evoluem durante a sessão. O inventário usa uma ponte NBT que rejeita stacks não preserváveis exatamente; suporte a todos os componentes 26.3 ainda falta.
 - `cargo fmt --all -- --check`, `cargo check --locked -p horizon-engine` e `git diff --check` passaram para as alterações locais de inventário/pistões antes da integração remota. Os commits remotos registram 48 testes da engine e checagem do grafo server-only; os cenários que requerem recursos oficiais não foram executados sem `BORIZON_SERVER_RESOURCES`.
-- Estado continua incremental: não há paridade vanilla comprovada. Próximos cortes incluem cobertura completa dos dados do jogador e componentes de itens; diagnosticar a expansão efetiva para além de 3×3; melhorar movimento/mineração com atributos, efeitos, água e ray trace; e completar sincronização de entidades, ticking, dimensões e lifecycle de save/shutdown.
+- Estado continua incremental: não há paridade vanilla comprovada. Próximo corte de player state é portar o tick de FoodData/saúde da referência (`main/crates/horizon-client/src/hunger.rs`), conectando regras, exhaustion, cura/dano e sincronização; os campos já são restaurados, enviados no login e persistidos. Também faltam cobertura completa de componentes de itens; diagnosticar a expansão efetiva para além de 3×3; melhorar movimento/mineração com atributos, efeitos, água e ray trace; sincronização de entidades, ticking, dimensões e lifecycle de save/shutdown.
 
 ### PlayerAction: mineração e alcance — 2026-11-28
 
@@ -14,6 +14,21 @@
 - [x] O alcance usa os valores padrão de interação vanilla (4,5 survival/5 creative mais o buffer do callsite). Eye height e atributos de alcance continuam simplificados.
 - [x] Os commits remotos registram 48 testes, `cargo check`, `cargo fmt` e auditoria do grafo server-only. Os testes que exigem recursos oficiais foram compilados, mas não executaram seu corpo sem o pacote de recursos.
 - [ ] Ainda faltam modificadores completos de mineração (atributos, efeitos, água), Adventure/claims, durabilidade de ferramentas e ray trace vanilla; validar com recursos oficiais e sessão real.
+
+### Ações de jogador: soltar item e trocar offhand — 2026-11-28
+
+- [x] `PlayerAction` 4/5 agora retira um item ou a stack selecionada, cria item entity no ponto vanilla relativo aos olhos e usa `drop_motion`/stream RNG do mundo e pickup delay de 40 ticks. A entidade entra no caminho de replicação/coleta já existente; inventário autoritativo é sincronizado ao jogador.
+- [x] `PlayerAction` 7 troca hotbar selecionado e offhand e sincroniza o menu. Spectators não soltam/trocam itens.
+- [x] `RELEASE_USE_ITEM` (6) é tratado como ação de protocolo válida, sem derrubar a conexão enquanto o engine ainda não possui estados de uso de itens.
+- [x] `cargo fmt --all` e `cargo check --locked -p horizon-engine` passaram. Nenhum teste ou sessão de cliente foi executado.
+- [ ] Falta validar a sequência de pacotes com cliente Java. RELEASE_USE_ITEM ainda precisa encerrar estados de arco/comida/poção quando esses sistemas forem portados; atualização de equipamento para outros jogadores depende do sistema de entidades/jogadores ainda ausente.
+
+### Persistência e estado inicial de saúde, fome e XP — 2026-11-28
+
+- [x] Playerdata restaura/salva `Health`, os quatro campos de `FoodData` (comida, saturação, exaustão e timer) e `XpP`/`XpLevel`/`XpTotal`, preservando o restante do composto vanilla.
+- [x] O bootstrap PLAY envia `SetHealth` e `SetExperience` com o estado restaurado ou os defaults vanilla para jogador novo.
+- [x] `cargo fmt --all -- --check`, `cargo check --locked -p horizon-engine` e `git diff --check` passaram; nenhum teste ou sessão Java foi executado.
+- [ ] O runtime ainda não avança fome, regeneração, starvation, XP ou efeitos na sessão. Portar `FoodData.tick` e os owners de saúde/dano da referência, sem simulação simplificada paralela.
 
 ### Tick de pistões móveis — 2026-11-28
 

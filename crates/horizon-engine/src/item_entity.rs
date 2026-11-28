@@ -41,6 +41,18 @@ impl ItemEntityStore {
         position: [f64; 3],
         velocity: [f64; 3],
     ) -> Result<i32, String> {
+        self.spawn_with_pickup_delay(stack, position, velocity, 10)
+    }
+
+    /// Spawn with a caller-selected pickup delay. Player-thrown items use 40
+    /// ticks; ordinary block loot keeps the vanilla 10-tick delay.
+    pub(crate) fn spawn_with_pickup_delay(
+        &self,
+        stack: Stack,
+        position: [f64; 3],
+        velocity: [f64; 3],
+        pickup_delay: u32,
+    ) -> Result<i32, String> {
         let mut store = self.store.lock().unwrap_or_else(|error| error.into_inner());
         let id = store.next_id.max(1_000_000);
         store.next_id = id
@@ -60,7 +72,7 @@ impl ItemEntityStore {
                 position,
                 velocity,
                 age: 0,
-                pickup_delay: 10,
+                pickup_delay,
                 on_ground: false,
             },
         );

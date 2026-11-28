@@ -9,6 +9,7 @@ mod player_data;
 pub mod registry_sync;
 mod resources;
 mod status;
+mod survival;
 
 use horizon_protocol::{buf::Reader, packets::play as play_packets};
 use std::{

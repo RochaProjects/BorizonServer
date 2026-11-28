@@ -42,7 +42,7 @@ use horizon_world::{
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    path::Path,
+    path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
     sync::{Arc, Condvar, Mutex},
     thread,
@@ -69,6 +69,7 @@ const MAX_CLIENT_MOVEMENT_SQUARED_PER_TICK: f64 = 100.0;
 const MAX_RETAINED_BLOCK_UPDATES: usize = 65_536;
 
 pub(crate) struct PreparedPlayWorld {
+    world_root: PathBuf,
     resources: Arc<ServerResources>,
     dimension_type: i32,
     spawn: [f64; 3],
@@ -1447,6 +1448,20 @@ struct PlayerPermit<'a> {
     uuid: u128,
 }
 
+struct PlayerChunkAdmission<'a> {
+    world: &'a PreparedPlayWorld,
+    player_id: i32,
+    release_on_drop: bool,
+}
+
+impl Drop for PlayerChunkAdmission<'_> {
+    fn drop(&mut self) {
+        if self.release_on_drop {
+            let _ = self.world.remove_player_chunk(self.player_id);
+        }
+    }
+}
+
 impl Drop for PlayerPermit<'_> {
     fn drop(&mut self) {
         self.players
@@ -1596,6 +1611,7 @@ impl PreparedPlayWorld {
         let chunk_generation =
             ChunkGeneration::start(generator, resources.clone(), initial_terrain)?;
         let mut prepared = Self {
+            world_root: world_root.to_owned(),
             resources,
             dimension_type,
             spawn,
@@ -1624,17 +1640,29 @@ impl PreparedPlayWorld {
         mut configured: ConfiguredConnection,
         player_id: i32,
     ) -> Result<(), String> {
+        let saved_player = crate::player_data::load(&self.world_root, configured.profile.uuid)?;
+        let player_position = saved_player.map_or(self.spawn, |saved| saved.position);
+        let player_yaw = saved_player.map_or(0.0, |saved| saved.yaw);
+        let player_pitch = saved_player.map_or(0.0, |saved| saved.pitch);
         let view_distance = configured
             .client_information
             .as_ref()
             .map_or(self.view_distance, |info| i32::from(info.view_distance))
             .clamp(2, self.view_distance);
-        let spawn_block = BlockPos::new(
-            self.spawn[0].floor() as i32,
-            self.spawn[1].floor() as i32,
-            self.spawn[2].floor() as i32,
+        let player_block = BlockPos::new(
+            player_position[0].floor() as i32,
+            player_position[1].floor() as i32,
+            player_position[2].floor() as i32,
         );
-        let spawn_loaded = || {
+        let player_chunk = chunk_center(player_position);
+        let mut admission = PlayerChunkAdmission {
+            world: self,
+            player_id,
+            release_on_drop: true,
+        };
+        self.set_player_chunk(player_id, player_chunk)?;
+        let initial_chunks = self.prepare_player_chunks(player_chunk)?;
+        let player_chunk_loaded = || {
             self.runtime
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -1642,17 +1670,10 @@ impl PreparedPlayWorld {
                 .expect("the Play Overworld is registered")
                 .resident()
                 .level()
-                .is_loaded(spawn_block)
+                .is_loaded(player_block)
         };
-        if !spawn_loaded() {
-            if let Err(error) = self.set_player_chunk(player_id, chunk_center(self.spawn)) {
-                let _ = self.remove_player_chunk(player_id);
-                return Err(error);
-            }
-            if !spawn_loaded() {
-                let _ = self.remove_player_chunk(player_id);
-                return Err("player ticket did not load the PLAY spawn chunk".into());
-            }
+        if !player_chunk_loaded() {
+            return Err("player ticket did not load the saved PLAY position".into());
         }
         // The client sends its terminal CONFIGURATION acknowledgement before
         // installing its PLAY encoder. The reference server hands the session
@@ -1665,7 +1686,6 @@ impl PreparedPlayWorld {
             self.spawn[1].floor() as i32,
             self.spawn[2].floor() as i32,
         ];
-        let spawn_chunk = [spawn_block[0].div_euclid(16), spawn_block[2].div_euclid(16)];
         let border = self
             .runtime
             .lock()
@@ -1750,8 +1770,8 @@ impl PreparedPlayWorld {
                 warning_time: border.warning_time,
             }),
             play::Clientbound::SetChunkCacheCenter(play::SetChunkCacheCenter {
-                x: spawn_chunk[0],
-                z: spawn_chunk[1],
+                x: player_chunk.x,
+                z: player_chunk.z,
             }),
             play::Clientbound::ChunkBatchStart(horizon_protocol::packets::Empty),
         ];
@@ -1761,7 +1781,7 @@ impl PreparedPlayWorld {
                 .send(&packet.encode())
                 .map_err(|error| format!("send PLAY bootstrap packet: {error}"))?;
         }
-        for packet in &self.chunk_packets {
+        for packet in &initial_chunks {
             configured
                 .connection
                 .send(packet)
@@ -1771,7 +1791,7 @@ impl PreparedPlayWorld {
             .connection
             .send(
                 &play::Clientbound::ChunkBatchFinished(play::ChunkBatchFinished {
-                    size: self.chunk_packets.len() as i32,
+                    size: initial_chunks.len() as i32,
                 })
                 .encode(),
             )
@@ -1781,10 +1801,10 @@ impl PreparedPlayWorld {
             .send(
                 &play::Clientbound::PlayerPosition(play::PlayerPosition {
                     teleport: 1,
-                    position: self.spawn,
+                    position: player_position,
                     delta: [0.0; 3],
-                    yaw: 0.0,
-                    pitch: 0.0,
+                    yaw: player_yaw,
+                    pitch: player_pitch,
                     relatives: 0,
                 })
                 .encode(),
@@ -1792,20 +1812,22 @@ impl PreparedPlayWorld {
             .map_err(|error| format!("send initial player position: {error}"))?;
         println!(
             "Horizon: entered initial PLAY for {} at ({:.1}, {:.1}, {:.1}); gameplay simulation is incomplete",
-            configured.profile.name, self.spawn[0], self.spawn[1], self.spawn[2]
+            configured.profile.name, player_position[0], player_position[1], player_position[2]
         );
-        self.set_player_chunk(player_id, chunk_center(self.spawn))?;
         let player_name = configured.profile.name.clone();
-        let spawn_center = chunk_center(self.spawn);
-        let result = serve_until_disconnect(
+        let player_uuid = configured.profile.uuid;
+        admission.release_on_drop = false;
+        let result = serve_until_disconnect_with_player_data(
             configured,
-            self.spawn,
+            player_position,
+            player_yaw,
+            player_pitch,
             player_id,
             player_name,
+            player_uuid,
             Some(self),
             view_distance,
-            self.simulation_distance,
-            spawn_center,
+            player_chunk,
         );
         let cleanup = self.finish_player_session(player_id);
         match (result, cleanup) {
@@ -1830,6 +1852,47 @@ impl PreparedPlayWorld {
                 .get_or_insert_with(|| format!("sync PLAY Anvil regions after session: {error}"));
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    fn prepare_player_chunks(&self, center: ChunkPos) -> Result<Vec<Vec<u8>>, String> {
+        let expected = region_positions(center);
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            self.poll_chunk_generation()?;
+            let cache = self
+                .chunk_packet_cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if expected.iter().all(|position| cache.contains_key(position)) {
+                return Ok(expected
+                    .iter()
+                    .map(|position| {
+                        cache
+                            .get(position)
+                            .expect("all initial player chunks were prepared")
+                            .clone()
+                    })
+                    .collect());
+            }
+            drop(cache);
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out preparing initial player chunks around ({},{})",
+                    center.x, center.z
+                ));
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn save_player_position(&self, uuid: u128, player: &PlayerSession) -> Result<(), String> {
+        crate::player_data::save(
+            &self.world_root,
+            uuid,
+            player.position,
+            player.yaw,
+            player.pitch,
+        )
     }
 
     fn set_player_chunk(&self, player_id: i32, center: ChunkPos) -> Result<(), String> {
@@ -2919,6 +2982,7 @@ fn wrap_degrees(degrees: f32) -> f32 {
     wrapped
 }
 
+#[cfg(test)]
 fn serve_until_disconnect(
     configured: ConfiguredConnection,
     spawn: [f64; 3],
@@ -2926,9 +2990,44 @@ fn serve_until_disconnect(
     player_name: String,
     world: Option<&PreparedPlayWorld>,
     view_distance: i32,
-    simulation_distance: i32,
+    _simulation_distance: i32,
     spawn_center: ChunkPos,
 ) -> Result<(), String> {
+    let uuid = configured.profile.uuid;
+    serve_until_disconnect_with_player_data(
+        configured,
+        spawn,
+        0.0,
+        0.0,
+        entity_id,
+        player_name,
+        uuid,
+        world,
+        view_distance,
+        spawn_center,
+    )
+}
+
+fn serve_until_disconnect_with_player_data(
+    configured: ConfiguredConnection,
+    spawn: [f64; 3],
+    yaw: f32,
+    pitch: f32,
+    entity_id: i32,
+    player_name: String,
+    player_uuid: u128,
+    world: Option<&PreparedPlayWorld>,
+    view_distance: i32,
+    spawn_center: ChunkPos,
+) -> Result<(), String> {
+    let mut player = PlayerSession::new(spawn, 1, entity_id);
+    player.name = player_name;
+    player.yaw = yaw;
+    player.pitch = pitch;
+    player.game_mode = world.map_or(0, |world| world.game_mode);
+    player.view_distance = view_distance;
+    player.chunk_center = spawn_center;
+    requeue_chunks(&mut player, spawn_center);
     let (reader, mut writer) = configured.connection.split();
     reader
         .set_read_timeout(None)
@@ -2941,20 +3040,17 @@ fn serve_until_disconnect(
         .name("borizon-play-reader".into())
         .spawn(move || read_play_packets(reader, incoming))
         .map_err(|error| format!("start PLAY network reader: {error}"))?;
-    let result = run_play_session(
-        &mut writer,
-        received,
-        spawn,
-        entity_id,
-        player_name,
-        world,
-        view_distance,
-        simulation_distance,
-        spawn_center,
-    );
+    let result = run_play_session(&mut writer, received, &mut player, world);
     closer.close();
     let _ = network_reader.join();
-    result
+    let saved = world.map_or(Ok(()), |world| {
+        world.save_player_position(player_uuid, &player)
+    });
+    match (result, saved) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 fn read_play_packets(
@@ -3001,13 +3097,8 @@ impl PendingPackets {
 fn run_play_session(
     writer: &mut horizon_protocol::connection::ConnWriter,
     received: Receiver<Result<(i32, Vec<u8>), String>>,
-    spawn: [f64; 3],
-    entity_id: i32,
-    player_name: String,
+    player: &mut PlayerSession,
     world: Option<&PreparedPlayWorld>,
-    view_distance: i32,
-    _simulation_distance: i32,
-    spawn_center: ChunkPos,
 ) -> Result<(), String> {
     const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
     const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -3015,12 +3106,6 @@ fn run_play_session(
     let mut last_keepalive = Instant::now();
     let mut next_keepalive_id = 1_i64;
     let mut pending_keepalive: Option<(i64, Instant)> = None;
-    let mut player = PlayerSession::new(spawn, 1, entity_id);
-    player.name = player_name;
-    player.game_mode = world.map_or(0, |world| world.game_mode);
-    player.view_distance = view_distance;
-    player.chunk_center = spawn_center;
-    requeue_chunks(&mut player, spawn_center);
     writer
         .send(&play::Clientbound::ContainerSetContent(player.inventory.content_packet()).encode())
         .map_err(|error| format!("send initial player inventory: {error}"))?;
@@ -3061,16 +3146,16 @@ fn run_play_session(
                 process_play_packet(
                     writer,
                     packet,
-                    &mut player,
+                    player,
                     &mut pending_keepalive,
                     &mut last_keepalive,
                     world,
                 )?;
             }
-            advance_player_mining(writer, &mut player, world)?;
+            advance_player_mining(writer, player, world)?;
             if let Some(world) = world {
-                world.stream_chunks(writer, &mut player)?;
-                sync_item_entities(writer, &mut player, world)?;
+                world.stream_chunks(writer, player)?;
+                sync_item_entities(writer, player, world)?;
             }
             next_tick += SERVER_TICK;
         }
@@ -4703,6 +4788,7 @@ mod tests {
             assert_eq!(resident.level_mut().set_raw(wall, stone), Some(air));
         }
         let mut world = PreparedPlayWorld {
+            world_root: world_root.clone(),
             resources,
             dimension_type: 0,
             spawn,

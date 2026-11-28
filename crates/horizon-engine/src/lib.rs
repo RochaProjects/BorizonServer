@@ -5,6 +5,7 @@ pub mod login;
 mod play;
 mod play_chunk;
 mod play_collision;
+mod player_data;
 pub mod registry_sync;
 mod resources;
 mod status;

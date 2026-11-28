@@ -1,12 +1,21 @@
 
 ## BorizonV26.3
 
-### Estado da migração ao pausar — 2026-11-27
+### Estado atual da migração — 2026-11-27
 
 - Branch: `BorizonV26.3`; último commit de código: `0b89abac` (`Advance server-only PLAY world migration`). `main` continua apenas como referência.
+- Há alterações locais ainda sem commit: restauração/salvamento da posição e rotação do jogador no formato gzip-NBT `players/data/<uuid>.dat`, além de preparar o batch inicial na posição salva em vez de reenviar os chunks do spawn global. Elas passaram `cargo check --locked --tests -p horizon-engine` (compilação dos alvos de teste; testes não executados) e `git diff --check`; falta validar com sessão real.
 - Já integrado: conexão Java 26.3 e teste manual anterior de gameplay survival básico; movement/mining, drops/coleta/colocação iniciais, inventário básico, relógio comum, ticks programados/aleatórios/block events, tickets de jogador, save inicial e pipeline de chunks `TERRAIN`/`FEATURES`/`LIGHT`. O teste manual comprova uma fatia, não paridade vanilla.
 - Nesta última atualização: budgets de jobs comparados à política da referência; reconciliação de block entities em escritas de worldgen e finalização parcial de ID/default NBT para block entities geradas. `cargo fmt --check`, `cargo check --locked -p horizon-world`, `cargo check --locked -p horizon-engine` e `git diff --check` passaram. Não houve build de release nem teste de jogo após esse commit.
-- Ponto da pausa: corrigir a expansão/ritmo de chunks além do 3×3 inicial com base no ACK e no scheduler da referência; depois completar `FULL`/finalização e persistência coerente de luz/heightmaps/block entities. Permanecem grandes lacunas de gameplay, incluindo persistência de jogador/entidades, menus/crafting, ticking geral, dimensões transitáveis e ciclo de encerramento. Não declarar gameplay vanilla completo.
+- Continuação ativa: revisar a expansão além do 3×3 sem tratar a fila anunciada como prova de entrega. A janela é enfileirada conforme a view efetiva (mínimo entre o pedido do cliente e `server.properties`, como na `main`); batches dependem do ACK e chunks só são enviados após TERRAIN → FEATURES → LIGHT. Isso confirma o desenho atual, mas não explica por si só a observação de apenas 3×3 nem prova ritmo adequado em runtime. Próximo corte: comparar a ordem/prontidão e os tickets com `main`, identificar por evidência onde a expansão para, então completar `FULL`/finalização e persistência coerente de luz/heightmaps/block entities. Permanecem grandes lacunas de gameplay, incluindo persistência de jogador/entidades, menus/crafting, ticking geral, dimensões transitáveis e ciclo de encerramento. Não declarar gameplay vanilla completo.
+
+### Persistência de posição do jogador — 2026-11-27
+
+- [x] O login procura `players/data/<uuid>.dat` usando o UUID do perfil e restaura `Pos`/`Rotation` de NBT gzip; arquivos inválidos/incompatíveis com o Overworld caem no spawn do mundo.
+- [x] A região inicial de chunks agora é preparada e enviada ao redor da posição restaurada. Antes, um jogador que voltasse longe do spawn recebia o 3×3 global enquanto o cache da sessão apontava para sua posição salva.
+- [x] Ao encerrar a sessão, grava `UUID`, `DataVersion`, `Pos`, `Rotation` e `Dimension=minecraft:overworld`, preservando os demais campos presentes no composto NBT. A leitura/escrita recupera de `.dat_old`; a substituição usa temporário, sync e rotação do arquivo atual. A admissão mantém ticket temporário e o libera em falhas antes de a sessão começar.
+- [x] `cargo fmt --all`, `cargo check --locked --tests -p horizon-engine` e `git diff --check` passaram. O comando apenas compilou os alvos de teste; nenhum teste foi executado e não houve cliente/runtime.
+- [ ] A alteração local ainda não foi testada em runtime. Inventário, saúde, fome, XP, efeitos, modo individual e demais campos de jogador ainda não são sincronizados com o `.dat`; chunks iniciais de uma posição salva também dependem de geração/iluminação completa antes do login.
 
 ### Pipeline de geração e iluminação de chunks — 2026-11-27
 

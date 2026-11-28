@@ -3581,6 +3581,12 @@ fn player_destroy_progress(
     )
 }
 
+fn block_action_reach(game_mode: i32) -> f64 {
+    // Mirrors Player.isWithinBlockInteractionRange(pos, 1.0) in origin/main:
+    // default range is 4.5 in survival and 5.0 in creative.
+    (if game_mode == 1 { 5.0 } else { 4.5 }) + 1.0
+}
+
 fn process_player_action(
     writer: &mut horizon_protocol::connection::ConnWriter,
     player: &mut PlayerSession,
@@ -3617,9 +3623,15 @@ fn process_player_action(
         player.position[1] + 1.62,
         player.position[2],
     ];
-    let in_reach = player_mining::within_block_range(eye, 5.5, action.pos);
+    let in_reach =
+        player_mining::within_block_range(eye, block_action_reach(player.game_mode), action.pos);
 
     if action.action == 0 {
+        // main's `Player.blockActionRestricted` always rejects spectators;
+        // otherwise this dedicated handler would fall through to survival.
+        if player.game_mode == 3 {
+            return Ok(());
+        }
         if !in_reach {
             return Ok(());
         }
@@ -4486,6 +4498,21 @@ mod tests {
         assert!(!stop_dig_breaks(0.699_999));
         assert!(stop_dig_breaks(0.7));
         assert!(stop_dig_breaks(1.0));
+    }
+    #[test]
+    fn creative_block_interaction_reach_matches_reference_default() {
+        let eye = [0.5, 1.62, 0.5];
+        let edge_block = [6, 1, 0];
+        assert!(!player_mining::within_block_range(
+            eye,
+            block_action_reach(0),
+            edge_block
+        ));
+        assert!(player_mining::within_block_range(
+            eye,
+            block_action_reach(1),
+            edge_block
+        ));
     }
     #[test]
     fn mining_progress_uses_server_ticks_not_client_tick_end_packets() {
